@@ -22,3 +22,9 @@
 # Rust 核心由 scripts/build_rust_ohos.ps1 交叉编译后拷贝到 libs/，与 Android 侧
 # jniLibs/*/*.so 一致，只保留源码。缺这行会把 20MB+ 的 .so 混进提交。
 **/libs/**/libfqapi_core.so
+# libmpv 由 scripts/fetch_libmpv_ohos.ps1 从预编译产物取回（24MB，SHA256 固定），
+# 与 Android 侧复用 media-kit 的同一份产物；同样只保留获取脚本，不入库。
+**/libs/**/libmpv.so
+# libc++_shared.so 由 OHOS NDK 提供（libmpv.so 的 DT_NEEDED 依赖），构建时拷入
+# libs/，可从 SDK `native/llvm/lib/aarch64-linux-ohos/` 取回，不入库。
+**/libs/**/libc++_shared.so

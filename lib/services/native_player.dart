@@ -1,9 +1,16 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 
 import 'package:flutter/services.dart';
+// part 文件 ohos_playback.dart 用它定位 mpv 日志落盘目录。
+import 'package:path_provider/path_provider.dart';
+import 'package:media_kit/media_kit.dart' as mk;
 
 import 'app_log.dart';
+import 'ohos_playback_options.dart';
+
+part 'ohos_playback.dart';
 
 // Codec metadata only: never log the whole platform payload or exception text.
 final _decoderToken = RegExp(r'^[A-Za-z0-9_.+/-]{1,160}$');
@@ -59,6 +66,14 @@ class NativePlayer {
   static const _channel = MethodChannel('fqapp/native_player');
   static const _events = EventChannel('fqapp/native_player/events');
   static const _methodTimeout = Duration(seconds: 10);
+
+  /// Timeout for plugin calls, exposed for the OHOS backend in
+  /// ohos_playback.dart, which issues its own surface-channel calls.
+  static const Duration methodTimeout = _methodTimeout;
+
+  /// The plugin channel, exposed for the OHOS backend in ohos_playback.dart,
+  /// which needs it to drive the surface lifecycle without a player id.
+  static const MethodChannel channel = _channel;
   static const _createTimeout = Duration(seconds: 25);
 
   /// The app's listening owner coordinates audio with video playback. The
@@ -193,6 +208,9 @@ class NativePlayer {
   int _appliedSeekGeneration = 0;
   int _playWhenReadyGeneration = 0;
 
+  /// OHOS-only: the in-process media_kit player that replaces the native one.
+  _OhosBackend? _ohos;
+
   int? get textureId => _textureId;
   bool get isCreated => _textureId != null && !_disposed;
 
@@ -260,6 +278,23 @@ class NativePlayer {
   }
 
   Future<int> _create(String cdnUrl, String keyHex) async {
+    // OHOS keeps decoding in this process, so there is no native player id to
+    // allocate: the backend drives libmpv directly and reports its texture id
+    // through the same `created` event the Android host sends.
+    if (Platform.operatingSystem == 'ohos') {
+      final backend = _ohos ??= _OhosBackend(this, keyHex);
+      try {
+        await backend.create(cdnUrl);
+        if (_textureId == null) {
+          throw StateError('Native player returned no texture id');
+        }
+        return _textureId!;
+      } catch (_) {
+        _creationFailed = true;
+        await _releaseNative();
+        rethrow;
+      }
+    }
     _ensureGlobalListener();
     // Disposal or an early native error can finish this future before the
     // method reply supplies an id. Observe errors now; the await below still
@@ -372,6 +407,36 @@ class NativePlayer {
     Map<String, dynamic> arguments = const {},
   ]) async {
     if (_disposed) return;
+    // The OHOS plugin owns only the texture surface and answers
+    // notImplemented for playback, so play/pause/seek/volume/rate must go to
+    // the in-process backend instead of the channel.
+    final ohos = _ohos;
+    if (ohos != null && ohos.isActive) {
+      switch (method) {
+        case 'play':
+          return ohos.play();
+        case 'pause':
+          return ohos.pause();
+        case 'seek':
+          final positionMs = arguments['positionMs'];
+          if (positionMs is num) {
+            return ohos.seek(Duration(milliseconds: positionMs.toInt()));
+          }
+          return;
+        case 'setVolume':
+          final volume = arguments['volume'];
+          if (volume is num) {
+            return ohos.setVolume(volume.toDouble());
+          }
+          return;
+        case 'setRate':
+          final rate = arguments['rate'];
+          if (rate is num) {
+            return ohos.setRate(rate.toDouble());
+          }
+          return;
+      }
+    }
     final playerId = _playerId;
     if (playerId == null) throw StateError('NativePlayer is not created');
     await _channel
@@ -380,9 +445,32 @@ class NativePlayer {
   }
 
   static Future<void> setKeepScreenOn(bool on) async {
+    if (Platform.operatingSystem == 'ohos') {
+      // The plugin replies asynchronously here, so this must not go through
+      // the 10s [_methodTimeout] helper: a late reply would leave a pending
+      // timer behind in widget tests.
+      await _invokeForeground('setKeepScreenOn', {'on': on});
+      return;
+    }
     await _channel
         .invokeMethod<void>('setKeepScreenOn', {'on': on})
         .timeout(_methodTimeout);
+  }
+
+  /// Sends a fire-and-forget command straight to the plugin.
+  ///
+  /// OHOS has no foreground media session yet (the plugin answers those two
+  /// methods as logged no-ops), so skip the channel entirely there.
+  static Future<void> _invokeForeground(
+    String method, [
+    Map<String, dynamic>? arguments,
+  ]) async {
+    if (Platform.operatingSystem == 'ohos') return;
+    if (arguments != null) {
+      await _channel.invokeMethod<void>(method, arguments);
+    } else {
+      await _channel.invokeMethod<void>(method);
+    }
   }
 
   /// [positionMs] / [durationMs] / [speed] 喂给系统媒体卡片：位置 + 倍速由系统外推，
@@ -402,7 +490,7 @@ class NativePlayer {
       // plugin replies synchronously, while Future.timeout() leaves a
       // pending 10s timer that breaks widget tests under FakeAsync when
       // the fire-and-forget call is still in flight at test end.
-      await _channel.invokeMethod<void>('startListenForeground', {
+      await _invokeForeground('startListenForeground', {
         'title': title,
         'episode': episode,
         'playing': playing,
@@ -420,7 +508,7 @@ class NativePlayer {
   static Future<void> stopListenForeground() async {
     try {
       // Same as startListenForeground: no .timeout(), see above.
-      await _channel.invokeMethod<void>('stopListenForeground');
+      await _invokeForeground('stopListenForeground');
     } catch (_) {
       // Best effort when channel/platform is unavailable or testing.
     }
@@ -449,6 +537,13 @@ class NativePlayer {
   }
 
   Future<void> _releaseNative() {
+    final ohos = _ohos;
+    if (ohos != null) {
+      return _nativeRelease ??= () async {
+        await ohos.release();
+        _ohos = null;
+      }();
+    }
     final playerId = _playerId;
     if (playerId == null) return Future<void>.value();
     return _nativeRelease ??= () {

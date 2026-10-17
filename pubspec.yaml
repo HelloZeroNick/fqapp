@@ -50,16 +50,12 @@ dependencies:
   # EncryptedHive (P1-3). Keys live in flutter_secure_storage (Keystore).
   hive_ce: ^2.0.0
   hive_ce_flutter: ^2.0.0
-  flutter_secure_storage: ^9.0.0
-  # 鸿蒙适配：fork 的父包 flutter_secure_storage 未声明 ohos 平台（见下方
-  # dependency_overrides 说明），只能像 fork 文档那样把 OHOS 实现包作为直接
-  # 依赖引入；它的 MethodChannel 名与 platform_interface 一致
-  # （plugins.it_nomads.com/flutter_secure_storage）。
-  flutter_secure_storage_ohos:
-    git:
-      url: https://gitcode.com/CPF-Flutter/fluttertpc_flutter_secure_storage.git
-      path: flutter_secure_storage_ohos
-      ref: 9.2.4-ohos-1.0.0
+  # 鸿蒙适配：参照 PiliNara/tsukuyomi-space-app 的做法，用本地 path 覆盖
+  # flutter_secure_storage（官方 9.2.4 父包未声明 ohos 平台），本地包只做
+  # re-export flutter_secure_storage_ohos；ohos 实现取 hosted 1.0.0 版。
+  flutter_secure_storage:
+    path: packages/flutter_secure_storage
+  flutter_secure_storage_ohos: ^1.0.0
   cached_network_image: ^4.0.0
   flutter_cache_manager: ^3.4.2
   flutter_riverpod: ^3.4.3
@@ -80,6 +76,16 @@ dependencies:
       ref: main
   image: ^4.12.0
   flutter_svg: ^2.3.0
+  # 鸿蒙播放后端：media_kit 是纯 Dart + dart:ffi 的 libmpv 封装（pubspec 里没有
+  # flutter.plugin 声明，所以加进来不会给 Android 带进 Gradle 子模块）。官方
+  # pub 版本（1.2.6）的 lib/ 下没有任何 ohos 分支，必须取 fork 的 pinned 提交；
+  # 8babdf4f 是媒体组核对过的远端分支头，含 player.dart / media_kit.dart 的
+  # `operatingSystem == 'ohos'` 分派与 native_library 的 libmpv.so 候选名。
+  media_kit:
+    git:
+      url: https://github.com/HelloZeroNick/media-kit.git
+      path: media_kit
+      ref: 8babdf4f456142fc8027f475838c5006da4656dd
 
 # 鸿蒙（OHOS）适配：以下包在 pub 上没有携带 ohos 平台的版本，改指到
 # OpenHarmony 社区维护的 fork。overrides 会绕过版本约束，因此 fork 版本号

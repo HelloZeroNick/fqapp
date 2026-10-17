@@ -2,6 +2,23 @@
 {
   "apiType": 'stageMode',
   "buildOption": {
+    "externalNativeOptions": {
+      "abiFilters": [
+        "arm64-v8a"
+      ]
+    },
+    "nativeLib": {
+      "filter": {
+        "excludes": [
+          "**/x86/**",
+          "**/x86_64/**",
+          "**/x86_64/*.so"
+        ]
+      }
+    },
+    "arkOptions": {
+      "autoLazyImport": true
+    }
   },
   "targets": [
     {

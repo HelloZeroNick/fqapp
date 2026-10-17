@@ -7,7 +7,10 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:hive_ce_flutter/hive_flutter.dart';
 
 import 'dart:async';
+import 'dart:io' show Platform;
 import 'dart:ui' show ImageFilter;
+
+import 'package:media_kit/media_kit.dart' as mk;
 
 import 'pages/home_page.dart';
 import 'pages/audio_page.dart';
@@ -37,6 +40,19 @@ import 'widgets/home/home_design.dart';
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
+  // OHOS 上播放走 libmpv（media_kit）：必须在任何 mk.Player 构造之前完成
+  // 初始化，否则 NativeLibrary.path 未注册，mk.Player 直接抛
+  // "MediaKit.ensureInitialized must be called before using any API"。只在
+  // OHOS 分支调用，Android/desktop 保持零开销；失败只让播放降级，不能拖住
+  // 整个应用启动。
+  if (Platform.operatingSystem == 'ohos') {
+    try {
+      mk.MediaKit.ensureInitialized();
+    } catch (error, stack) {
+      AppLog.e('media_kit', '初始化失败，OHOS 播放将不可用',
+          error: error, stack: stack);
+    }
+  }
   // 应用内日志：接管 debugPrint 与 FlutterError.onError，未处理异步异常由
   // runZonedGuarded 捕获；文件持久化异步开启，失败只退回内存模式。
   AppLog.instance.install();
