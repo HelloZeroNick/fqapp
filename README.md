@@ -1,3 +1,37 @@
+# fqapp 鸿蒙版（HarmonyOS / OpenHarmony）
+
+本分支是 [ch6vip/fqapp](https://github.com/ch6vip/fqapp) 的鸿蒙移植分支，仓库托管在
+[HelloZeroNick/fqapp](https://github.com/HelloZeroNick/fqapp) 的 `ohos` 分支。
+
+> [!WARNING]
+> 本分支只做一件事：把 fqapp 客户端适配到鸿蒙。
+>
+> - 产品功能、界面与分支特性以 [上游仓库](https://github.com/ch6vip/fqapp) 为准，鸿蒙侧不新增产品功能、不改变上游行为；
+> - 除鸿蒙平台相关的适配代码（`ohos/` 平台目录、OHOS 播放后端及鸿蒙构建产物）之外，其余代码应尽量与上游保持一致，以便后续继续同步上游；
+> - 目前仅保证 HarmonyOS 目标可编译、可运行到主要流程（小说阅读、短剧/漫剧 libmpv 播放、听书等）。
+
+## 提 issue 注意事项
+
+- 请先查看[是否已存在类似 issue](https://github.com/HelloZeroNick/fqapp/issues?q=is%3Aissue)，
+  并确保问题属于**鸿蒙版特有问题**（即上游/Android 版本没有该问题）。
+- 与鸿蒙无关的功能问题请提到 [上游仓库](https://github.com/ch6vip/fqapp)。
+
+## 编译运行
+
+- 1、配置鸿蒙 Flutter 环境（参考 [CPF-Flutter/flutter_flutter](https://gitcode.com/CPF-Flutter/flutter_flutter) 的 `oh-3.44.9-dev` 分支）；
+- 2、安装 DevEco Studio 与 HarmonyOS SDK，并配置好 `DEVECO_SDK_HOME`；
+- 3、OHOS 播放走 libmpv：先运行 `scripts/fetch_libmpv_ohos.ps1` 取回预编译产物（24MB，SHA256 固定，不入库）；
+- 4、Rust 核心交叉编译：`scripts/build_rust_ohos.ps1`（产物同样不入库）；
+- 5、`flutter pub get` 后使用 `flutter build hap --release` 或 DevEco Studio 构建运行。
+
+## 感谢
+
+- [ch6vip/fqapp](https://github.com/ch6vip/fqapp) 上游作者
+- [LINUX DO](https://linux.do/) 社区
+- 所有开发者和贡献者
+
+# 以下是原上游项目README
+
 <p align="center">
   <img src="assets/images/app_logo.webp" width="120" height="120" alt="fqapp Logo">
 </p>
