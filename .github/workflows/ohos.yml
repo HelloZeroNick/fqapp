@@ -51,7 +51,7 @@ jobs:
       - name: Collect unsigned HAP
         run: |
           mkdir -p dist
-          find build/app/outputs ohos/entry/build -name '*unsigned*.hap' -exec cp {} dist/ \;
+          find ohos/entry/build/default/outputs/default -name '*.hap' -exec cp {} dist/ \;
           ls -la dist/
       - uses: actions/upload-artifact@v4
         with:
