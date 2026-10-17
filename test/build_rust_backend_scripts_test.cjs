@@ -150,6 +150,47 @@ test('the Rust build script survives cargo writing progress to stderr', () => {
   );
 });
 
+test('the OHOS build script handles the load path flutter_rust_bridge uses', () => {
+  // flutter_rust_bridge opens the crate by bare name on OHOS
+  // (`ExternalLibrary.open('libfqapi_core.so')`), so the .so must be inside the
+  // module's libs/<arch> directory before Hvigor assembles the HAP. `flutter
+  // build hap` does not cross-compile the crate, hence the dedicated script.
+  const name = 'build_rust_ohos.ps1';
+  const source = readScript(name);
+  assert.ok(
+    source.includes('aarch64-unknown-linux-ohos'),
+    `${name} must target the OHOS triples`,
+  );
+  assert.ok(
+    source.includes('libfqapi_core.so'),
+    `${name} must produce libfqapi_core.so`,
+  );
+  assert.ok(
+    source.includes('ohos\\entry\\libs') && source.includes('arm64-v8a'),
+    `${name} must install into ohos/entry/libs/arm64-v8a`,
+  );
+  // CRIT-012 applies to this script too: cargo writes progress to stderr.
+  assert.ok(
+    source.includes('function Invoke-NativeCommand'),
+    `${name} must define a native-command wrapper`,
+  );
+  assert.ok(
+    !/^\s*cargo build /m.test(source),
+    `${name} must not invoke cargo outside the wrapper`,
+  );
+
+  // The generated .so is a build artifact and must stay out of Git, matching
+  // android/app/src/main/jniLibs/*/*.so.
+  const ignore = fs.readFileSync(
+    path.join(appDir, 'ohos', '.gitignore'),
+    'utf8',
+  );
+  assert.ok(
+    ignore.includes('**/libs/**/libfqapi_core.so'),
+    'the OHOS project must ignore the built core library',
+  );
+});
+
 test('a stale Android Rust core can be detected before packaging', () => {
   // CRIT-011: Gradle only checks that the core exists, so the freshness guard is
   // the only thing standing between a backfill release and a silently stale APK.

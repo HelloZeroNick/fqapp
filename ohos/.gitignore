@@ -1,0 +1,24 @@
+/node_modules
+/oh_modules
+/local.properties
+/.idea
+**/build
+/.hvigor
+.cxx
+/.clangd
+/.clang-format
+/.clang-tidy
+**/.test
+**/BuildProfile.ets
+**/oh-package-lock.json5
+/package.json
+/package-lock.json
+
+**/src/main/resources/rawfile/flutter_assets/
+# Flutter 引擎产物由 `flutter build hap` 拷贝，可重建，不入库。
+**/libs/**/libapp.so
+**/libs/**/libflutter.so
+**/libs/**/libvmservice_snapshot.so
+# Rust 核心由 scripts/build_rust_ohos.ps1 交叉编译后拷贝到 libs/，与 Android 侧
+# jniLibs/*/*.so 一致，只保留源码。缺这行会把 20MB+ 的 .so 混进提交。
+**/libs/**/libfqapi_core.so

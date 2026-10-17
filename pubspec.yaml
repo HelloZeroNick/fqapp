@@ -30,6 +30,10 @@ environment:
 dependencies:
   flutter:
     sdk: flutter
+  material_ui:
+    path: packages/material_ui
+  cupertino_ui:
+    path: packages/cupertino_ui
 
   # The following adds the Cupertino Icons font to your application.
   # Use with the CupertinoIcons class for iOS style icons.
@@ -47,18 +51,71 @@ dependencies:
   hive_ce: ^2.0.0
   hive_ce_flutter: ^2.0.0
   flutter_secure_storage: ^9.0.0
+  # 鸿蒙适配：fork 的父包 flutter_secure_storage 未声明 ohos 平台（见下方
+  # dependency_overrides 说明），只能像 fork 文档那样把 OHOS 实现包作为直接
+  # 依赖引入；它的 MethodChannel 名与 platform_interface 一致
+  # （plugins.it_nomads.com/flutter_secure_storage）。
+  flutter_secure_storage_ohos:
+    git:
+      url: https://gitcode.com/CPF-Flutter/fluttertpc_flutter_secure_storage.git
+      path: flutter_secure_storage_ohos
+      ref: 9.2.4-ohos-1.0.0
   cached_network_image: ^4.0.0
   flutter_cache_manager: ^3.4.2
   flutter_riverpod: ^3.4.3
   archive: ^4.3.0
   html: 0.15.6
   xml: ^7.0.1
-  flutter_lucide: ^1.43.0
+  flutter_lucide: ^1.58.0
   lottie: ^3.6.1
   flutter_rust_bridge: 2.13.0
+  #鸿蒙适配
+  flutter_rust_bridge_ohos: ^2.11.2
   connectivity_plus: ^7.3.1
+  # 鸿蒙适配：与 host 版 connectivity_plus 走同一 MethodChannel
+  # （dev.fluttercommunity.plus/connectivity），该包只做原生注册，Dart 侧为空。
+  connectivity_plus_ohos:
+    git:
+      url: https://github.com/HelloZeroNick/connectivity_plus_ohos.git
+      ref: main
   image: ^4.12.0
   flutter_svg: ^2.3.0
+
+# 鸿蒙（OHOS）适配：以下包在 pub 上没有携带 ohos 平台的版本，改指到
+# OpenHarmony 社区维护的 fork。overrides 会绕过版本约束，因此 fork 版本号
+# 低于 pubspec.lock 中已解析的版本属预期现象，差异见本轮报告。
+dependency_overrides:
+  # 强制第三方包里的 material_ui/cupertino_ui 也走本地 shim
+  material_ui:
+    path: packages/material_ui
+  cupertino_ui:
+    path: packages/cupertino_ui
+  # 应用可用路径。取 pinned 分支而非 PiliNara 的 ref HEAD，避免上游漂移。
+  path_provider:
+    git:
+      url: https://gitcode.com/openharmony-sig/flutter_packages.git
+      path: packages/path_provider/path_provider
+      ref: br_path_provider-v2.1.5_ohos
+  # 键值存储。与 PiliNara 同一分支。
+  shared_preferences:
+    git:
+      url: https://gitcode.com/CPF-Flutter/flutter_packages.git
+      path: packages/shared_preferences/shared_preferences
+      ref: br_shared_preferences-v2.5.4_ohos
+  # 打开链接。与 PiliNara 同一 fork。
+  url_launcher:
+    git:
+      url: https://gitcode.com/hellozeronick/url_launcher.git
+      path: url_launcher
+      ref: main
+  # 数据库。PiliNara 未适配 sqflite（它不用 flutter_cache_manager），
+  # 但本项目的 cached_network_image -> flutter_cache_manager 依赖 sqflite，
+  # 海报/网络图缓存路径在鸿蒙上需要它。
+  sqflite:
+    git:
+      url: https://gitcode.com/openharmony-sig/flutter_sqflite.git
+      path: sqflite
+      ref: br_v2.4.2_ohos
 dev_dependencies:
   flutter_test:
     sdk: flutter

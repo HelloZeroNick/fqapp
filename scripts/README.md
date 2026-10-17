@@ -7,6 +7,7 @@
 | 脚本 | 用途 | 依赖与输出 |
 | --- | --- | --- |
 | [build_rust_backend.ps1](build_rust_backend.ps1) / [.sh](build_rust_backend.sh) | 生成 FRB 绑定并交叉编译 Rust ARM64 核心 | Rust、NDK、FRB codegen 2.13.0；输出到 `android/app/src/main/jniLibs/arm64-v8a/` |
+| [build_rust_ohos.ps1](build_rust_ohos.ps1) | 交叉编译 Rust ARM64 核心到 OHOS | Rust、OpenHarmony SDK（环境变量 `OHOS_SDK_HOME` 指向 `<sdk>/<version>/native`）；输出到 `ohos/entry/libs/arm64-v8a/` |
 | [run_rust_host_tests.ps1](run_rust_host_tests.ps1) / [.sh](run_rust_host_tests.sh) | 构建宿主核心，运行真实 Dart → FRB → Rust 集成测试 | Rust、Flutter；使用本地 Mock 上游和临时运行目录 |
 | [verify_android_apk.py](verify_android_apk.py) | 检查 APK 签名、库、版本、资源及 16 KiB 对齐 | Python 3、Android Build-Tools；报告目录由参数指定 |
 | [check_native_alignment.cjs](check_native_alignment.cjs) | 检查一个或多个 ARM64 ELF 库的 LOAD 段对齐 | Node.js；只读取指定 `.so` |
@@ -35,6 +36,17 @@ bash scripts/run_rust_host_tests.sh
 Windows 构建开关为 `-SkipCodegen`、`-HostLib`、`-Profile debug`；Shell 版对应 `--skip-codegen`、`--host-lib`、`--profile debug`。宿主测试的 `-SkipBuild` / `--skip-build` 只在宿主库已经更新时使用。
 
 FRB 绑定发生变化时，还需再次生成并比较内容哈希，确认可复现。生成的文件位置见本地 `docs/project-structure.md`（不入库）。
+
+### OHOS
+
+OHOS 侧单独走 `build_rust_ohos.ps1`：FRB 在鸿蒙上按裸名 `libfqapi_core.so` 打开库，所以 `.so` 必须先落在 `ohos/entry/libs/arm64-v8a/`，Hvigor 才会把它打进 HAP；`flutter build hap` 不负责交叉编译该 crate。漏掉这一步，HAP 里只有 `libapp.so` / `libflutter.so`，启动即报 `Failed to load dynamic library 'libfqapi_core.so'`。
+
+```powershell
+.\scripts\build_rust_ohos.ps1            # 编译并拷贝到 ohos/entry/libs/arm64-v8a/
+flutter build hap --release --target-platform ohos-arm64 --no-pub
+```
+
+构建开关为 `-Profile debug`、`-SkipCopy`。脚本通过 `OHOS_SDK_HOME` 定位 SDK，并要求 `rustup target add aarch64-unknown-linux-ohos`；Windows 上需要 `<sdk>/tools` 下的 clang 包装批处理，因为 rustc 无法执行 SDK 附带的 POSIX 脚本。
 
 ## 常规验证
 

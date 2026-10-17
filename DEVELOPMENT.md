@@ -73,6 +73,7 @@ fqapp/
 │   └── src/rust/                    # FRB 生成绑定
 ├── rust/                            # fqapi_core 源码、协议夹具和 Rust 测试
 ├── android/                         # Android 工程、原生插件与 JVM 测试
+├── ohos/                            # OHOS 工程（Flutter for OHOS 生成的 HAR/HAP 壳）
 ├── native/                          # CENC 流式 C 解密库、JNI 与 CMake
 ├── assets/                          # 配置示例、Web UI、插件、图片和动画
 ├── test/                            # Flutter 测试及 Node 主机回归
@@ -86,6 +87,7 @@ fqapp/
 > 前者可由 `rust/` 中的 Rust 源码经 `scripts/build_rust_backend.*` 重建；
 > `libshortplay_crypto.so` 由本仓库 `native/` 中的 C 源码在 Android 构建时自动生成。
 > Android 构建前需先运行 Rust 构建脚本生成 ARM64 核心库。
+> OHOS 构建前需运行 `scripts/build_rust_ohos.ps1`，把核心库放进 `ohos/entry/libs/arm64-v8a/`。
 >
 > 体积参考：Rust ARM64 `libfqapi_core.so` 为 6,125,392 字节（约 5.84 MiB）。这是本地 release
 > 构建产物的实测大小，不是安装包体积，也不是性能结论。
@@ -106,6 +108,7 @@ fqapp/
 | JDK | 17 | Android Gradle 构建 |
 | Android NDK | 28.2.13676358 | 交叉编译 Rust ARM64 核心与 C 流式解密库 |
 | CMake | 3.22.1 | Android 构建自动编译 C 库 |
+| OpenHarmony SDK | 5.0.5(17)+ | 构建 HAP（`OHOS_SDK_HOME` 指向 `native` 目录）；另需 Rust target `aarch64-unknown-linux-ohos` |
 
 > Windows 下构建注意：Kotlin 增量编译在部分环境会报 `Could not close incremental caches`，已在 `android/gradle.properties` 中关闭（`kotlin.incremental=false`）。
 
@@ -165,6 +168,24 @@ flutter build apk --release --target-platform android-arm64
 生成的 APK 仅支持 `arm64-v8a`；如果要支持 32 位或 x86 设备，需要先为
 对应 ABI 交叉编译并打包 `libfqapi_core.so` 和 `libshortplay_crypto.so`，同时调整 ABI 配置。
 
+### 4. 构建 HAP（OHOS）
+
+鸿蒙侧与 Android 分开打包，额外一步交叉编译 Rust 核心：
+
+```powershell
+.\scripts\build_rust_ohos.ps1
+flutter build hap --release --target-platform ohos-arm64 --no-pub
+```
+
+`flutter build hap` 不会编译 `fqapi_core`；FRB 在 OHOS 上按裸名打开
+`libfqapi_core.so`，因此这个库必须先放进 `ohos/entry/libs/arm64-v8a/`，Hvigor 才会把它
+打进 HAP。漏掉该步骤时 HAP 里只有 `libapp.so` / `libflutter.so`，启动即报
+`Failed to load dynamic library 'libfqapi_core.so': No such file or directory`。
+
+前置条件：OpenHarmony SDK（`OHOS_SDK_HOME` 指向 `<sdk>/<version>/native`）、
+`rustup target add aarch64-unknown-linux-ohos`。Windows 上还需要 `<sdk>/tools` 下的
+clang 包装批处理，因为 rustc 无法执行 SDK 附带的 POSIX 脚本。
+
 ### GitHub Actions 云端编译
 
 打开 [Actions → Android APK](https://github.com/ch6vip/fqapp/actions/workflows/android-apk.yml)，
@@ -206,13 +227,23 @@ JVM 单测也不需要签名。可以保留，也可以删除。）
 ELF/ZIP 的 16 KiB 对齐检查通过后，仍需在对应 Android 设备上验证实际播放；
 开启 R8 后还必须额外确认 JNI 符号没被改名破坏（真机验收清单由维护者本地留档）。
 
-### 4. 安装运行
+### 5. 安装运行
 
 ```powershell
 # 真机 USB 调试连接后
 adb install -r build\app\outputs\flutter-apk\app-debug.apk
 adb shell am start -n com.fqapp.fqapp/.MainActivity
 ```
+
+#### OHOS（hdc）
+
+```powershell
+hdc install -r ohos/entry/build/default/outputs/default/entry-default-signed.hap
+hdc shell aa start -a EntryAbility -b com.fqapp.fqapp
+```
+
+鸿蒙真机上库由 HAP 的 `libs/arm64-v8a/` 提供，`nativeLibraryPath` 为 `libs/arm64`；
+启动失败时先用 `hdc shell hilog -x` 搜索 `Failed to load dynamic library` 确认缺的是哪个库。
 
 首次启动：App 将运行时资源部署到 `files/backend/`，通过 flutter_rust_bridge 初始化 Rust 原生核心，健康检查通过后进入主界面。
 已有缓存时也可在启动页面直接进入离线阅读。
