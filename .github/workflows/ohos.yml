@@ -42,12 +42,16 @@ jobs:
         env:
           GIT_LFS_SKIP_SMUDGE: 1
       - name: Build HAP
-        # No signing material on CI: the Hvigor assembleHap step fails asking
-        # for a debug signature, but the unsigned HAP is already produced
-        # (same approach as PiliNara's release-ohos.yml).
+        # Release, not debug: the artifact is published for users, so it must be
+        # an AOT build without the debug runtime's JIT/assert overhead. CI holds
+        # no signing material, so Hvigor's signing step can still fail after the
+        # unsigned package is written; failure here is not a verdict -- the
+        # collect step below decides whether a usable release HAP exists and
+        # fails loudly when it does not.
         continue-on-error: true
         run: |
-          flutter build hap --debug --target-platform ohos-arm64
+          flutter build hap --release --target-platform ohos-arm64
+
       - name: Collect unsigned HAP
         run: |
           # Hvigor names the product `entry-default-unsigned.hap`. Publishing
@@ -68,13 +72,25 @@ jobs:
           fi
           hap="$(find ohos/entry/build/default/outputs/default -maxdepth 1 -name '*.hap' ! -name '*-signed.hap' | head -n1)"
           if [[ -z "$hap" ]]; then
-            echo '::error::flutter build hap did not produce an unsigned .hap' >&2
+            echo '::error::flutter build hap --release did not produce an unsigned .hap' >&2
             find ohos/entry/build -name '*.hap' >&2 || true
+            exit 1
+          fi
+          # The build step is allowed to fail on signing, so it cannot vouch for
+          # the mode. Assert it here instead: a debug HAP still loads and still
+          # installs, which is exactly how a JIT package would slip into a
+          # release unnoticed. With --release the engine ships libapp.so (AOT);
+          # a debug build does not, so an empty or absent payload is the tell.
+          payloads="$(unzip -l "$hap" | grep -c 'libs/.*/libapp\.so')"
+          if [[ "${payloads:-0}" -eq 0 ]]; then
+            echo '::error::The collected HAP has no libapp.so AOT payload; it is not a release build' >&2
+            unzip -l "$hap" | head -40 >&2 || true
             exit 1
           fi
           target="dist/fqapp-${version}-ohos-arm64-unsigned.hap"
           install -m 0644 "$hap" "$target"
-          printf 'hap_source=%s\nhap_name=%s\n' "$hap" "$(basename "$target")"
+          printf 'hap_source=%s\nhap_name=%s\nhap_aot_payloads=%s\n' \
+            "$hap" "$(basename "$target")" "$payloads"
           ls -la dist/
           case "$target" in *.hap) ;; *) echo '::error::release artifact must end in .hap' >&2; exit 1;; esac
       - uses: actions/upload-artifact@v4
