@@ -41,6 +41,36 @@ jobs:
         run: flutter pub get
         env:
           GIT_LFS_SKIP_SMUDGE: 1
+
+      # `flutter build hap` packages only what Hvigor finds in the module's
+      # libs directory; it never cross-compiles the Rust crate or fetches
+      # libmpv. Skipping these two steps still produced a green build, but the
+      # HAP shipped libapp.so/libflutter.so only and the app died at startup
+      # with "Failed to load dynamic library 'libfqapi_core.so'". They are
+      # ordered before the build because Hvigor copies libs/ at assemble time.
+      - name: Install the pinned Rust toolchain for the OHOS target
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          # Pinned to the exact stable release, not the floating `stable`
+          # channel: a release must not silently change the toolchain it was
+          # built with. Kept in step with the Android workflow's pin.
+          toolchain: '1.99.1'
+          targets: aarch64-unknown-linux-ohos
+
+      - name: Cache the Cargo build
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: rust
+          key: ohos-aarch64
+
+      - name: Cross-compile the Rust core for OHOS arm64
+        # OHOS_NDK_HOME is exported by ErBWs/setup-ohos and is what the script
+        # resolves the clang wrapper and libc++_shared.so from.
+        run: bash scripts/build_rust_ohos.sh
+
+      - name: Install the prebuilt libmpv and libc++ runtime
+        run: bash scripts/fetch_libmpv_ohos.sh
+
       - name: Build HAP
         # Release, not debug: the artifact is published for users, so it must be
         # an AOT build without the debug runtime's JIT/assert overhead. CI holds
@@ -85,6 +115,29 @@ jobs:
           if [[ "${payloads:-0}" -eq 0 ]]; then
             echo '::error::The collected HAP has no libapp.so AOT payload; it is not a release build' >&2
             unzip -l "$hap" | head -40 >&2 || true
+            exit 1
+          fi
+          # The same trap applies to the native libraries: a HAP that builds
+          # green without libfqapi_core.so still installs and then crashes on
+          # the first FFI call. libmpv and libc++_shared are its companions --
+          # libmpv has DT_NEEDED libc++_shared, and devices ship neither.
+          unzip -l "$hap" > /tmp/hap-listing.txt
+          missing=()
+          for required in libfqapi_core.so libmpv.so libc++_shared.so; do
+            if ! grep -q "libs/arm64-v8a/${required}\$" /tmp/hap-listing.txt; then
+              missing+=("$required")
+            fi
+          done
+          if [ "${#missing[@]}" -gt 0 ]; then
+            echo "::error::The HAP is missing native libraries: ${missing[*]}" >&2
+            grep 'libs/' /tmp/hap-listing.txt >&2 || true
+            exit 1
+          fi
+          # A library can be present yet be a 0-byte placeholder if a copy step
+          # half-failed; require a plausible ELF size for the Rust core.
+          fqapi_size="$(unzip -l "$hap" | awk '$4 ~ /libs\/arm64-v8a\/libfqapi_core\.so$/ {print $1}')"
+          if [ "${fqapi_size:-0}" -lt 100000 ]; then
+            echo "::error::libfqapi_core.so in the HAP is only ${fqapi_size:-0} bytes; the Rust core did not build" >&2
             exit 1
           fi
           target="dist/fqapp-${version}-ohos-arm64-unsigned.hap"
