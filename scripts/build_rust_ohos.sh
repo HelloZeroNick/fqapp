@@ -93,17 +93,21 @@ if [ -z "$OHOS_NATIVE" ]; then
   exit 1
 fi
 
-# The clang wrapper named after the target is the SDK's own cross linker. On
-# POSIX these are executable shell scripts, which rustc can run directly.
+# The wrapper named after the target is the SDK's own cross linker. It lives in
+# <native>/llvm/bin on every platform; the sibling `tools` directory only holds
+# Windows `.bat` shims (which is why the first CI attempt failed to find it).
+# Probe both, in that order, so either layout works.
 TOOLS_DIR=""
-for candidate in "$OHOS_NATIVE/tools" "$(dirname "$OHOS_NATIVE")/tools" "$(dirname "$(dirname "$OHOS_NATIVE")")/tools"; do
+for candidate in "$OHOS_NATIVE/llvm/bin" "$OHOS_NATIVE/tools" \
+                 "$(dirname "$OHOS_NATIVE")/tools" \
+                 "$(dirname "$(dirname "$OHOS_NATIVE")")/tools"; do
   if [ -x "$candidate/$TARGET-clang" ]; then
     TOOLS_DIR="$candidate"
     break
   fi
 done
 if [ -z "$TOOLS_DIR" ]; then
-  echo "错误：未找到 OHOS 链接器包装 $TARGET-clang。已尝试 $OHOS_NATIVE/tools 及其上级目录。" >&2
+  echo "错误：未找到 OHOS 链接器包装 $TARGET-clang（查找 $OHOS_NATIVE/llvm/bin 及其上级 tools）。" >&2
   exit 1
 fi
 
