@@ -150,6 +150,25 @@ class ReaderDevice {
     if (path is! String || path.isEmpty || name is! String) return null;
     return ReaderFont(path: path, name: name);
   }
+
+  /// Copies an already-imported font [path] to a user-picked location. Returns
+  /// true on success, false on cancel. Only meaningful on platforms that have a
+  /// document picker; Android has no export counterpart today, so it degrades to
+  /// false there instead of throwing.
+  Future<bool> exportFont({required String path, required String name}) async {
+    if (_closed || path.isEmpty) return false;
+    try {
+      return await _channel.invokeMethod<bool>(
+            'exportFont',
+            {'path': path, 'name': name},
+          ) ??
+          false;
+    } on MissingPluginException {
+      return false;
+    } on PlatformException {
+      return false;
+    }
+  }
 }
 
 /// Thrown when the process has already imported [ReaderFonts.maxFamilies]

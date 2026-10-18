@@ -34,7 +34,8 @@ const List<String> ohosProtocolWhitelist = <String>[
 /// These are FFmpeg AVFormatContext options that media_kit relies on for HLS and
 /// for the odd extensions this app's CDN serves, so they must survive the
 /// decryption key being appended.
-const String _baseDemuxerLavfOptions = 'seg_max_retry=5,'
+const String _baseDemuxerLavfOptions =
+    'seg_max_retry=5,'
     'strict=experimental,'
     'allowed_extensions=ALL';
 
@@ -91,6 +92,23 @@ String ohosDemuxerLavfOptions({
 double ohosVolume(double volume) {
   if (volume.isNaN) return 0;
   return (volume * 100).clamp(0, 100).toDouble();
+}
+
+/// Converts this app's 0..1 volume into the system media stream's own level
+/// scale (`min`..`max`, typically 0..15), which is what AVVolumePanel expects.
+///
+/// The result is rounded because the panel takes an integer level, and for any
+/// non-zero request it stays at least one step above `min`: a 0.1 request must
+/// not round down to silence, since the caller asked for sound. A non-finite
+/// or negative value mutes, matching [ohosVolume].
+double ohosSystemVolume(double volume, {required int min, required int max}) {
+  final span = max - min;
+  if (span <= 0) return max.toDouble();
+  if (!volume.isFinite || volume <= 0) return min.toDouble();
+  if (volume >= 1) return max.toDouble();
+  final level = (min + span * volume.clamp(0.0, 1.0)).round();
+  final audible = level > min ? level : min + 1;
+  return (audible > max ? max : audible).toDouble();
 }
 
 /// Longest edge mpv will be asked to render. HarmonyOS caps a texture axis, and

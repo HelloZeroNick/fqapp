@@ -37,9 +37,14 @@ void main() {
       expect(options, contains('allowed_extensions=ALL'));
       expect(
         options,
-        contains('protocol_whitelist=[udp,rtp,tcp,tls,data,file,http,https,crypto]'),
+        contains(
+          'protocol_whitelist=[udp,rtp,tcp,tls,data,file,http,https,crypto]',
+        ),
       );
-      expect(options, contains('decryption_key=0123456789abcdef0123456789abcdef'));
+      expect(
+        options,
+        contains('decryption_key=0123456789abcdef0123456789abcdef'),
+      );
     });
 
     test('omits decryption_key when the key is missing', () {
@@ -64,7 +69,10 @@ void main() {
         protocolWhitelist: ohosProtocolWhitelist,
         contentKeyHex: '0123456789ABCDEF0123456789ABCDEF',
       );
-      expect(options, contains('decryption_key=0123456789abcdef0123456789abcdef'));
+      expect(
+        options,
+        contains('decryption_key=0123456789abcdef0123456789abcdef'),
+      );
     });
 
     test('uses the supplied whitelist', () {
@@ -156,6 +164,44 @@ void main() {
     test('clamps out of range values', () {
       expect(ohosVolume(-1), 0);
       expect(ohosVolume(2), 100);
+    });
+  });
+
+  group('ohosSystemVolume', () {
+    test('maps 0..1 onto the stream min..max', () {
+      expect(ohosSystemVolume(0, min: 0, max: 15), 0);
+      expect(ohosSystemVolume(1, min: 0, max: 15), 15);
+    });
+
+    test('never returns a muted level for a non-zero request', () {
+      // A stream whose minimum is above the device's own 0 keeps sound audible
+      // for every non-zero request; rounding 0.1*15 = 1.5 stays above min.
+      expect(ohosSystemVolume(0.1, min: 0, max: 15), greaterThan(0));
+    });
+
+    test('clamps out of range and non-finite values', () {
+      expect(ohosSystemVolume(-1, min: 0, max: 15), 0);
+      expect(ohosSystemVolume(2, min: 0, max: 15), 15);
+      expect(ohosSystemVolume(double.nan, min: 0, max: 15), 0);
+    });
+
+    test('clamps into the stream range when the minimum is above zero', () {
+      expect(ohosSystemVolume(0, min: 1, max: 15), 1);
+      expect(ohosSystemVolume(1, min: 1, max: 15), 15);
+    });
+
+    test('keeps a request above the minimum audible', () {
+      // 0.01*14 = 0.14 rounds to 0, which would silence a request for sound.
+      expect(ohosSystemVolume(0.01, min: 1, max: 15), 2);
+    });
+
+    test('rounds to the nearest step instead of truncating', () {
+      // 0.5*15 = 7.5 must land on 8, not be floored to 7.
+      expect(ohosSystemVolume(0.5, min: 0, max: 15), 8);
+    });
+
+    test('returns max when the stream has a single level', () {
+      expect(ohosSystemVolume(0.5, min: 4, max: 4), 4);
     });
   });
 }

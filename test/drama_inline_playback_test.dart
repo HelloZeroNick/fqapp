@@ -185,6 +185,11 @@ void main() {
   // has to exist before the first build.
   setUp(() async {
     SharedPreferences.setMockInitialValues({});
+    // DramaMutePreferences caches its first read for the process, so a test
+    // that claims the read (the inline card does, while mounting) would
+    // otherwise leak its value into every later test in this file; that is why
+    // the "start muted" test looked green alone but failed in the full run.
+    DramaMutePreferences.instance.resetForTest();
     TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
         .setMockMethodCallHandler(
           const MethodChannel('fqapp/native_player'),

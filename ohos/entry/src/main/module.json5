@@ -22,6 +22,9 @@
         "startWindowBackground": "$color:start_window_background",
         "startWindow": "$profile:start_window",
         "exported": true,
+        "backgroundModes": [
+          "audioPlayback"
+        ],
         "skills": [
           {
             "entities": [
@@ -36,6 +39,9 @@
     ],
     "requestPermissions": [
       {"name" :  "ohos.permission.INTERNET"},
+      // Required by backgroundTaskManager.startBackgroundRunning for the
+      // AUDIO_PLAYBACK long-running task held during background listening.
+      {"name" :  "ohos.permission.KEEP_BACKGROUND_RUNNING"}
     ]
   }
 }

@@ -459,13 +459,13 @@ class NativePlayer {
 
   /// Sends a fire-and-forget command straight to the plugin.
   ///
-  /// OHOS has no foreground media session yet (the plugin answers those two
-  /// methods as logged no-ops), so skip the channel entirely there.
+  /// Deliberately without [_methodTimeout]: the OHOS plugin replies from a
+  /// promise chain (long-running task + AVSession setup), and a late reply
+  /// would leave a pending timer behind in widget tests under FakeAsync.
   static Future<void> _invokeForeground(
     String method, [
     Map<String, dynamic>? arguments,
   ]) async {
-    if (Platform.operatingSystem == 'ohos') return;
     if (arguments != null) {
       await _channel.invokeMethod<void>(method, arguments);
     } else {

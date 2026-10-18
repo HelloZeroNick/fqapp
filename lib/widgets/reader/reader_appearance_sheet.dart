@@ -18,6 +18,8 @@ class ReaderAppearanceSheet extends StatefulWidget {
   final ReaderPreferences initialValue;
   final ValueChanged<ReaderPreferences> onChanged;
   final Future<ReaderFont?> Function() onPickFont;
+  final Future<bool> Function({required String path, required String name})?
+      onExportFont;
 
   /// 全局墨水屏模式已开启时，阅读背景跟随全局，不由本面板的色块决定。
   /// 此时面板显示墨水屏为选中，色块点按禁用，避免点 夜间/米白 却毫无变化。
@@ -28,6 +30,7 @@ class ReaderAppearanceSheet extends StatefulWidget {
     required this.initialValue,
     required this.onChanged,
     required this.onPickFont,
+    this.onExportFont,
     this.einkOverride = false,
   });
 
@@ -43,6 +46,7 @@ class _ReaderAppearanceSheetState extends State<ReaderAppearanceSheet> {
   ReaderThemePreset get _displayPreset =>
       widget.einkOverride ? ReaderThemePreset.eink : _value.themePreset;
   bool _importing = false;
+  bool _exporting = false;
   String? _fontError;
 
   /// Applies the pending value to the reader page. The reader re-measures the
@@ -102,6 +106,30 @@ class _ReaderAppearanceSheetState extends State<ReaderAppearanceSheet> {
       );
     } finally {
       if (mounted) setState(() => _importing = false);
+    }
+  }
+
+  Future<void> _exportFont() async {
+    if (_value.fontPath.isEmpty) return;
+    setState(() => _exporting = true);
+    try {
+      final exported = await widget.onExportFont?.call(
+        path: _value.fontPath,
+        name: _value.fontName,
+      );
+      if (!mounted) return;
+      if (exported == null || exported == false) {
+        _fontError = null;
+      }
+    } catch (error) {
+      if (!mounted) return;
+      setState(
+        () => _fontError = error is PlatformException
+            ? error.message ?? '字体导出失败'
+            : '字体导出失败',
+      );
+    } finally {
+      if (mounted) setState(() => _exporting = false);
     }
   }
 
@@ -393,6 +421,26 @@ class _ReaderAppearanceSheetState extends State<ReaderAppearanceSheet> {
                                     ),
                                   ],
                                 ),
+                                if (_value.fontPath.isNotEmpty)
+                                  Padding(
+                                    padding: const EdgeInsets.only(top: 4),
+                                    child: Row(
+                                      children: [
+                                        Text(
+                                          _value.fontName,
+                                          style: const TextStyle(fontSize: 12),
+                                          overflow: TextOverflow.ellipsis,
+                                        ),
+                                        const Spacer(),
+                                        TextButton(
+                                          onPressed: _exporting ? null : _exportFont,
+                                          child: _exporting
+                                              ? const Text('导出中…')
+                                              : const Text('导出字体'),
+                                        ),
+                                      ],
+                                    ),
+                                  ),
                                 if (_fontError != null)
                                   Padding(
                                     padding: const EdgeInsets.only(top: 4),

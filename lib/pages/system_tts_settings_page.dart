@@ -1,3 +1,5 @@
+import 'dart:io';
+
 import 'package:flutter/material.dart';
 
 import '../services/system_tts.dart';
@@ -100,6 +102,7 @@ class _SystemTtsSettingsPageState extends State<SystemTtsSettingsPage>
         .where((e) => e.package == _defaultEngine)
         .firstOrNull
         ?.label;
+    final isOhos = Platform.operatingSystem == 'ohos';
     return Scaffold(
       appBar: AppBar(title: const Text('系统朗读')),
       body: _loading
@@ -107,27 +110,35 @@ class _SystemTtsSettingsPageState extends State<SystemTtsSettingsPage>
           : ListView(
               padding: const EdgeInsets.all(16),
               children: [
-                const Text(
-                  '从小说或本地书阅读页点“听书”即可使用。支持已安装的系统 TTS 引擎，例如 MultiTTS；音色和联网需求由引擎管理。',
+                Text(
+                  isOhos
+                      ? '从小说或本地书阅读页点“听书”即可使用。系统使用鸿蒙基础语音服务（Core Speech Kit）朗读，可在下方选择音色与语速。'
+                      : '从小说或本地书阅读页点“听书”即可使用。支持已安装的系统 TTS 引擎，例如 MultiTTS；音色和联网需求由引擎管理。',
                 ),
                 const SizedBox(height: 16),
                 if (_error != null) ...[
                   Text(_error!),
                   TextButton(onPressed: _load, child: const Text('重试')),
                 ] else if (_engines.isEmpty)
-                  const Text('没有找到朗读引擎，请先安装并在引擎应用中配置中文语音。')
+                  Text(
+                    isOhos
+                        ? '没有找到可用音色，请在系统设置中下载中文或英文语音包。'
+                        : '没有找到朗读引擎，请先安装并在引擎应用中配置中文语音。',
+                  )
                 else ...[
                   if (selectedMissing)
                     const Padding(
                       padding: EdgeInsets.only(bottom: 12),
-                      child: Text('之前选择的引擎已不可用，请重新选择。'),
+                      child: Text('之前选择的音色已不可用，请重新选择。'),
                     ),
                   DropdownButtonFormField<String>(
                     key: ValueKey(_prefs.engine ?? ''),
                     initialValue: selectedMissing
                         ? null
                         : (_prefs.engine ?? ''),
-                    decoration: const InputDecoration(labelText: '朗读引擎'),
+                    decoration: InputDecoration(
+                      labelText: isOhos ? '朗读音色' : '朗读引擎',
+                    ),
                     items: [
                       DropdownMenuItem(
                         value: '',
@@ -184,13 +195,18 @@ class _SystemTtsSettingsPageState extends State<SystemTtsSettingsPage>
                   ),
                 ],
                 const SizedBox(height: 12),
-                const Text('引擎和语速修改在关闭当前系统朗读、重新开始后生效。部分引擎暂停后会从当前短句重读。'),
-                const SizedBox(height: 12),
-                OutlinedButton.icon(
-                  onPressed: _openSettings,
-                  icon: const Icon(Icons.settings_voice),
-                  label: const Text('打开系统语音设置'),
+                Text(
+                  isOhos
+                      ? '音色与语速修改在关闭当前朗读、重新开始后生效。'
+                      : '引擎和语速修改在关闭当前系统朗读、重新开始后生效。部分引擎暂停后会从当前短句重读。',
                 ),
+                const SizedBox(height: 12),
+                if (!isOhos)
+                  OutlinedButton.icon(
+                    onPressed: _openSettings,
+                    icon: const Icon(Icons.settings_voice),
+                    label: const Text('打开系统语音设置'),
+                  ),
               ],
             ),
     );

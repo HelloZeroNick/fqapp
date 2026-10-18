@@ -6,6 +6,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import '../models/media_item.dart';
 import 'api_client.dart';
+import 'app_log.dart';
 import 'audio_preferences.dart';
 import 'backend_transport.dart';
 import 'chapter_cache_store.dart';
@@ -69,7 +70,11 @@ class SystemTtsPreferences {
 
   static Future<SystemTtsPreferences> load() async {
     final sp = await SharedPreferences.getInstance();
-    final rate = sp.getDouble('system_tts_rate') ?? 1;
+    // shared_preferences_ohos 在 getDouble 里走 `Number(value)`，整数值会以
+    // int 形式回传，Dart 侧的 double? 强制转换随即抛
+    // "type 'int' is not a subtype of type 'double?'"（默认语速 1 正好命中）。
+    // 统一按 num 取值再转换，与仓库其他位置的宽松读取保持一致。
+    final rate = (sp.get('system_tts_rate') as num?)?.toDouble() ?? 1;
     return SystemTtsPreferences(
       engine: sp.getString('system_tts_engine'),
       rate: rate.isFinite ? rate.clamp(0.5, 2) : 1,
@@ -390,6 +395,10 @@ class SystemTtsPlayback extends ChangeNotifier with WidgetsBindingObserver {
 
   Future<void> _fail(Object e) async {
     if (closed) return;
+    // 排障关键：正文加载、引擎初始化与 speak 三段共用同一个失败出口，
+    // 此前没有任何落盘记录，真机只看得到一句兜底文案。AppLog 会把异常类型、
+    // 消息与堆栈写进应用日志页，warn 及以上级别还会立即 flush 到文件。
+    AppLog.e('system_tts', '朗读失败', error: e, stack: StackTrace.current);
     error = SystemTts.errorMessage(e);
     _ready = false;
     await pause();

@@ -12,12 +12,12 @@
 /// ohos/entry/src/main/ets/plugins/NativePlayerPlugin.ets, and the same
 /// texture is reported back as the player's texture id.
 ///
-/// The plugin deliberately owns only the surface lifecycle. It answers
-/// `createSurface` / `setSurfaceSize` / `disposeSurface` / `setKeepScreenOn`
-/// and the two foreground-session no-ops, and reports `notImplemented` for
-/// everything else -- in particular `create`, `play`, `pause`, `seek`,
-/// `setVolume`, `setRate` and `dispose`, which is why [NativePlayer._invoke]
-/// must not be reached on this platform.
+/// The plugin deliberately owns only the surface lifecycle plus the two
+/// platform integrations Dart cannot reach: `setKeepScreenOn`, the pair
+/// `startListenForeground` / `stopListenForeground`, and `setSystemVolume`.
+/// It reports `notImplemented` for everything else -- in particular `create`,
+/// `play`, `pause`, `seek`, `setRate` and `dispose`, which is why
+/// [NativePlayer._invoke] must not be reached on this platform.
 
 part of 'native_player.dart';
 
@@ -213,8 +213,21 @@ class _OhosBackend {
     },
   );
 
+  /// Routes the player volume to the system media volume via the plugin.
+  ///
+  /// HarmonyOS gives third-party apps no writable system-volume API -- libmpv's
+  /// own `volume`/`mute` properties only affect its output, which is why the
+  /// short-drama "start muted" default appeared to do nothing. The ArkTS side
+  /// maps 0..1 onto the media stream through an AVVolumePanel node, so this
+  /// deliberately no longer touches mpv on that path.
   Future<void> setVolume(double volume) => _run(
-    () => _player?.setVolume(ohosVolume(volume)),
+    () async {
+      final applied = volume.isFinite ? volume.clamp(0.0, 1.0) : 0.0;
+      // The plugin owns the min/max scale of the device's media stream, so the
+      // channel takes the normalised 0..1 value and converts it on that side.
+      await _invokeSurface<void>('setSystemVolume', {'volume': applied});
+      AppLog.d('mpv', 'system volume -> $applied');
+    },
   );
 
   Future<void> setRate(double rate) => _run(() => _player?.setRate(rate));

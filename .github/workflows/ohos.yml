@@ -50,9 +50,33 @@ jobs:
           flutter build hap --debug --target-platform ohos-arm64
       - name: Collect unsigned HAP
         run: |
+          # Hvigor names the product `entry-default-unsigned.hap`. Publishing
+          # that name verbatim gives a downloader no version and no target ABI,
+          # and the `-default-` token reads like a debug fallback rather than a
+          # release-named package. Copy it under an explicit release name, and
+          # skip the `-signed` sibling entirely: CI has no signing material, so
+          # that file is a leftover of the failing Hvigor signing step, not a
+          # proven signature. The artifact keeps the .hap suffix either way --
+          # upload-artifact stores the file name as-is, so renaming to e.g.
+          # `.zip` would destroy the only thing an installer can open.
           mkdir -p dist
-          find ohos/entry/build/default/outputs/default -name '*.hap' -exec cp {} dist/ \;
+          # Tag builds carry the version; branch/dispatch builds fall back to
+          # the pubspec version so the name is never empty.
+          version="${GITHUB_REF_NAME#v}"
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+            version="$(sed -n 's/^version:[[:space:]]*\([0-9][0-9.]*\).*/\1/p' pubspec.yaml | head -n1)"
+          fi
+          hap="$(find ohos/entry/build/default/outputs/default -maxdepth 1 -name '*.hap' ! -name '*-signed.hap' | head -n1)"
+          if [[ -z "$hap" ]]; then
+            echo '::error::flutter build hap did not produce an unsigned .hap' >&2
+            find ohos/entry/build -name '*.hap' >&2 || true
+            exit 1
+          fi
+          target="dist/fqapp-${version}-ohos-arm64-unsigned.hap"
+          install -m 0644 "$hap" "$target"
+          printf 'hap_source=%s\nhap_name=%s\n' "$hap" "$(basename "$target")"
           ls -la dist/
+          case "$target" in *.hap) ;; *) echo '::error::release artifact must end in .hap' >&2; exit 1;; esac
       - uses: actions/upload-artifact@v4
         with:
           name: fqapp-ohos-hap

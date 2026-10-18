@@ -3,6 +3,11 @@ import { FlutterAbility, FlutterEngine } from '@ohos/flutter_ohos';
 import { GeneratedPluginRegistrant } from '../plugins/GeneratedPluginRegistrant';
 import NativePlayerPlugin from '../plugins/NativePlayerPlugin';
 import LibraryBackupPlugin from '../plugins/LibraryBackupPlugin';
+import ReaderDevicePlugin from '../plugins/ReaderDevicePlugin';
+import SystemTtsPlugin from '../plugins/SystemTtsPlugin';
+import TxtExportPlugin from '../plugins/TxtExportPlugin';
+import LocalBookPickerPlugin from '../plugins/LocalBookPickerPlugin';
+import VolumeKeysPlugin from '../plugins/VolumeKeysPlugin';
 
 export default class EntryAbility extends FlutterAbility {
   configureFlutterEngine(flutterEngine: FlutterEngine) {
@@ -16,5 +21,27 @@ export default class EntryAbility extends FlutterAbility {
     // Backup import/export over MethodChannel "fqapp/library_backup"; mirrors
     // Android's LibraryBackupPlugin using the OHOS DocumentViewPicker.
     flutterEngine.getPlugins()?.add(new LibraryBackupPlugin())
+    // Reading fonts import/export over MethodChannel "fqapp/reader"; mirrors
+    // Android's ReaderDevicePlugin (pickFont) plus a HarmonyOS-only exportFont.
+    flutterEngine.getPlugins()?.add(new ReaderDevicePlugin())
+    // System text-to-speech over MethodChannel "fqapp/system_tts" +
+    // EventChannel "fqapp/system_tts_events"; mirrors Android's
+    // SystemTtsPlugin using Core Speech Kit's textToSpeech. The settings UI's
+    // engine list becomes a voice/音色 picker on HarmonyOS.
+    flutterEngine.getPlugins()?.add(new SystemTtsPlugin())
+    // Whole-book TXT export over MethodChannel "fqapp/downloads"; mirrors
+    // Android's DownloadsPlugin. HarmonyOS has no app-writable shared
+    // Downloads collection, so the user picks the destination through the
+    // DocumentViewPicker save dialog; the result therefore always reports
+    // public: true.
+    flutterEngine.getPlugins()?.add(new TxtExportPlugin())
+    // Local novel import over MethodChannel "fqapp/local_books"; mirrors
+    // Android's LocalBookPickerPlugin (DocumentViewPicker + TXT GB18030
+    // decoding fallback).
+    flutterEngine.getPlugins()?.add(new LocalBookPickerPlugin())
+    // Volume keys over MethodChannel "fqapp/volume_keys" + its event channel;
+    // HarmonyOS consumes the keys as system function keys, so the reader asks
+    // for a scoped claim through inputConsumer (see VolumeKeysPlugin).
+    flutterEngine.getPlugins()?.add(new VolumeKeysPlugin())
   }
 }

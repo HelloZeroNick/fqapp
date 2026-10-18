@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:collection';
+import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_lucide/flutter_lucide.dart';
@@ -19,6 +20,7 @@ import '../services/reader_history.dart';
 import '../services/reader_preferences.dart';
 import '../services/reader_underline_store.dart';
 import '../services/system_tts.dart';
+import '../services/volume_keys.dart';
 import '../widgets/chapter_cache_sheet.dart';
 import '../widgets/reader/reader_appearance_sheet.dart';
 import '../widgets/reader/reader_bubble.dart';
@@ -137,30 +139,65 @@ class _ReaderPageState extends State<ReaderPage> with WidgetsBindingObserver {
       ? ReaderThemePreset.eink
       : _preferences.themePreset;
 
+  /// Whether a volume-key press should turn a page right now. Both the
+  /// keyboard path (other platforms) and the native forwarder (HarmonyOS)
+  /// share it, and it also decides whether HarmonyOS may claim the keys at all.
+  bool get _volumeKeyTurnable =>
+      mounted &&
+      _appActive &&
+      _preferences.volumeKeyTurn &&
+      _paged &&
+      !_controlsVisible &&
+      ModalRoute.of(context)?.isCurrent == true;
+
   bool _handleVolumeKey(KeyEvent event) {
-    if (!mounted ||
-        !_appActive ||
-        ModalRoute.of(context)?.isCurrent != true ||
-        !_preferences.volumeKeyTurn ||
-        _controlsVisible) {
-      return false;
-    }
+    if (!_volumeKeyTurnable) return false;
     if (event is! KeyDownEvent && event is! KeyRepeatEvent) return false;
-    if (_paged) {
-      if (event.logicalKey == LogicalKeyboardKey.audioVolumeDown) {
-        _pauseListenFollow();
-        _stopAutoTurn();
-        unawaited(_turnPage(1));
-        return true;
-      }
-      if (event.logicalKey == LogicalKeyboardKey.audioVolumeUp) {
-        _pauseListenFollow();
-        _stopAutoTurn();
-        unawaited(_turnPage(-1));
-        return true;
-      }
+    if (event.logicalKey == LogicalKeyboardKey.audioVolumeDown) {
+      _volumeTurn(1);
+      return true;
+    }
+    if (event.logicalKey == LogicalKeyboardKey.audioVolumeUp) {
+      _volumeTurn(-1);
+      return true;
     }
     return false;
+  }
+
+  /// `direction` follows [_turnPage]: 1 is the next page, -1 the previous.
+  void _volumeTurn(int direction) {
+    _pauseListenFollow();
+    _stopAutoTurn();
+    unawaited(_turnPage(direction));
+  }
+
+  /// Native volume-key events mirror [_handleVolumeKey]; they arrive only while
+  /// the reader holds the claim, and the guard is re-checked because the page
+  /// can go stale between the press and delivery.
+  void _onVolumeKeyEvent(String type) {
+    if (!_volumeKeyTurnable) {
+      unawaited(_syncVolumeKeys());
+      return;
+    }
+    if (type == 'volumeDown') {
+      _volumeTurn(1);
+    } else if (type == 'volumeUp') {
+      _volumeTurn(-1);
+    }
+  }
+
+  /// Keeps the native volume-key claim in step with [_volumeKeyTurnable].
+  ///
+  /// Claiming the keys disables their normal volume function system-wide while
+  /// the reader is focused, so the claim must be released the moment a press
+  /// would no longer turn a page (leaving the reader, opening the controls,
+  /// switching to scroll mode, turning the preference off, backgrounding).
+  Future<void> _syncVolumeKeys() async {
+    if (!VolumeKeys.isSupported) return;
+    final wanted = _volumeKeyTurnable;
+    if (wanted == _volumeKeysOn) return;
+    _volumeKeysOn = wanted;
+    await VolumeKeys.setEnabled(wanted);
   }
 
   void _toggleAutoTurn() {
@@ -252,6 +289,14 @@ class _ReaderPageState extends State<ReaderPage> with WidgetsBindingObserver {
   bool _appActive = true;
   bool _routeCurrent = false;
   bool _changingChapter = false;
+
+  /// HarmonyOS swallows the volume keys before Flutter sees them, so the
+  /// reader has to claim them through the native side. The claim steals the
+  /// system volume function, so it is held only while a volume-key press would
+  /// actually turn a page; [_volumeKeysOn] tracks the applied state to avoid
+  /// re-sending the same request on every rebuild.
+  bool _volumeKeysOn = false;
+  StreamSubscription<String>? _volumeKeyEvents;
 
   /// Chapter-boundary transition handed to [ReaderPagedView]; see
   /// [ReaderChapterTurn]. Set by [_next] / [_prev] and cleared once the slide
@@ -362,6 +407,7 @@ class _ReaderPageState extends State<ReaderPage> with WidgetsBindingObserver {
   void initState() {
     super.initState();
     HardwareKeyboard.instance.addHandler(_handleVolumeKey);
+    if (VolumeKeys.isSupported) _volumeKeyEvents = VolumeKeys.events().listen(_onVolumeKeyEvent);
     ListeningSession.instance.addListener(_onListeningTick);
     WidgetsBinding.instance.addObserver(this);
     _appActive =
@@ -390,6 +436,7 @@ class _ReaderPageState extends State<ReaderPage> with WidgetsBindingObserver {
     if (_routeCurrent == current) return;
     _routeCurrent = current;
     _syncSystemBars();
+    unawaited(_syncVolumeKeys());
   }
 
   // Note: Route/lifecycle ownership and SDK 36 compatibility; see
@@ -419,6 +466,7 @@ class _ReaderPageState extends State<ReaderPage> with WidgetsBindingObserver {
     });
     await _loadFont(preferences.fontPath);
     if (mounted && _appActive) unawaited(_refreshDevice());
+    unawaited(_syncVolumeKeys());
   }
 
   Future<void> _refreshDevice() async {
@@ -922,6 +970,12 @@ class _ReaderPageState extends State<ReaderPage> with WidgetsBindingObserver {
   void dispose() {
     _chapterRequest?.cancel();
     HardwareKeyboard.instance.removeHandler(_handleVolumeKey);
+    unawaited(_volumeKeyEvents?.cancel());
+    _volumeKeyEvents = null;
+    // Release the native claim unconditionally: leaving the reader must give
+    // the volume keys back to the system even if a sync was pending.
+    _volumeKeysOn = false;
+    unawaited(VolumeKeys.setEnabled(false));
     ListeningSession.instance.removeListener(_onListeningTick);
     _autoTurnTimer?.cancel();
     WidgetsBinding.instance.removeObserver(this);
@@ -951,10 +1005,12 @@ class _ReaderPageState extends State<ReaderPage> with WidgetsBindingObserver {
       _sessionActive = false;
       _appActive = false;
       unawaited(_persistProgress());
+      unawaited(_syncVolumeKeys());
     } else if (resumed && !_appActive) {
       _appActive = true;
       _syncSystemBars();
       unawaited(_refreshDevice());
+      unawaited(_syncVolumeKeys());
       if (!_loading && _content.isNotEmpty) {
         _readStart = DateTime.now();
         _sessionActive = true;
@@ -1730,6 +1786,7 @@ class _ReaderPageState extends State<ReaderPage> with WidgetsBindingObserver {
       ScaffoldMessenger.of(context).hideCurrentSnackBar();
     }
     setState(() => _controlsVisible = !_controlsVisible);
+    unawaited(_syncVolumeKeys());
   }
 
   void _previewPreferences(ReaderPreferences preferences) {
@@ -1742,6 +1799,9 @@ class _ReaderPageState extends State<ReaderPage> with WidgetsBindingObserver {
       }
     });
     if (fontChanged) unawaited(_loadFont(preferences.fontPath));
+    // Turning the preference off, or switching to scroll mode, must hand the
+    // volume keys back to the system.
+    unawaited(_syncVolumeKeys());
   }
 
   Future<void> _showAppearanceSettings() async {
@@ -1760,6 +1820,8 @@ class _ReaderPageState extends State<ReaderPage> with WidgetsBindingObserver {
         einkOverride: einkModeNotifier.value,
         onChanged: _previewPreferences,
         onPickFont: _pickFont,
+        onExportFont: ({required String path, required String name}) =>
+            _device.exportFont(path: path, name: name),
       ),
     );
     await _savePreferences();
@@ -1841,7 +1903,11 @@ class _ReaderPageState extends State<ReaderPage> with WidgetsBindingObserver {
                 ListTile(
                   leading: const Icon(Icons.record_voice_over),
                   title: const Text('系统朗读'),
-                  subtitle: const Text('使用手机已安装的 TTS 引擎'),
+                  subtitle: Text(
+                    Platform.operatingSystem == 'ohos'
+                        ? '使用鸿蒙基础语音服务朗读'
+                        : '使用手机已安装的 TTS 引擎',
+                  ),
                   onTap: () => Navigator.pop(context, true),
                 ),
               ],

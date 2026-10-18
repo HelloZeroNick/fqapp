@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_lucide/flutter_lucide.dart';
@@ -29,7 +30,10 @@ class SettingsPage extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     // 开关读的是 ValueNotifier：先把持久化的值读出来，读到后自动重绘。
+    // 短剧默认静音同理——此前只有短剧页会 load()，从设置页直接进入时开关
+    // 读到的是一律 false 的内存默认值，用户看到的是「设置没保存」。
     unawaited(BookOpenPreferences.instance.load());
+    unawaited(DramaMutePreferences.instance.load());
     final palette = HomePalette.of(context);
     final categories = <SettingsCategory>[
       SettingsCategory(
@@ -53,7 +57,9 @@ class SettingsPage extends StatelessWidget {
           SettingsItem(
             icon: LucideIcons.mic,
             title: '系统朗读',
-            subtitle: '选择 TTS 引擎与语速，支持本地书',
+            subtitle: Platform.operatingSystem == 'ohos'
+                ? '选择鸿蒙音色与语速，支持本地书'
+                : '选择 TTS 引擎与语速，支持本地书',
             onTap: (context, setState) => Navigator.push(
               context,
               MaterialPageRoute(builder: (_) => const SystemTtsSettingsPage()),
