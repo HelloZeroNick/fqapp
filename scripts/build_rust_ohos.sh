@@ -127,6 +127,14 @@ if [ -x "$CXX_BIN" ]; then
   export CXX_aarch64_unknown_linux_ohos="$CXX_BIN"
 fi
 
+# Cargo defaults the linker to plain `cc` for this target, which on the runner
+# is the host gcc; linking arm64 objects with it fails with
+# "Relocations in generic ELF (EM: 183)" / "file in wrong format". Point the
+# target's linker at the SDK wrapper and stop rustc from wiring in the host's
+# self-contained C runtime. Both are needed: address them, not just the name.
+export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_OHOS_LINKER="$CC_BIN"
+export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_OHOS_RUSTFLAGS="-Clink-self-contained=no"
+
 echo "==> OHOS SDK: $OHOS_NATIVE"
 echo "==> CC: $CC_BIN"
 
