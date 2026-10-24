@@ -16,7 +16,7 @@ publish_to: 'none' # Remove this line if you wish to publish to pub.dev
 # https://developer.apple.com/library/archive/documentation/General/Reference/InfoPlistKeyReference/Articles/CoreFoundationKeys.html
 # In Windows, build-name is used as the major, minor, and patch parts
 # of the product and file versions while build-number is used as the build suffix.
-version: 1.0.121+126
+version: 1.0.131+136
 
 environment:
   sdk: ^3.12.2
@@ -30,22 +30,19 @@ environment:
 dependencies:
   flutter:
     sdk: flutter
+  # 中文 Material 文案（复制/粘贴/全选等系统文本菜单）：没有 delegates 时
+  # Flutter 一律回退英文，即使系统语言是中文（issue #79）。
+  flutter_localizations:
+    sdk: flutter
   material_ui:
     path: packages/material_ui
   cupertino_ui:
     path: packages/cupertino_ui
 
-  # The following adds the Cupertino Icons font to your application.
-  # Use with the CupertinoIcons class for iOS style icons.
-  cupertino_icons: ^1.0.8
   http: ^1.6.0
   path_provider: ^2.1.0
   shared_preferences: ^2.3.0
   url_launcher: ^6.3.0
-  # Retained for the existing tests, which still import package:hive.
-  # Production code uses hive_ce below; drop these once the tests migrate.
-  hive: ^2.2.3
-  hive_flutter: ^1.1.0
   # hive_ce is the maintained Hive fork; all boxes open encrypted via
   # EncryptedHive (P1-3). Keys live in flutter_secure_storage (Keystore).
   hive_ce: ^2.0.0
@@ -55,7 +52,6 @@ dependencies:
   # re-export flutter_secure_storage_ohos；ohos 实现取 hosted 1.0.0 版。
   flutter_secure_storage:
     path: packages/flutter_secure_storage
-  flutter_secure_storage_ohos: ^1.0.0
   cached_network_image: ^4.0.0
   flutter_cache_manager: ^3.4.2
   flutter_riverpod: ^3.4.3
@@ -74,6 +70,10 @@ dependencies:
     git:
       url: https://github.com/HelloZeroNick/connectivity_plus_ohos.git
       ref: main
+  flutter_localization:
+    git:
+      url: https://gitcode.com/CPF-Flutter/flutter_localization.git
+      ref: br_3.41_dev
   image: ^4.12.0
   flutter_svg: ^2.3.0
   # 鸿蒙播放后端：media_kit 是纯 Dart + dart:ffi 的 libmpv 封装（pubspec 里没有
@@ -86,6 +86,30 @@ dependencies:
       url: https://github.com/HelloZeroNick/media-kit.git
       path: media_kit
       ref: 8babdf4f456142fc8027f475838c5006da4656dd
+  # lib/services/desktop_platform.dart 无条件 import 了下面这几个 Windows 桌面端
+  # 才用到的包；它们的具体实现全部在 `isWindowsDesktop` 之后才调用，鸿蒙侧
+  # 只需要能被解析（pub get）与编译（build hap）。media_kit_video 与 media_kit
+  # 取同一个 fork/提交，以便鸿蒙上仍有 ohos 分派。
+  media_kit_video:
+    git:
+      url: https://github.com/HelloZeroNick/media-kit.git
+      path: media_kit_video
+      ref: 8babdf4f456142fc8027f475838c5006da4656dd
+  screen_retriever: ^0.2.2
+  window_manager: ^0.5.1
+  file_selector:
+    git:
+      url: https://gitcode.com/CPF-Flutter/flutter_packages.git
+      path: packages/file_selector/file_selector
+      ref: br_file_selector-v1.1.0_ohos_dev
+  # Windows 专用 libmpv；不要把 umbrella 的 media_kit_libs_video 加回来，否则
+  # Android/iOS/macOS/Linux 的播放库会一起进包（APK 多出 ~11 MB）。
+  media_kit_libs_windows_video: 1.0.11
+  flutter_tts: ^4.2.5
+  webview_windows:
+    path: third_party/webview_windows
+  smtc_windows: ^1.1.0
+  ffi: ^2.1.4
 
 # 鸿蒙（OHOS）适配：以下包在 pub 上没有携带 ohos 平台的版本，改指到
 # OpenHarmony 社区维护的 fork。overrides 会绕过版本约束，因此 fork 版本号
@@ -97,6 +121,18 @@ dependency_overrides:
   cupertino_ui:
     path: packages/cupertino_ui
   # 应用可用路径。取 pinned 分支而非 PiliNara 的 ref HEAD，避免上游漂移。
+  media_kit_video:
+    git:
+      url: https://github.com/HelloZeroNick/media-kit.git
+      path: media_kit_video
+      ref: 8babdf4f456142fc8027f475838c5006da4656dd
+  # fork 里的 media_kit_video 自己声明依赖 hosted 的 media_kit，与本项目 git 版
+  # media_kit 冲突（pub：两个来源同一个包 -> forbidden）。统一 override 到同一提交。
+  media_kit:
+    git:
+      url: https://github.com/HelloZeroNick/media-kit.git
+      path: media_kit
+      ref: 8babdf4f456142fc8027f475838c5006da4656dd
   path_provider:
     git:
       url: https://gitcode.com/openharmony-sig/flutter_packages.git
@@ -123,6 +159,8 @@ dependency_overrides:
       path: sqflite
       ref: br_v2.4.2_ohos
 dev_dependencies:
+  integration_test:
+    sdk: flutter
   flutter_test:
     sdk: flutter
 
@@ -152,10 +190,6 @@ flutter:
     - assets/config/filter.json
     - assets/config/device_pool.example.json
     - assets/filters/
-    - assets/web/
-    - assets/web/assets/
-    - assets/web/assets/css/
-    - assets/web/assets/webfonts/
     - assets/plugins/
     - assets/images/app_logo.webp
     - assets/images/bubble/

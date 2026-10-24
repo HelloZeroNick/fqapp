@@ -65,6 +65,72 @@ class ApiClient {
 
   static final ApiClient instance = ApiClient();
 
+  /// Fixed read-only library resources; credentials stay in the POST body.
+  Future<Map<String, dynamic>> fanqieLibraryResource({
+    required String cookie,
+    required String resource,
+    String? deviceId,
+    int offset = 0,
+    int bookType = 0,
+    List<String> bookIds = const [],
+    String? folderId,
+  }) async {
+    final response = await _get(
+      '$_base/api/v1/account/fanqie/library',
+      method: 'POST',
+      body: Uint8List.fromList(
+        utf8.encode(
+          jsonEncode({
+            'cookie': cookie,
+            'resource': resource,
+            'device_id': ?deviceId,
+            'offset': offset,
+            'book_type': bookType,
+            'book_ids': bookIds,
+            'folder_id': ?folderId,
+          }),
+        ),
+      ),
+    );
+    return _decodeAsync(response);
+  }
+
+  /// Preserve the detail payload for later interpretation instead of dropping
+  /// fields through the display model. This endpoint needs no account cookie.
+  Future<Map<String, dynamic>> fanqieBookMetadata(String bookId) async =>
+      _decodeAsync(
+        await _get(
+          _url('/api/v1/books/${Uri.encodeComponent(bookId)}/detail', {}),
+        ),
+      );
+
+  /// Read-only upstream operation. POST keeps the temporary login cookie out
+  /// of URLs; the Rust adapter only permits the fixed upstream history GET.
+  Future<Map<String, dynamic>> fanqieHistoryPage({
+    required String cookie,
+    required int offset,
+    required int lastMinReadTimestampMs,
+    required bool firstLoad,
+    String? deviceId,
+  }) async {
+    final response = await _get(
+      '$_base/api/v1/account/fanqie/history',
+      method: 'POST',
+      body: Uint8List.fromList(
+        utf8.encode(
+          jsonEncode({
+            'cookie': cookie,
+            'offset': offset,
+            'last_min_read_timestamp_ms': lastMinReadTimestampMs,
+            'is_first_load': firstLoad,
+            'device_id': ?deviceId,
+          }),
+        ),
+      ),
+    );
+    return _decodeAsync(response);
+  }
+
   /// Per-instance gate: coalescing must not reach across test instances, and
   /// a restarted backend service gets a fresh flight table.
   final RequestGate _gate = RequestGate();
@@ -233,16 +299,28 @@ class ApiClient {
   String _url(String path, Map<String, String> query) =>
       Uri.parse(_base).resolve(path).replace(queryParameters: query).toString();
 
-  String _searchUrl(String query, int page) =>
-      _url('/api/search', {'source': '番茄', 'query': query, 'page': '$page'});
+  /// Directory route for [bookId].
+  ///
+  /// The old `/api/directory` Web bridge is gone; `/api/v1/books/<id>/directory`
+  /// reaches the same `directory` endpoint. It returns the upstream payload, so
+  /// the chapter list arrives as `data.item_data_list` instead of the bridge's
+  /// pre-flattened `data.data.chapterListWithVolume` - [parseDirectory] accepts
+  /// both.
+  String _directoryUrl(String bookId, String tab) => _url(
+    '/api/v1/books/${Uri.encodeComponent(bookId)}/directory',
+    const {},
+  );
 
-  String _directoryUrl(String bookId, String tab) =>
-      _url('/api/directory', {'source': '番茄', 'book_id': bookId, 'tab': tab});
-
-  /// Search across content types.
-  /// Returns normalized {tabs: [{title, data:[...]}], ...} structure.
+  /// Search across content types (raw envelope).
   Future<Map<String, dynamic>> search(String query, {int page = 1}) async {
-    final r = await _get(_searchUrl(query, page));
+    final offset = (page > 1 ? page - 1 : 0) * 10;
+    final r = await _get(
+      _url('/api/v1/search', {
+        'query': query,
+        'offset': '$offset',
+        'count': '10',
+      }),
+    );
     return _decodeAsync(r);
   }
 
@@ -256,14 +334,12 @@ class ApiClient {
     int? offset,
   }) async {
     final searchOffset = offset ?? (page > 1 ? page - 1 : 0) * 10;
-    final url = tabType == null
-        ? _searchUrl(query, page)
-        : _url('/api/v1/search', {
-            'query': query,
-            'tab_type': '$tabType',
-            'offset': '${searchOffset < 0 ? 0 : searchOffset}',
-            'count': '10',
-          });
+    final url = _url('/api/v1/search', {
+      'query': query,
+      if (tabType != null) 'tab_type': '$tabType',
+      'offset': '${searchOffset < 0 ? 0 : searchOffset}',
+      'count': '10',
+    });
     final r = await _get(url);
     final statusCode = r.statusCode;
     final bodyBytes = r.bodyBytes;
@@ -308,13 +384,16 @@ class ApiClient {
     return null;
   }
 
-  /// Book detail.
+  /// Book detail, addressed through the v1 route.
+  ///
+  /// Kept as a plain envelope accessor (unlike [bookDetail], which parses a
+  /// model) for callers and tests that only need the raw payload.
   Future<Map<String, dynamic>> detail(
     String bookId, {
     String tab = '小说',
   }) async {
     final r = await _get(
-      _url('/api/detail', {'source': '番茄', 'book_id': bookId, 'tab': tab}),
+      _url('/api/v1/books/${Uri.encodeComponent(bookId)}/detail', const {}),
     );
     return _decodeAsync(r);
   }
@@ -342,19 +421,25 @@ class ApiClient {
     );
   }
 
-  /// Chapter content (decrypted by backend).
+  /// Chapter content route, by content type.
+  ///
+  /// The old `/api/content?tab=` Web bridge dispatched to a different endpoint
+  /// per tab; the v1 routes are addressed directly instead.
   String _contentUrl(
     String itemId, {
     required String tab,
     String? toneId,
     String? mode,
-  }) => _url('/api/content', {
-    'source': '番茄',
-    'item_id': itemId,
-    'tab': tab,
-    'tone_id': ?toneId,
-    'mode': ?mode,
-  });
+  }) {
+    final id = Uri.encodeComponent(itemId);
+    return switch (tab) {
+      '漫画' => _url('/api/v1/manga/$id', const {}),
+      '短剧' || '漫剧' => _url('/api/v1/videos/$id', {
+        'mode': ?mode,
+      }),
+      _ => _url('/api/v1/chapters/$id', {'tone_id': ?toneId}),
+    };
+  }
 
   Future<Map<String, dynamic>> content(
     String itemId, {
@@ -1171,12 +1256,6 @@ class ApiClient {
     }
   }
 
-  /// Resolve a share URL to a book id.
-  Future<Map<String, dynamic>> resolve(String url) async {
-    final r = await _get(_url('/api/resolve', {'url': url}));
-    return _decodeAsync(r);
-  }
-
   /// Real homepage recommendations (the Flutter home page previously used a
   /// search for the literal word "推荐", which is not a recommendation API).
   ///
@@ -1438,9 +1517,17 @@ Map<String, dynamic> _decodeEnvelope(int statusCode, List<int> bodyBytes) {
   final payload = Map<String, dynamic>.from(decoded);
   // The web bridge uses code=200; REST upstream-compatible endpoints use
   // code=0. Both are successful envelopes.
+  //
+  // The "unavailable" codes are exempted rather than thrown: they mean "this
+  // item has no subtitles / no paragraph comments", which the subtitle and
+  // chapter-idea callers answer with an empty result. Throwing here made their
+  // `isUnavailableCode`/`isUnavailableIdeaCode` guards unreachable dead code -
+  // they only ever saw the exception path.
   if (payload['code'] != null &&
       payload['code'] != 200 &&
-      payload['code'] != 0) {
+      payload['code'] != 0 &&
+      !isUnavailableCode(payload['code']) &&
+      !isUnavailableIdeaCode(payload['code'])) {
     throw ApiException(
       '${payload['message'] ?? '请求失败'}',
       upstreamCode: payload['code'] is int ? payload['code'] as int : null,

@@ -1,4 +1,7 @@
+import '../services/desktop_platform.dart';
+import '../widgets/desktop_chapter_sidebar.dart';
 import 'dart:async';
+import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_lucide/flutter_lucide.dart';
@@ -9,9 +12,11 @@ import '../models/book_detail.dart';
 import '../models/chapter_media.dart';
 import '../models/media_item.dart';
 import '../services/api_client.dart';
+import '../services/audio_download_store.dart';
 import '../services/audio_history.dart';
 import '../services/audio_preferences.dart';
 import '../services/chapter_cache_store.dart';
+import '../services/fair_memory.dart';
 import '../services/library_store.dart';
 import '../services/listening_session.dart';
 import '../services/native_player.dart';
@@ -19,10 +24,12 @@ import '../services/playback_format.dart';
 import '../services/shelf_store.dart';
 import '../services/transient_retry.dart';
 import '../services/system_tts.dart';
+import '../widgets/audio/audio_offline_section.dart';
 import '../widgets/audio/audio_sections.dart';
 import '../widgets/audio/voice_settings_sheet.dart';
 import '../widgets/audio/system_tts_controls.dart';
 import '../widgets/chapter_cache_sheet.dart';
+import '../widgets/comment_images.dart';
 import '../widgets/home/home_design.dart';
 import 'detail_page.dart';
 import 'reader_page.dart';
@@ -70,6 +77,10 @@ class AudioPage extends StatefulWidget {
   /// switch uses that book's own chapter IDs. Defaults to the listening API.
   final Future<List<Chapter>> Function(String bookId)? directoryLoader;
 
+  /// 离线音频记录箱。默认用 [HiveAudioDownloadStore.instance]；测试注入
+  /// 内存实现后，离线命中判断不依赖真实 Hive 箱。
+  final AudioDownloadStore? downloadStore;
+
   const AudioPage({
     super.key,
     required this.bookId,
@@ -90,6 +101,7 @@ class AudioPage extends StatefulWidget {
     this.subtitleLoader,
     this.excerptLoader,
     this.directoryLoader,
+    this.downloadStore,
   });
 
   @override
@@ -331,8 +343,11 @@ class _AudioPageState extends State<AudioPage> {
       context: context,
       isScrollControlled: true,
       showDragHandle: true,
-      builder: (context) =>
-          _AudioCatalog(chapters: c._chapters, currentIndex: c._index),
+      builder: (context) => _AudioCatalog(
+        chapters: c._chapters,
+        currentIndex: c._index,
+        unit: c._mode == 'narrator' ? '集' : '章',
+      ),
     );
     if (!mounted || selected == null || selected == c._index) return;
     await c._openChapter(selected);
@@ -380,7 +395,29 @@ class _AudioPageState extends State<AudioPage> {
       );
     }
     final chapter = c._chapters[c._index];
-    final tones = c._mode == 'narrator' ? c._narratorTones : c._ttsTones;
+    final realAudio = c._mode == 'narrator';
+    final tones = realAudio ? c._narratorTones : c._ttsTones;
+    final detail = c._extras.detail;
+    final introSummary = detail?.abstract ?? '';
+    final related = c._extras.related.isEmpty ? null : c._extras.related.first;
+    final hasIntro =
+        introSummary.isNotEmpty ||
+        (detail?.author.name.isNotEmpty ?? false) ||
+        detail?.title.isNotEmpty == true;
+    // 官方把「AI朗读 │ 真人讲书」作为页头分段（layout/hy.xml），只在两种
+    // 音源都真的可选时出现，否则会给出一个点了没反应的开关。
+    final modeSwitch =
+        c._extras.tones.narratorTones.isNotEmpty &&
+            c._extras.tones.ttsTones.isNotEmpty
+        ? AudioModeSwitch(
+            realSelected: realAudio,
+            onSelectTts: () => _onToneSelected(c._extras.tones.ttsTones.first),
+            onSelectNarrator: () =>
+                _onToneSelected(c._extras.tones.narratorTones.first),
+          )
+        : null;
+    // Windows 桌面端用独立版式；它只需要 tones，上面这些局部变量先算好并不吃亏。
+    if (isWindowsDesktop) return _desktopAudio(palette, chapter, tones);
     return Scaffold(
       key: ValueKey('audio_session_${c._bookId}'),
       backgroundColor: palette.canvas,
@@ -391,6 +428,7 @@ class _AudioPageState extends State<AudioPage> {
               onCollapse: () => Navigator.maybePop(context),
               onMore: _showMore,
             ),
+            ?modeSwitch,
             Expanded(
               child: SingleChildScrollView(
                 child: Center(
@@ -408,9 +446,39 @@ class _AudioPageState extends State<AudioPage> {
                             chapterTitle: chapter.title,
                             onSwitch: _showVoices,
                             onOpenBook: _showCatalog,
+                            realAudio: realAudio,
+                            modeLabel: realAudio
+                                ? '真人讲书・第 ${c._index + 1} 集'
+                                : null,
+                            intro: realAudio
+                                ? AudioIntroCard(
+                                    cover: c._cover,
+                                    title: detail?.title.isNotEmpty == true
+                                        ? detail!.title
+                                        : c._title,
+                                    author: detail?.author.name ?? '',
+                                    meta: detail?.metaParts ?? const [],
+                                    summary: introSummary,
+                                    related: related,
+                                    onOpenRelated: _openRelated,
+                                  )
+                                : null,
                           ),
                         ),
-                        if (c._excerpt.isNotEmpty) ...[
+                        if (realAudio)
+                          ValueListenableBuilder<_ReadAlongSnapshot>(
+                            valueListenable: c._readAlong,
+                            builder: (context, snapshot, _) =>
+                                AudioInlineSubtitle(
+                                  track: snapshot.track,
+                                  position: snapshot.position,
+                                  onTap: _showReadAlong,
+                                ),
+                          ),
+                        // 真人讲书的简介在封面背面（官方 bhi.xml），正文摘录只在
+                        // 没有简介数据时兜底，避免同一段文字出现两次。
+                        if (c._excerpt.isNotEmpty &&
+                            !(realAudio && hasIntro)) ...[
                           const SizedBox(height: 12),
                           AudioExcerpt(text: c._excerpt, onTap: _showExcerpt),
                         ],
@@ -467,22 +535,30 @@ class _AudioPageState extends State<AudioPage> {
                         const SizedBox(height: 6),
                         _transport(),
                         const SizedBox(height: 16),
-                        Padding(
-                          padding: const EdgeInsets.symmetric(horizontal: 12),
-                          child: AudioToneSection(
-                            title: c._mode == 'narrator' ? '真人讲书' : '智能朗读',
-                            tones: tones,
-                            selectedId: c._extras.tones.hasFixedTone
-                                ? c._bookId
-                                : c._toneId,
-                            currentChapterTitle: chapter.title,
-                            onSelect: _onToneSelected,
-                            onReadAlong: _showReadAlong,
-                            onShowVoices: c._switchingVersion
-                                ? null
-                                : _showVoices,
+                        // 官方在真人讲书页把音色卡默认收起（bj1.xml a5h 为
+                        // gone），主播版本改由一行入口 + 声音设置面板承担。
+                        if (realAudio)
+                          AudioRealVersionRow(
+                            narrator: _narratorLabel,
+                            onTap: c._switchingVersion ? null : _showVoices,
+                          )
+                        else
+                          Padding(
+                            padding: const EdgeInsets.symmetric(horizontal: 12),
+                            child: AudioToneSection(
+                              title: '智能朗读',
+                              tones: tones,
+                              selectedId: c._extras.tones.hasFixedTone
+                                  ? c._bookId
+                                  : c._toneId,
+                              currentChapterTitle: chapter.title,
+                              onSelect: _onToneSelected,
+                              onReadAlong: _showReadAlong,
+                              onShowVoices: c._switchingVersion
+                                  ? null
+                                  : _showVoices,
+                            ),
                           ),
-                        ),
                         if (c._extras.related.isNotEmpty) ...[
                           const SizedBox(height: 18),
                           Padding(
@@ -505,6 +581,162 @@ class _AudioPageState extends State<AudioPage> {
       ),
     );
   }
+
+  Widget _desktopAudio(
+    HomePalette palette,
+    Chapter chapter,
+    List<AudioTone> tones,
+  ) => Scaffold(
+    backgroundColor: palette.canvas,
+    body: Column(
+      children: [
+        AudioTopBar(
+          onCollapse: () => Navigator.maybePop(context),
+          onMore: _showMore,
+        ),
+        Expanded(
+          child: Row(
+            children: [
+              Expanded(
+                child: SingleChildScrollView(
+                  padding: const EdgeInsets.all(24),
+                  child: Center(
+                    child: ConstrainedBox(
+                      constraints: const BoxConstraints(maxWidth: 600),
+                      child: Column(
+                        children: [
+                          AudioBookCard(
+                            cover: c._cover,
+                            bookTitle: c._title,
+                            chapterTitle: chapter.title,
+                            onSwitch: _showVoices,
+                            onOpenBook: _showCatalog,
+                          ),
+                          const SizedBox(height: 20),
+                          _statusLine(palette),
+                          if (c._excerpt.isNotEmpty)
+                            AudioExcerpt(text: c._excerpt, onTap: _showExcerpt),
+                          const SizedBox(height: 12),
+                          AudioActionRow(actions: _actions),
+                          const SizedBox(height: 24),
+                          AudioToneSection(
+                            title: c._mode == 'narrator' ? '真人讲书' : '智能朗读',
+                            tones: tones,
+                            selectedId: c._extras.tones.hasFixedTone
+                                ? c._bookId
+                                : c._toneId,
+                            currentChapterTitle: chapter.title,
+                            onSelect: _onToneSelected,
+                            onReadAlong: _showReadAlong,
+                            onShowVoices: c._switchingVersion
+                                ? null
+                                : _showVoices,
+                          ),
+                          if (c._extras.related.isNotEmpty)
+                            AudioRelatedRow(
+                              works: c._extras.related,
+                              onTap: _openRelated,
+                            ),
+                        ],
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+              SizedBox(
+                width: MediaQuery.sizeOf(context).width >= 1200 ? 360 : 280,
+                child: DefaultTabController(
+                  length: 2,
+                  child: Column(
+                    children: [
+                      const TabBar(
+                        tabs: [
+                          Tab(text: '章节目录'),
+                          Tab(text: '同步字幕'),
+                        ],
+                      ),
+                      Expanded(
+                        child: TabBarView(
+                          children: [
+                            DesktopChapterSidebar(
+                              chapters: c._chapters,
+                              currentIndex: c._index,
+                              onSelected: (index) =>
+                                  unawaited(c._openChapter(index)),
+                            ),
+                            ValueListenableBuilder<Duration>(
+                              valueListenable: c._position,
+                              builder: (context, position, _) {
+                                final track = c._subtitles;
+                                final active = track.indexAt(position);
+                                if (track.isEmpty) {
+                                  return const Center(
+                                    child: Text('当前章节暂无同步字幕'),
+                                  );
+                                }
+                                return ListView.builder(
+                                  itemCount: track.cues.length,
+                                  itemBuilder: (context, index) => ListTile(
+                                    selected: index == active,
+                                    title: Text(track.cues[index].text),
+                                    onTap: c._ready
+                                        ? () => c._seekTo(
+                                            Duration(
+                                              milliseconds:
+                                                  track.cues[index].startMs,
+                                            ),
+                                          )
+                                        : null,
+                                  ),
+                                );
+                              },
+                            ),
+                          ],
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+        Material(
+          color: palette.surface,
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(32, 8, 32, 12),
+            child: Column(
+              children: [
+                ValueListenableBuilder<Duration>(
+                  valueListenable: c._position,
+                  builder: (context, position, _) => AudioProgressRow(
+                    position: position,
+                    duration: c._duration,
+                    preview: c._seekPreview.value,
+                    enabled: c._ready,
+                    onChanged: (value) => c._seekPreview.value = value,
+                    onChangeEnd: (value) =>
+                        c._seekTo(Duration(milliseconds: value.round())),
+                    onBack15: c._ready
+                        ? () => c._seekTo(
+                            c._position.value - const Duration(seconds: 15),
+                          )
+                        : null,
+                    onForward15: c._ready
+                        ? () => c._seekTo(
+                            c._position.value + const Duration(seconds: 15),
+                          )
+                        : null,
+                  ),
+                ),
+                _transport(),
+              ],
+            ),
+          ),
+        ),
+      ],
+    ),
+  );
 
   Future<void> _showExcerpt() async {
     if (c._excerpt.isEmpty) return;
@@ -598,6 +830,15 @@ class _AudioPageState extends State<AudioPage> {
     );
   }
 
+  /// 当前主播的上游标签（形如 `主播：老恒`），供真人讲书页头那一行使用。
+  /// 正在播放的书不在返回列表里时退回第一个版本，与音色面板的默认一致。
+  String get _narratorLabel {
+    for (final tone in c._narratorTones) {
+      if (tone.id == c._bookId) return tone.title;
+    }
+    return c._narratorTones.isEmpty ? '' : c._narratorTones.first.title;
+  }
+
   /// Icon row: 语速 / 加入书架 / 下载 / 章评 / 更多.
   List<AudioAction> get _actions => [
     AudioAction(
@@ -636,51 +877,83 @@ class _AudioPageState extends State<AudioPage> {
     ),
   ];
 
-  /// 目录 / 上一章 / 播放暂停 / 下一章 / 定时.
+  /// `layout/bin.xml`: 目录 / 上一章 / 播放暂停 / 下一章 / 定时。
+  ///
+  /// 官方只给「目录」「定时」配 12sp 文字标签，上一章/下一章是纯 24dp 图标，
+  /// 播放键 60dp；加载或缓冲时它换成转圈指示。
   Widget _transport() {
     final palette = HomePalette.of(context);
     final playing = c._wantPlay && !c._completed;
-    return Row(
-      mainAxisAlignment: MainAxisAlignment.spaceEvenly,
-      children: [
-        _TransportButton(
-          icon: LucideIcons.list,
-          tooltip: '目录',
-          onTap: _showCatalog,
-        ),
-        _TransportButton(
-          icon: LucideIcons.skip_back,
-          tooltip: '上一章',
-          onTap: c._index > 0 ? () => c._openChapter(c._index - 1) : null,
-        ),
-        Semantics(
-          button: true,
-          child: IconButton(
-            tooltip: playing ? '暂停' : '播放',
-            onPressed: c._ready ? c._togglePlayback : null,
-            padding: const EdgeInsets.all(11),
-            iconSize: 38,
-            style: IconButton.styleFrom(
-              foregroundColor: palette.ink,
-              disabledForegroundColor: palette.muted.withValues(alpha: 0.5),
+    final loading = c._loading || (c._player?.buffering ?? false);
+    // 官方用 40dip 的固定间距托住播放键；窄屏（≤320dp）或大字号下按可用宽度
+    // 收缩，避免 RenderFlex 溢出，同时保持播放键居中。
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final gap = ((constraints.maxWidth - 252) / 3).clamp(8.0, 40.0);
+        return Row(
+          children: [
+            _TransportButton(
+              icon: LucideIcons.list,
+              tooltip: '目录',
+              label: '目录',
+              onTap: _showCatalog,
             ),
-            icon: Icon(playing ? LucideIcons.pause : LucideIcons.play),
-          ),
-        ),
-        _TransportButton(
-          icon: LucideIcons.skip_forward,
-          tooltip: '下一章',
-          onTap: c._index + 1 < c._chapters.length
-              ? () => c._openChapter(c._index + 1)
-              : null,
-        ),
-        _TransportButton(
-          icon: LucideIcons.alarm_clock,
-          tooltip: '定时',
-          active: c._sleepRemaining != null,
-          onTap: _showSleepTimer,
-        ),
-      ],
+            const Spacer(),
+            _TransportButton(
+              icon: LucideIcons.skip_back,
+              tooltip: '上一章',
+              onTap: c._index > 0 ? () => c._openChapter(c._index - 1) : null,
+            ),
+            SizedBox(width: gap),
+            Semantics(
+              button: true,
+              child: SizedBox(
+                key: const Key('audio_play'),
+                width: 60,
+                height: 60,
+                child: IconButton(
+                  tooltip: playing ? '暂停' : '播放',
+                  onPressed: c._ready ? c._togglePlayback : null,
+                  padding: EdgeInsets.zero,
+                  iconSize: 40,
+                  style: IconButton.styleFrom(
+                    foregroundColor: palette.ink,
+                    disabledForegroundColor: palette.muted.withValues(
+                      alpha: 0.5,
+                    ),
+                  ),
+                  icon: loading && !playing
+                      ? SizedBox(
+                          width: 26,
+                          height: 26,
+                          child: CircularProgressIndicator(
+                            strokeWidth: 2,
+                            color: palette.accentText,
+                          ),
+                        )
+                      : Icon(playing ? LucideIcons.pause : LucideIcons.play),
+                ),
+              ),
+            ),
+            SizedBox(width: gap),
+            _TransportButton(
+              icon: LucideIcons.skip_forward,
+              tooltip: '下一章',
+              onTap: c._index + 1 < c._chapters.length
+                  ? () => c._openChapter(c._index + 1)
+                  : null,
+            ),
+            const Spacer(),
+            _TransportButton(
+              icon: LucideIcons.alarm_clock,
+              tooltip: '定时',
+              label: '定时',
+              active: c._sleepRemaining != null,
+              onTap: _showSleepTimer,
+            ),
+          ],
+        );
+      },
     );
   }
 
@@ -815,6 +1088,13 @@ class _AudioPageState extends State<AudioPage> {
         currentIndex: c._index,
         cache: cache,
         loader: (chapter) => ApiClient.instance.contentText(chapter.itemId),
+        extraSection: AudioOfflineSection(
+          bookId: c._bookId,
+          title: c._title,
+          cover: c._cover,
+          toneId: c._toneId,
+          chapters: c._chapters,
+        ),
       ),
     );
   }
@@ -1027,7 +1307,7 @@ class _AudioPageState extends State<AudioPage> {
                               ),
                             ),
                             subtitle: Text(
-                              '共 ${c._chapters.length} 章',
+                              '共 ${c._chapters.length} ${c._mode == 'narrator' ? '集' : '章'}',
                               style: TextStyle(
                                 fontSize: 12.5,
                                 color: palette.muted,
@@ -1445,14 +1725,20 @@ class _AudioCommentsSheetState extends State<_AudioCommentsSheet> {
                               ],
                             ),
                             const SizedBox(height: 6),
-                            Text(
-                              comment.text,
-                              style: TextStyle(
-                                color: palette.ink,
-                                fontSize: 13,
-                                height: 1.65,
+                            if (comment.text.isNotEmpty)
+                              Text(
+                                comment.text,
+                                style: TextStyle(
+                                  color: palette.ink,
+                                  fontSize: 13,
+                                  height: 1.65,
+                                ),
                               ),
-                            ),
+                            if (comment.imageUrls.isNotEmpty) ...[
+                              if (comment.text.isNotEmpty)
+                                const SizedBox(height: 8),
+                              CommentImages(imageUrls: comment.imageUrls),
+                            ],
                           ],
                         ),
                       );
@@ -1465,32 +1751,67 @@ class _AudioCommentsSheetState extends State<_AudioCommentsSheet> {
   }
 }
 
-/// Compact icon + tooltip button used in the transport row.
+/// Compact transport control.
+///
+/// With [label] it is the official icon-over-caption button used by 目录 / 定时
+/// (`bin.xml`: 24dp icon + 12sp text); without it, a bare 24dp icon button
+/// (上一章 / 下一章).
 class _TransportButton extends StatelessWidget {
   final IconData icon;
   final String tooltip;
   final VoidCallback? onTap;
   final bool active;
+  final String? label;
 
   const _TransportButton({
     required this.icon,
     required this.tooltip,
     required this.onTap,
     this.active = false,
+    this.label,
   });
 
   @override
   Widget build(BuildContext context) {
     final palette = HomePalette.of(context);
-    return IconButton(
-      tooltip: tooltip,
-      onPressed: onTap,
-      style: IconButton.styleFrom(
-        foregroundColor: active ? palette.accentText : palette.ink,
-        disabledForegroundColor: palette.line,
-        minimumSize: const Size(48, 48),
+    final color = onTap == null
+        ? palette.line
+        : (active ? palette.accentText : palette.ink);
+    final caption = label;
+    if (caption == null) {
+      return IconButton(
+        tooltip: tooltip,
+        onPressed: onTap,
+        iconSize: 24,
+        visualDensity: VisualDensity.compact,
+        style: IconButton.styleFrom(
+          foregroundColor: color,
+          disabledForegroundColor: palette.line,
+          minimumSize: const Size(48, 48),
+        ),
+        icon: Icon(icon),
+      );
+    }
+    return Tooltip(
+      message: tooltip,
+      child: InkWell(
+        onTap: onTap,
+        borderRadius: BorderRadius.circular(10),
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(minWidth: 48),
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 4),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(icon, size: 24, color: color),
+                const SizedBox(height: 4),
+                Text(caption, style: TextStyle(color: color, fontSize: 12)),
+              ],
+            ),
+          ),
+        ),
       ),
-      icon: Icon(icon, size: 22),
     );
   }
 }
@@ -1499,7 +1820,14 @@ class _AudioCatalog extends StatefulWidget {
   final List<Chapter> chapters;
   final int currentIndex;
 
-  const _AudioCatalog({required this.chapters, required this.currentIndex});
+  /// 章节单位：真人讲书按「集」计，其它情况仍是「章」。
+  final String unit;
+
+  const _AudioCatalog({
+    required this.chapters,
+    required this.currentIndex,
+    this.unit = '章',
+  });
 
   @override
   State<_AudioCatalog> createState() => _AudioCatalogState();
@@ -1510,6 +1838,10 @@ class _AudioCatalogState extends State<_AudioCatalog> {
     initialScrollOffset: widget.currentIndex * 72.0,
   );
   String _query = '';
+
+  String get _hintLabel => widget.unit == '集' ? '搜索集名或序号' : '搜索章节名称或序号';
+
+  String get _emptyLabel => widget.unit == '集' ? '没有匹配的集' : '没有匹配的章节';
 
   @override
   void dispose() {
@@ -1535,15 +1867,15 @@ class _AudioCatalogState extends State<_AudioCatalog> {
           child: Column(
             children: [
               Text(
-                '目录 · ${widget.chapters.length} 章',
+                '目录 · ${widget.chapters.length} ${widget.unit}',
                 style: Theme.of(context).textTheme.titleLarge,
               ),
               Padding(
                 padding: const EdgeInsets.all(16),
                 child: TextField(
-                  decoration: const InputDecoration(
-                    hintText: '搜索章节名称或序号',
-                    prefixIcon: Icon(Icons.search),
+                  decoration: InputDecoration(
+                    hintText: _hintLabel,
+                    prefixIcon: const Icon(Icons.search),
                   ),
                   onChanged: (value) {
                     setState(() => _query = value.trim().toLowerCase());
@@ -1553,7 +1885,7 @@ class _AudioCatalogState extends State<_AudioCatalog> {
               ),
               Expanded(
                 child: indexes.isEmpty
-                    ? const Center(child: Text('没有匹配的章节'))
+                    ? Center(child: Text(_emptyLabel))
                     : ListView.builder(
                         controller: _controller,
                         itemCount: indexes.length,

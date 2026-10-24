@@ -1,9 +1,11 @@
 //! Endpoint registry and request context.
 //!
-//! One `Server` owns the route table; the FFI bridge, the loopback HTTP
-//! adapter and the built-in Web UI all dispatch through it. Endpoint names and
-//! path matching are identical across all three dispatch paths.
+//! One `Server` owns the route table; the FFI bridge and the loopback HTTP
+//! adapter both dispatch through it. Endpoint names and path matching are
+//! identical across both dispatch paths.
 
+pub mod account_history;
+pub mod account_library;
 pub mod audio;
 pub mod author;
 pub mod base;
@@ -15,14 +17,12 @@ pub mod dhcontent;
 pub mod full;
 pub mod home;
 pub mod manga;
-pub mod pages;
 pub mod router;
 pub mod search;
 pub mod session;
 pub mod toutiao;
 pub mod util;
 pub mod video;
-pub mod webui;
 pub mod wkcontent;
 
 use std::collections::HashMap;
@@ -117,7 +117,6 @@ pub struct Ctx {
     pub pool: Arc<DevicePool>,
     pub cfg: Arc<Config>,
     pub src_dir: String,
-    pub web_dir: String,
     pub filters: Arc<FilterManager>,
 }
 
@@ -183,6 +182,5 @@ pub mod server {
         audio::register(s);
         video::register(s);
         manga::register(s);
-        pages::register(s);
     }
 }

@@ -1,24 +1,25 @@
+import '../services/desktop_platform.dart';
+import '../widgets/desktop_settings_body.dart';
 import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_lucide/flutter_lucide.dart';
 import 'package:shared_preferences/shared_preferences.dart';
-import 'package:url_launcher/url_launcher.dart';
 
-import '../services/api_client.dart';
 import '../services/app_theme.dart';
 import '../services/audio_preferences.dart';
-import '../services/backend_service.dart';
+import '../services/native_player.dart';
+import '../services/player_preferences.dart';
 import '../services/book_open_preferences.dart';
 import '../services/drama_mute_preferences.dart';
 import '../services/library_store.dart';
 import '../widgets/home/home_design.dart';
 import 'about_page.dart';
+import 'api_service_page.dart';
 import 'cached_books_page.dart';
 import 'cached_dramas_page.dart';
 import 'library_backup_page.dart';
-import 'log_viewer_page.dart';
 import 'settings_category_page.dart';
 import 'system_tts_settings_page.dart';
 
@@ -45,8 +46,8 @@ class SettingsPage extends StatelessWidget {
       SettingsCategory(
         icon: LucideIcons.book_open,
         title: '阅读',
-        subtitle: '点书直达阅读器',
-        items: [_directReaderItem()],
+        subtitle: '点书直达阅读器（书架 / 发现入口）',
+        items: [_shelfDirectReaderItem(), _discoverDirectReaderItem()],
       ),
       SettingsCategory(
         icon: LucideIcons.headphones,
@@ -71,7 +72,11 @@ class SettingsPage extends StatelessWidget {
         icon: LucideIcons.film,
         title: '短剧',
         subtitle: '播放',
-        items: [_muteWhenColdStartItem()],
+        items: [
+          _muteWhenColdStartItem(),
+          if (!isWindowsDesktop) _floatingWindowItem(),
+          if (!isWindowsDesktop) _videoDecoderItem(),
+        ],
       ),
       SettingsCategory(
         icon: LucideIcons.database,
@@ -80,8 +85,8 @@ class SettingsPage extends StatelessWidget {
         items: [
           SettingsItem(
             icon: LucideIcons.database,
-            title: '备份与恢复',
-            subtitle: '导出收藏和进度，迁移到另一台手机',
+            title: '备份与导入',
+            subtitle: '本机备份、恢复与番茄书架导入',
             onTap: (context, setState) => Navigator.push(
               context,
               MaterialPageRoute(builder: (_) => const LibraryBackupPage()),
@@ -111,8 +116,9 @@ class SettingsPage extends StatelessWidget {
       SettingsCategory(
         icon: LucideIcons.cpu,
         title: '服务',
-        subtitle: '本地后端状态',
-        items: [_backendItem(), _statusItem(), _logItem()],
+        subtitle: '本地接口地址与可用端点',
+        pageBuilder: (_) => const ApiServicePage(),
+        items: const [],
       ),
       SettingsCategory(
         icon: LucideIcons.info,
@@ -142,97 +148,93 @@ class SettingsPage extends StatelessWidget {
         surfaceTintColor: Colors.transparent,
         scrolledUnderElevation: 0,
       ),
-      body: ListView(
-        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-        children: [
-          Material(
-            color: palette.surface,
-            borderRadius: BorderRadius.circular(20),
-            clipBehavior: Clip.antiAlias,
-            child: Container(
-              decoration: BoxDecoration(
-                borderRadius: BorderRadius.circular(20),
-                border: Border.all(
-                  color: palette.line,
-                  width: 0.6,
-                ),
-              ),
-              child: Column(
+      body: isWindowsDesktop
+          ? DesktopSettingsBody(categories: categories)
+          : ListView(
+              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
               children: [
-                for (var i = 0; i < categories.length; i++) ...[
-                  if (i > 0)
-                    Divider(
-                      height: 1,
-                      indent: 68,
-                      color: palette.line,
+                Material(
+                  color: palette.surface,
+                  borderRadius: BorderRadius.circular(20),
+                  clipBehavior: Clip.antiAlias,
+                  child: Container(
+                    decoration: BoxDecoration(
+                      borderRadius: BorderRadius.circular(20),
+                      border: Border.all(color: palette.line, width: 0.6),
                     ),
-                  ListTile(
-                    contentPadding: const EdgeInsets.symmetric(
-                      horizontal: 16,
-                      vertical: 4,
-                    ),
-                    leading: Container(
-                      width: 38,
-                      height: 38,
-                      decoration: BoxDecoration(
-                        color: (i < categoryColors.length
-                                ? categoryColors[i]
-                                : HomePalette.accent)
-                            .withValues(alpha: 0.12),
-                        borderRadius: BorderRadius.circular(10),
-                      ),
-                      child: Icon(
-                        categories[i].icon,
-                        size: 20,
-                        color: i < categoryColors.length
-                            ? categoryColors[i]
-                            : HomePalette.accent,
-                      ),
-                    ),
-                    title: Text(
-                      categories[i].title,
-                      style: TextStyle(
-                        fontWeight: FontWeight.w600,
-                        fontSize: 15,
-                        color: palette.ink,
-                      ),
-                    ),
-                    subtitle: Text(
-                      categories[i].subtitle,
-                      style: TextStyle(
-                        fontSize: 12.5,
-                        color: palette.muted,
-                      ),
-                    ),
-                    trailing: Icon(
-                      LucideIcons.chevron_right,
-                      size: 18,
-                      color: palette.muted,
-                    ),
-                    onTap: () {
-                      final cat = categories[i];
-                      final pageBuilder = cat.pageBuilder;
-                      Navigator.push(
-                        context,
-                        MaterialPageRoute(
-                          builder:
-                              pageBuilder ??
-                              (_) => SettingsCategoryPage(
-                                title: cat.title,
-                                items: cat.items,
+                    child: Column(
+                      children: [
+                        for (var i = 0; i < categories.length; i++) ...[
+                          if (i > 0)
+                            Divider(height: 1, indent: 68, color: palette.line),
+                          ListTile(
+                            contentPadding: const EdgeInsets.symmetric(
+                              horizontal: 16,
+                              vertical: 4,
+                            ),
+                            leading: Container(
+                              width: 38,
+                              height: 38,
+                              decoration: BoxDecoration(
+                                color:
+                                    (i < categoryColors.length
+                                            ? categoryColors[i]
+                                            : HomePalette.accent)
+                                        .withValues(alpha: 0.12),
+                                borderRadius: BorderRadius.circular(10),
                               ),
-                        ),
-                      );
-                    },
+                              child: Icon(
+                                categories[i].icon,
+                                size: 20,
+                                color: i < categoryColors.length
+                                    ? categoryColors[i]
+                                    : HomePalette.accent,
+                              ),
+                            ),
+                            title: Text(
+                              categories[i].title,
+                              style: TextStyle(
+                                fontWeight: FontWeight.w600,
+                                fontSize: 15,
+                                color: palette.ink,
+                              ),
+                            ),
+                            subtitle: Text(
+                              categories[i].subtitle,
+                              style: TextStyle(
+                                fontSize: 12.5,
+                                color: palette.muted,
+                              ),
+                            ),
+                            trailing: Icon(
+                              LucideIcons.chevron_right,
+                              size: 18,
+                              color: palette.muted,
+                            ),
+                            onTap: () {
+                              final cat = categories[i];
+                              final pageBuilder = cat.pageBuilder;
+                              Navigator.push(
+                                context,
+                                MaterialPageRoute(
+                                  builder:
+                                      pageBuilder ??
+                                      (_) => SettingsCategoryPage(
+                                        title: cat.title,
+                                        items: cat.items,
+                                      ),
+                                ),
+                              );
+                            },
+                          ),
+                        ],
+                      ],
+                    ),
                   ),
-                ],
+                ),
               ],
             ),
-          ),
-        ),
-      ],
-    ),
-  );
+    );
   }
 
   // ── 外观 ──────────────────────────────────────────────────────────────
@@ -350,21 +352,88 @@ class SettingsPage extends StatelessWidget {
   // ── 阅读 ──────────────────────────────────────────────────────────────
 
   /// issue #19 第 3 条：点书跳过详情页，直接按上次进度进阅读器（小说/漫画）。
-  /// 默认关＝现有行为（先进详情页）。听书/短剧与加载失败时仍停留在详情页。
-  SettingsItem _directReaderItem() => SettingsItem(
-    icon: LucideIcons.book_open,
-    title: '点击书籍直接进入阅读',
-    subtitle: '点书架、首页、搜索里的书时，跳过详情页直接开始阅读',
+  /// 切后台悬浮窗播放（#24，默认关）：开启且已授予悬浮窗权限时，切到
+  /// 后台或锁屏用悬浮小窗继续播；关闭则切后台暂停（现有行为）。
+  /// 开启时若无权限，先打开系统设置让用户授予，授予后回来再点一次。
+  SettingsItem _floatingWindowItem() => SettingsItem(
+    icon: LucideIcons.video,
+    title: '切后台悬浮窗播放',
+    subtitle: '切到后台或锁屏时用悬浮小窗继续播放，需要悬浮窗权限',
     trailingBuilder: (context) => ValueListenableBuilder<bool>(
-      valueListenable: BookOpenPreferences.instance.directReader,
+      valueListenable: PlayerPreferences.floatingWindow,
       builder: (context, value, _) => Switch(
         value: value,
-        onChanged: (v) => unawaited(BookOpenPreferences.instance.set(v)),
+        onChanged: (enabled) =>
+            unawaited(_setFloatingWindow(context, enabled)),
       ),
     ),
     onTap: (context, setState) {
-      final current = BookOpenPreferences.instance.directReader.value;
-      unawaited(BookOpenPreferences.instance.set(!current));
+      final current = PlayerPreferences.floatingWindow.value;
+      unawaited(_setFloatingWindow(context, !current));
+    },
+  );
+
+  Future<void> _setFloatingWindow(BuildContext context, bool enabled) async {
+    if (!enabled) {
+      await PlayerPreferences.setFloatingWindow(false);
+      return;
+    }
+    if (await NativePlayer.canDrawOverlays()) {
+      await PlayerPreferences.setFloatingWindow(true);
+      return;
+    }
+    await NativePlayer.requestOverlayPermission();
+    if (context.mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('请在系统设置中允许“显示在其他应用的上层”，然后回来再开启'),
+        ),
+      );
+    }
+  }
+
+  /// 默认关＝现有行为（先进详情页）。听书/短剧与加载失败时仍停留在详情页。
+  ///
+  /// 书架的「我的书」和发现入口分成两条（issue #103）：书架里的书点开多半是
+  /// 接着读，首页/搜索里的书往往还要先看简介，一条全局开关会让两边互相干扰。
+  SettingsItem _shelfDirectReaderItem() => SettingsItem(
+    icon: LucideIcons.book_open,
+    title: '书架点书直接进入阅读',
+    subtitle: '在书架、阅读历史里点书时跳过详情页，接着上次进度读',
+    trailingBuilder: (context) => ValueListenableBuilder<bool>(
+      valueListenable: BookOpenPreferences.instance.shelfDirectReader,
+      builder: (context, value, _) => Switch(
+        value: value,
+        onChanged: (v) => unawaited(
+          BookOpenPreferences.instance.setShelfDirectReader(v),
+        ),
+      ),
+    ),
+    onTap: (context, setState) {
+      final current = BookOpenPreferences.instance.shelfDirectReader.value;
+      unawaited(BookOpenPreferences.instance.setShelfDirectReader(!current));
+    },
+  );
+
+  SettingsItem _discoverDirectReaderItem() => SettingsItem(
+    icon: LucideIcons.search,
+    title: '首页与搜索点书直接进入阅读',
+    subtitle: '在首页、搜索、榜单、作者页等入口点书时跳过详情页',
+    trailingBuilder: (context) => ValueListenableBuilder<bool>(
+      valueListenable: BookOpenPreferences.instance.discoverDirectReader,
+      builder: (context, value, _) => Switch(
+        value: value,
+        onChanged: (v) => unawaited(
+          BookOpenPreferences.instance.setDiscoverDirectReader(v),
+        ),
+      ),
+    ),
+    onTap: (context, setState) {
+      final current =
+          BookOpenPreferences.instance.discoverDirectReader.value;
+      unawaited(
+        BookOpenPreferences.instance.setDiscoverDirectReader(!current),
+      );
     },
   );
   // ── 听书 ──────────────────────────────────────────────────────────────
@@ -377,7 +446,8 @@ class SettingsPage extends StatelessWidget {
       valueListenable: AudioPreferences.instance.backgroundPlayback,
       builder: (context, value, _) => Switch(
         value: value,
-        onChanged: (v) => unawaited(AudioPreferences.instance.setBackgroundPlayback(v)),
+        onChanged: (v) =>
+            unawaited(AudioPreferences.instance.setBackgroundPlayback(v)),
       ),
     ),
     onTap: (context, setState) {
@@ -407,6 +477,78 @@ class SettingsPage extends StatelessWidget {
       unawaited(DramaMutePreferences.instance.set(!current));
     },
   );
+
+  /// 视频解码器（issue #92）：硬解异常的机型可以手动切软解。
+  ///
+  /// 只有**新起的播放器**会采用新设置——ExoPlayer 的 renderer 在 build 时
+  /// 定型，所以行内说明写明需重新进入播放页。
+  SettingsItem _videoDecoderItem() => SettingsItem(
+    icon: LucideIcons.monitor_play,
+    title: '视频解码器',
+    subtitle: '画面异常（黑屏、卡住、绿屏）时改用软解，重新进入播放页生效',
+    trailingBuilder: (context) => FutureBuilder<VideoDecoderPreference>(
+      future: PlayerPreferences.loadVideoDecoder(),
+      builder: (context, snapshot) => Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Text(
+            (snapshot.data ?? VideoDecoderPreference.automatic).label,
+            style: TextStyle(color: Theme.of(context).colorScheme.outline),
+          ),
+          const SizedBox(width: 4),
+          const Icon(LucideIcons.chevron_right, size: 18),
+        ],
+      ),
+    ),
+    onTap: (context, setState) => _showVideoDecoderDialog(context, setState),
+  );
+
+  Future<void> _showVideoDecoderDialog(
+    BuildContext context,
+    StateSetter refresh,
+  ) async {
+    final current = await PlayerPreferences.loadVideoDecoder();
+    if (!context.mounted) return;
+    final selected = await showDialog<VideoDecoderPreference>(
+      context: context,
+      builder: (c) => SimpleDialog(
+        title: const Text('视频解码器'),
+        children: [
+          RadioGroup<VideoDecoderPreference>(
+            groupValue: current,
+            onChanged: (v) {
+              if (v != null) Navigator.pop(c, v);
+            },
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                for (final value in VideoDecoderPreference.values)
+                  RadioListTile<VideoDecoderPreference>(
+                    value: value,
+                    title: Text(value.label),
+                    subtitle: value == VideoDecoderPreference.software
+                        ? const Text('更耗电，但能绕开部分芯片的硬解缺陷')
+                        : null,
+                  ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+    if (selected == null || !context.mounted) return;
+    try {
+      await DecoderPreferenceCache.set(selected);
+    } catch (_) {
+      if (context.mounted) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(const SnackBar(content: Text('解码器设置未能保存')));
+      }
+      return;
+    }
+    refresh(() {});
+  }
 
   // ── 数据 ──────────────────────────────────────────────────────────────
 
@@ -462,108 +604,7 @@ class SettingsPage extends StatelessWidget {
     }
   }
 
-  // ── 服务 ──────────────────────────────────────────────────────────────
-
-  SettingsItem _backendItem() => SettingsItem(
-    icon: LucideIcons.cpu,
-    title: '本地后端',
-    subtitle: BackendService.instance.baseUrl,
-    // The adapter only answers a request that carries the per-launch
-    // capability, and the entry URL is what hands it to a browser as a session
-    // cookie. Opening the bare base URL would just land on a 401.
-    onTap: (context, setState) => _openWebUi(context),
-  );
-
-  /// Opens the built-in Web UI in a browser.
-  ///
-  /// The transport's `resourceBase` carries the loopback capability in its
-  /// path; the adapter answers that entry with a redirect to `/` plus the
-  /// session cookie, so the capability never lingers in the address bar.
-  Future<void> _openWebUi(BuildContext context) async {
-    final entry = BackendService.instance.webUiEntryUrl;
-    if (entry.isEmpty) return;
-    var launched = false;
-    try {
-      // Android package visibility may hide a browser from canLaunchUrl even
-      // though it can handle the actual ACTION_VIEW intent.
-      launched = await launchUrl(
-        Uri.parse(entry),
-        mode: LaunchMode.externalApplication,
-      );
-    } catch (_) {
-      // Report launch failures through the same visible fallback.
-    }
-    if (!launched && context.mounted) {
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(const SnackBar(content: Text('无法打开 Web UI')));
-    }
-  }
-
-  SettingsItem _logItem() => SettingsItem(
-    icon: LucideIcons.terminal,
-    title: '日志',
-    subtitle: '查看应用运行日志',
-    onTap: (context, setState) => Navigator.push(
-      context,
-      MaterialPageRoute(builder: (_) => const LogViewerPage()),
-    ),
-  );
-
-  SettingsItem _statusItem() => SettingsItem(
-    icon: LucideIcons.circle_check,
-    title: '服务状态',
-    rowBuilder: (context) => const _ServiceStatusRow(),
-  );
-
   // ── 关于 ──────────────────────────────────────────────────────────────
   // The About category opens the About page directly via its pageBuilder;
   // no category-page items are needed.
-}
-
-/// Self-refreshing service status row (health check + refresh button).
-class _ServiceStatusRow extends StatefulWidget {
-  const _ServiceStatusRow();
-
-  @override
-  State<_ServiceStatusRow> createState() => _ServiceStatusRowState();
-}
-
-class _ServiceStatusRowState extends State<_ServiceStatusRow> {
-  String _status = '';
-
-  @override
-  void initState() {
-    super.initState();
-    _refresh();
-  }
-
-  Future<void> _refresh() async {
-    final ok = await ApiClient.instance.health();
-    if (!mounted) return;
-    setState(() => _status = ok ? '运行中' : '已停止');
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-    final healthy = _status == '运行中';
-    return ListTile(
-      leading: Icon(
-        healthy ? LucideIcons.circle_check : LucideIcons.circle_alert,
-        color: healthy ? Colors.green : Colors.red,
-      ),
-      title: Text('服务状态', style: theme.textTheme.titleMedium),
-      subtitle: Text(
-        _status,
-        style: theme.textTheme.labelMedium?.copyWith(
-          color: theme.colorScheme.outline,
-        ),
-      ),
-      trailing: IconButton(
-        icon: const Icon(LucideIcons.rotate_ccw, size: 18),
-        onPressed: _refresh,
-      ),
-    );
-  }
 }

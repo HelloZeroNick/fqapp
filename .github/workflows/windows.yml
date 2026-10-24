@@ -1,0 +1,135 @@
+name: Windows build and regression
+
+on:
+  workflow_dispatch:
+    inputs:
+      verify_player:
+        description: 也跑 libmpv 播放验证（需要桌面会话，托管 runner 上不稳定）
+        type: boolean
+        default: false
+  pull_request:
+    paths:
+      - 'lib/**'
+      - 'test/**'
+      - 'rust/**'
+      - 'native/**'
+      - 'windows/**'
+      - 'third_party/**'
+      - 'pubspec.*'
+      - 'scripts/*windows*'
+      - '.github/workflows/windows.yml'
+  push:
+    branches: [master]
+    paths:
+      - 'lib/**'
+      - 'test/**'
+      - 'rust/**'
+      - 'native/**'
+      - 'windows/**'
+      - 'third_party/**'
+      - 'pubspec.*'
+      - 'scripts/*windows*'
+      - '.github/workflows/windows.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
+        with:
+          toolchain: '1.99.1'
+      - uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2
+        with:
+          flutter-version: '3.44.6'
+          channel: stable
+          cache: true
+      - name: Resolve dependencies on the official unmodified SDK
+        run: flutter pub get
+      - name: Analyze application
+        run: flutter analyze --no-pub
+      - name: Test layout and playback lifecycle
+        run: >-
+          flutter test --no-pub
+          test/desktop_detail_layout_test.dart test/desktop_platform_test.dart
+          test/desktop_video_layout_test.dart test/player_page_test.dart
+          test/book_open_entry_test.dart
+      - name: Restore matching release binaries
+        id: bundle-cache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            build/windows/x64/runner/Release
+            rust/target/release/fqapi_core.dll
+          key: windows-3.44.6-rust1.99.1-${{ runner.arch }}-v1-${{ hashFiles('lib/**', 'pubspec.*', 'rust/Cargo.*', 'rust/src/**', 'rust/assets/**', 'rust/build.rs', 'native/**', 'assets/**', 'windows/runner/**', 'windows/CMakeLists.txt', 'windows/flutter/CMakeLists.txt', 'third_party/**') }}
+      - name: Build Windows release
+        if: steps.bundle-cache.outputs.cache-hit != 'true'
+        run: flutter build windows --release --target lib/main.dart
+      - name: Save verified-source release binaries
+        if: steps.bundle-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            build/windows/x64/runner/Release
+            rust/target/release/fqapi_core.dll
+          key: ${{ steps.bundle-cache.outputs.cache-primary-key }}
+      - name: Verify native decryption and access control
+        shell: pwsh
+        run: |
+          if (-not (Get-Command ffmpeg -ErrorAction SilentlyContinue)) {
+            choco install ffmpeg --yes --no-progress
+            if ($LASTEXITCODE -ne 0) { throw 'FFmpeg installation failed' }
+            $env:PATH += ';C:\ProgramData\chocolatey\bin'
+          }
+          python scripts/verify_windows_media.py
+          if ($LASTEXITCODE -ne 0) { throw 'Native media verification failed' }
+      - name: Diagnose headless libmpv playback and teardown (manual)
+        if: github.event_name == 'workflow_dispatch' && inputs.verify_player
+        shell: pwsh
+        run: |
+          dart compile exe scripts/verify_windows_player.dart -o build/verify_windows_player.exe
+          if ($LASTEXITCODE -ne 0) { throw 'AOT player verification compilation failed' }
+          & ./build/verify_windows_player.exe
+          if ($LASTEXITCODE -ne 0) { throw 'libmpv verification failed' }
+      - name: Collect licenses and package portable preview
+        shell: pwsh
+        run: |
+          python scripts/collect_windows_licenses.py
+          if ($LASTEXITCODE -ne 0) { throw 'License collection failed' }
+          $src = 'build/windows/x64/runner/Release'
+          foreach ($file in @('fqapp.exe','fqapi_core.dll','libmpv-2.dll','data/app.so')) {
+            if (-not (Test-Path "$src/$file")) { throw "Missing $file" }
+          }
+          Copy-Item LICENSE "$src/LICENSE.txt"
+          Copy-Item WINDOWS.md "$src/使用说明.md"
+          Compress-Archive -Path "$src/*" -DestinationPath 'fqapp-windows-x64-preview.zip'
+          Get-FileHash fqapp-windows-x64-preview.zip -Algorithm SHA256 | Format-List
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fqapp-windows-x64-preview
+          path: |
+            fqapp-windows-x64-preview.zip
+            build/validation/windows-media/*.json
+            build/validation/windows-player/*.json
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: windows-build-logs
+          path: |
+            build/windows/**/*.log
+            build/validation/windows-media/*.json
+            build/validation/windows-player/*.json
+            **/CMakeOutput.log
+            **/CMakeError.log
+          if-no-files-found: ignore

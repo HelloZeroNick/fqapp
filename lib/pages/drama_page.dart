@@ -1,3 +1,5 @@
+import '../widgets/video_player_chrome.dart';
+import '../services/desktop_platform.dart';
 import 'dart:async';
 
 import 'package:flutter/material.dart';
@@ -257,6 +259,12 @@ class _DramaPageState extends ConsumerState<DramaPage>
   static const _stripHeight = 38.0;
   static const _pullRefreshTrigger = 64.0;
 
+  /// 顶栏在本页内容上方占的高度：移动端是搜索行 + 频道条两行；桌面端
+  /// 不渲染搜索行——分区搜索入口收敛到频道条右端的搜索图标（壳层全局
+  /// 搜索在短剧分区也隐藏），只占频道条一行，把垂直空间还给视频/网格。
+  double get _topChromeHeight =>
+      (isWindowsDesktop ? 0.0 : _searchRowHeight) + _stripHeight;
+
   double _effectiveBottomInset(BuildContext context) {
     if (widget.bottomInset != null) return widget.bottomInset!;
     // Scaffold(extendBody: true) 已将底栏高度自动合入 MediaQuery.padding.bottom，
@@ -287,12 +295,24 @@ class _DramaPageState extends ConsumerState<DramaPage>
   /// True between the feed's scroll start and end notifications.
   bool _paging = false;
 
+  /// 上次滚轮切剧的时刻（桌面 feed）：一格滚轮常连发多个信号事件，
+  /// 冷却内的都丢弃，保证一次滚动只切一条。
+  DateTime? _lastWheelSwitchAt;
+
   /// Whether the containing route still shows this page (TickerMode). The bottom
   /// bar mutes a hidden destination instead of unmounting it.
   bool _tickerEnabled = true;
 
   /// True while a route we pushed is on top of the feed.
   bool _modalOpen = false;
+
+  /// 内联播放器当前这次暂停是不是生命周期可见性分支（hidden/paused）造成
+  /// 的，而不是用户手动暂停的。只有可见性暂停可以被随后的「回到 active」
+  /// 撤销；手动暂停是用户意图，焦点/生命周期噪声不许推翻——Windows 上点
+  /// 一下别的窗口只发 inactive，而桌面端把 inactive 算作 active，不分开
+  /// 记账的话用户一暂停、一切窗视频就自己播回来。仅 Windows 路径读写，
+  /// Android 的回前台续播语义不变。
+  bool _inlineVisibilityPaused = false;
 
   /// 长按中带打开的更多面板还在屏上（面板不销毁 inline 播放器，视频在
   /// 面板后面继续播，同官方 dialog；只挡掉手势与翻页）。
@@ -372,6 +392,9 @@ class _DramaPageState extends ConsumerState<DramaPage>
   @override
   void initState() {
     super.initState();
+    if (isWindowsDesktop) {
+      DesktopPlatform.fullscreen.addListener(_desktopFullscreenChanged);
+    }
     WidgetsBinding.instance.addObserver(this);
     _inline = InlineVideoPlayback(
       directoryLoader: widget.directoryLoader,
@@ -425,6 +448,9 @@ class _DramaPageState extends ConsumerState<DramaPage>
 
   @override
   void dispose() {
+    if (isWindowsDesktop) {
+      DesktopPlatform.fullscreen.removeListener(_desktopFullscreenChanged);
+    }
     WidgetsBinding.instance.removeObserver(this);
     _inline.activeVid.removeListener(_onFeedVidChanged);
     _inline.seeked.removeListener(_onFeedSeeked);
@@ -561,12 +587,30 @@ class _DramaPageState extends ConsumerState<DramaPage>
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    if (state == AppLifecycleState.resumed) {
+    if (playbackAppIsActive(state)) {
       if (_tickerEnabled && !_modalOpen) {
+        // Windows 上「切到别的窗口」只发 inactive，而 playbackAppIsActive
+        // 在桌面端把 inactive 算作 active：无条件续播会把用户手动暂停的
+        // 视频在焦点刚丢时就拉起来。所以桌面端只有可见性分支自己暂停过
+        // 的那一次才许在这里恢复，手动暂停不许被焦点变化推翻。Android
+        // 没有「可见但失焦」态，保持原有的回前台续播。
+        if (isWindowsDesktop && !_inlineVisibilityPaused) return;
         _resumeInline();
         _scheduleInlineSync();
       }
-    } else if (state != AppLifecycleState.inactive) {
+    } else if (state == AppLifecycleState.hidden ||
+        state == AppLifecycleState.paused ||
+        state == AppLifecycleState.detached) {
+      // 只在确实在播时把这次暂停记到可见性头上：用户已经手动暂停的，
+      // 回来时不许被当成可见性暂停恢复。「在播」现读播放器，不用会话的
+      // playing 通知器：桌面 chrome 是直接暂停播放器的，通知器靠
+      // playWhenReady 事件重算，可能还停在暂停前的值。
+      final player = _inline.player;
+      if (player != null &&
+          (player.playing ||
+              (player.playWhenReady && !player.completed))) {
+        _inlineVisibilityPaused = true;
+      }
       // `inactive` 只是瞬态打断（下拉通知栏/控制中心）：feed 继续播；
       // 只有 hidden/paused/detached 才暂停（视频绝不能从后台出声）。
       // A video must never keep playing from the background.
@@ -732,6 +776,8 @@ class _DramaPageState extends ConsumerState<DramaPage>
     // A tap while the feed is still settling, a route is on top, or the full
     // page player is loading must not fight the state machine.
     if (_modalOpen || _paging || _openingId != null) return;
+    // 用户手动接管播放/暂停：可见性暂停的记账作废。
+    _inlineVisibilityPaused = false;
     if (_inline.activeId.value != item.id) {
       unawaited(_inline.activate(item));
       return;
@@ -747,6 +793,9 @@ class _DramaPageState extends ConsumerState<DramaPage>
   /// a route may still sit on top of it, a drag may still be in flight, or the
   /// full page player may be loading.
   void _resumeInline() {
+    // 走到这里的续播都不是生命周期可见性恢复（滚动落定、路由返回、tab
+    // 回到本页）：可见性记账就此作废，免得陈旧标记日后放行一次假恢复。
+    _inlineVisibilityPaused = false;
     if (_modalOpen || _paging || _openingId != null) return;
     if (_currentItem()?.id == _inline.activeId.value) {
       unawaited(_inline.resume());
@@ -822,8 +871,7 @@ class _DramaPageState extends ConsumerState<DramaPage>
               danmakuEnabled: _feedDanmakuEnabled,
               onToggleDanmaku: () => unawaited(_toggleFeedDanmaku()),
               // 官方 `jm3.e`：弹幕设置入口在弹幕开关之后（与全页同门）。
-              onOpenDanmakuSettings: () =>
-                  _pendingFeedDanmakuSettings = true,
+              onOpenDanmakuSettings: () => _pendingFeedDanmakuSettings = true,
               // 官方 `jm3.t0`：行尾当前档 + 点击级联打开字号弹层。
               fontScaleLabel: ShortSeriesFontScale.label,
               onOpenFontSettings: () => _pendingFeedFontScale = true,
@@ -847,8 +895,7 @@ class _DramaPageState extends ConsumerState<DramaPage>
             danmakuEnabled: _feedDanmakuEnabled,
             onToggleDanmaku: () => unawaited(_toggleFeedDanmaku()),
             // 官方 `jm3.e`：弹幕设置入口在弹幕开关之后（与全页同门）。
-            onOpenDanmakuSettings: () =>
-                _pendingFeedDanmakuSettings = true,
+            onOpenDanmakuSettings: () => _pendingFeedDanmakuSettings = true,
             clearScreen: _feedClearScreen,
             onToggleClearScreen: () =>
                 setState(() => _feedClearScreen = !_feedClearScreen),
@@ -918,12 +965,12 @@ class _DramaPageState extends ConsumerState<DramaPage>
       await showModalBottomSheet<void>(
         context: context,
         useSafeArea: true,
-        backgroundColor: landscape ? Colors.transparent : const Color(0xFF1C1C1C),
+        backgroundColor: landscape
+            ? Colors.transparent
+            : const Color(0xFF1C1C1C),
         shape: landscape
             ? null
-            : RoundedRectangleBorder(
-                borderRadius: BorderRadius.circular(12),
-              ),
+            : RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
         builder: (sheetContext) {
           final panel = PlayletDanmakuSettingsPanel(
             settings: _feedDanmakuSettings,
@@ -932,9 +979,8 @@ class _DramaPageState extends ConsumerState<DramaPage>
               setState(() => _feedDanmakuSettings = settings);
               unawaited(DanmakuSettings.save(settings));
             },
-            onReset: () => messenger.showSnackBar(
-              const SnackBar(content: Text('设置成功')),
-            ),
+            onReset: () =>
+                messenger.showSnackBar(const SnackBar(content: Text('设置成功'))),
           );
           if (!landscape) return panel;
           return Container(
@@ -1232,11 +1278,7 @@ class _DramaPageState extends ConsumerState<DramaPage>
             ),
             if (_pullDistance > 0)
               Positioned(
-                top:
-                    MediaQuery.paddingOf(context).top +
-                    _searchRowHeight +
-                    _stripHeight +
-                    8,
+                top: MediaQuery.paddingOf(context).top + _topChromeHeight + 8,
                 left: 0,
                 right: 0,
                 child: _PullRefreshHint(
@@ -1256,8 +1298,7 @@ class _DramaPageState extends ConsumerState<DramaPage>
                   child: SizedBox(
                     height:
                         MediaQuery.paddingOf(context).top +
-                        _searchRowHeight +
-                        _stripHeight +
+                        _topChromeHeight +
                         56,
                     child: const DecoratedBox(
                       decoration: BoxDecoration(
@@ -1276,7 +1317,8 @@ class _DramaPageState extends ConsumerState<DramaPage>
                   ),
                 ),
               ),
-            if (!_recentEditing)
+            if (!_recentEditing &&
+                !(isWindowsDesktop && DesktopPlatform.fullscreen.value))
               Positioned(
                 top: 0,
                 left: 0,
@@ -1295,7 +1337,7 @@ class _DramaPageState extends ConsumerState<DramaPage>
             // 底部 tab（50dp）是**悬浮压在 feed 上的**，所以 94dp 从 tab 底边算，
             // 提示悬在 tab 栏上方约 44dp。本页 feed 止步于 NavigationBar 顶边，
             // 同一视觉位置 = 94 - 官方 tab 高 50 = **44dp**。
-            if (_guideMounted)
+            if (_guideMounted && !isWindowsDesktop)
               Positioned(
                 left: 16,
                 right: 16,
@@ -1334,6 +1376,9 @@ class _DramaPageState extends ConsumerState<DramaPage>
       }
       return _GridMessage(key: Key('$gridKey.empty'), message: '暂无内容');
     }
+    if (isWindowsDesktop) {
+      columns = (MediaQuery.sizeOf(context).width / 190).floor().clamp(3, 9);
+    }
     final bottomInset = _effectiveBottomInset(context);
     return NotificationListener<ScrollNotification>(
       onNotification: _onGridScroll,
@@ -1341,10 +1386,7 @@ class _DramaPageState extends ConsumerState<DramaPage>
         key: Key(gridKey),
         padding: EdgeInsets.fromLTRB(
           12,
-          MediaQuery.paddingOf(context).top +
-              _searchRowHeight +
-              _stripHeight +
-              12,
+          MediaQuery.paddingOf(context).top + _topChromeHeight + 12,
           12,
           bottomInset + 20,
         ),
@@ -1353,7 +1395,11 @@ class _DramaPageState extends ConsumerState<DramaPage>
           crossAxisSpacing: 8,
           mainAxisSpacing: 16,
           // 海报约 5:7 + 片名 + 「分类·集数」；两列格片名可占两行。
-          childAspectRatio: columns == 2 ? 0.56 : 0.52,
+          childAspectRatio: isWindowsDesktop
+              ? .58
+              : columns == 2
+              ? 0.56
+              : 0.52,
         ),
         itemCount: items.length,
         itemBuilder: (context, index) => _BrowseCard(
@@ -1410,6 +1456,9 @@ class _DramaPageState extends ConsumerState<DramaPage>
   }
 
   Widget _feed(HomeState state, List<MediaItem> items) {
+    if (isWindowsDesktop && state.error == null && items.isNotEmpty) {
+      return _desktopFeed(items);
+    }
     if (state.error != null) {
       return _FeedMessage(
         key: const Key('drama_error'),
@@ -1497,8 +1546,12 @@ class _DramaPageState extends ConsumerState<DramaPage>
                     onRetry: () => unawaited(_inline.activate(item)),
                   )
                 : null,
-            // 全屏观看 = 唯一进全页播放器的入口；单击画面只切播放/暂停。
+            // 「观看全集·N集」药丸 = 进全页播放器（官方 `nk3.c.e` →
+            // `zf3.c.s` goToSingleFeed）。
             onFullscreen: () => _openPlayer(item),
+            // 右侧横屏钮是另一条路：官方 `nk3.c.g` → `zf3.c.w` →
+            // `transformToLandActivity`，起独立横屏页。
+            onLandscape: () => _openPlayer(item, openFullScreen: true),
             onQuickCatalog: () => _openQuickCatalog(item),
             // 标题行「剧名 >」= 官方进剧集详情页的入口（ql3/v0.a1）。
             onOpenSeriesDetail: () => _openSeriesDetail(item),
@@ -1516,6 +1569,157 @@ class _DramaPageState extends ConsumerState<DramaPage>
     );
   }
 
+  void _desktopFullscreenChanged() {
+    if (mounted) setState(() {});
+  }
+
+  void _desktopNextDrama(List<MediaItem> items, int delta) {
+    final index = (_screenIndex + delta).clamp(0, items.length - 1);
+    if (index == _screenIndex) return;
+    setState(() => _screenIndex = index);
+    ref.read(dramaProvider.notifier).noteCurrentVid(items[index].id);
+    if (index >= items.length - 2) {
+      unawaited(ref.read(dramaProvider.notifier).loadMore());
+    }
+    _syncInline();
+  }
+
+  /// 桌面滚轮切剧：600ms 冷却，一次滚动只切一条；推了路由（详情/播放页）
+  /// 时不响应，滚轮留给上层页面。
+  void _desktopWheelDrama(List<MediaItem> items, int delta) {
+    if (_modalOpen) return;
+    final now = DateTime.now();
+    final last = _lastWheelSwitchAt;
+    if (last != null &&
+        now.difference(last) < const Duration(milliseconds: 600)) {
+      return;
+    }
+    _lastWheelSwitchAt = now;
+    _desktopNextDrama(items, delta);
+  }
+
+  Widget _desktopFeed(List<MediaItem> items) {
+    final item = items[_screenIndex.clamp(0, items.length - 1)];
+    return ListenableBuilder(
+      listenable: Listenable.merge([
+        _inline.textureId,
+        _inline.playing,
+        _inline.duration,
+        _inline.videoSize,
+        _inline.firstFrame,
+        _inline.error,
+        _inline.activeVid,
+      ]),
+      builder: (context, _) => Focus(
+        onKeyEvent: (_, event) {
+          if (event is! KeyDownEvent) return KeyEventResult.ignored;
+          if (event.logicalKey == LogicalKeyboardKey.pageDown) {
+            _desktopNextDrama(items, 1);
+            return KeyEventResult.handled;
+          }
+          if (event.logicalKey == LogicalKeyboardKey.pageUp) {
+            _desktopNextDrama(items, -1);
+            return KeyEventResult.handled;
+          }
+          return KeyEventResult.ignored;
+        },
+        child: Padding(
+          padding: EdgeInsets.only(
+            top: DesktopPlatform.fullscreen.value ? 0 : _topChromeHeight,
+          ),
+          child: Column(
+            children: [
+              Expanded(
+                child: VideoPlayerChrome(
+                  key: const ValueKey('desktop-feed-player'),
+                  player: _inline.player,
+                  title: item.title,
+                  seriesTitle: item.title,
+                  synopsis: item.intro,
+                  onWheelNavigate: (delta) =>
+                      _desktopWheelDrama(items, delta),
+                  episodes: _inline.episodes,
+                  currentIndex: _inline.activeEpisodeIndex ?? 0,
+                  duration: _inline.duration.value,
+                  playing: _inline.playing.value,
+                  enabled: _inline.player?.isCreated ?? false,
+                  shortSeries: true,
+                  onSelectEpisode: (index) =>
+                      _inline.activate(item, startEpisodeIndex: index),
+                  onError: (_) => _inline.error.value = '播放失败，请重试',
+                  onOpenSeriesDetail: () => _openSeriesDetail(item),
+                  onComments: () =>
+                      PlayletCommentPanel.show(context, seriesId: item.id),
+                  onOpenOfflineCache: _inline.episodes.isEmpty
+                      ? null
+                      : () => unawaited(_openFeedDownloadSheet()),
+                  onOpenListenMode: _inline.episodes.isEmpty
+                      ? null
+                      : () => unawaited(_openFeedListenMode()),
+                  onPlaybackRateChanged: _inline.selectRate,
+                  onPlaybackVolumeChanged: _inline.setVolume,
+                  defaultMute: _inline.muted.value,
+                  qualityVariants: _inline.variants,
+                  currentQualityUrl: _inline.currentVariant?.url,
+                  onQualitySelected: (variant) =>
+                      unawaited(_inline.switchVariant(variant)),
+                  child: Stack(
+                    fit: StackFit.expand,
+                    children: [
+                      _InlineVideoLayer(item: item, playback: _inline),
+                      _FeedDanmakuOverlay(
+                        item: item,
+                        playback: _inline,
+                        entries: _feedDanmaku.entries,
+                        enabled: _feedDanmakuEnabled,
+                        clearScreen: false,
+                        settings: _feedDanmakuSettings,
+                      ),
+                      _InlineVideoError(
+                        item: item,
+                        playback: _inline,
+                        onRetry: () => unawaited(_inline.activate(item)),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+              if (!DesktopPlatform.fullscreen.value)
+                SizedBox(
+                  height: 44,
+                  child: Row(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      TextButton.icon(
+                        onPressed: _screenIndex > 0
+                            ? () => _desktopNextDrama(items, -1)
+                            : null,
+                        icon: const Icon(Icons.keyboard_arrow_up),
+                        label: const Text('上一条（Page Up）'),
+                      ),
+                      const SizedBox(width: 24),
+                      Text(
+                        '${_screenIndex + 1} / ${items.length}',
+                        style: const TextStyle(color: Colors.white60),
+                      ),
+                      const SizedBox(width: 24),
+                      TextButton.icon(
+                        onPressed: _screenIndex + 1 < items.length
+                            ? () => _desktopNextDrama(items, 1)
+                            : null,
+                        icon: const Icon(Icons.keyboard_arrow_down),
+                        label: const Text('下一条（Page Down）'),
+                      ),
+                    ],
+                  ),
+                ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
   /// The official card opens the play page directly
   /// (`VideoInfiniteHolderV3` → `ShortSeriesLaunchArgs`), so the directory is
   /// fetched here and the player is pushed with the resume episode selected.
@@ -1526,6 +1730,11 @@ class _DramaPageState extends ConsumerState<DramaPage>
     int? startEpisodeIndex,
     List<Chapter>? loadedEpisodes,
     SeriesDetail? initialDetail,
+
+    /// 进页即横屏全屏（feed 卡片右侧的横屏钮）。官方那颗钮不是「观看全集」
+    /// 的同一条路，它 `transformToLandActivity` 起独立
+    /// `ShortSeriesLandActivity`（`jq3/x.java:4499-4538`）。
+    bool openFullScreen = false,
   }) async {
     if (_openingId != null) return;
     setState(() => _openingId = item.id);
@@ -1590,6 +1799,7 @@ class _DramaPageState extends ConsumerState<DramaPage>
             // 进度不需要显式传——上面的 `disposePlayer()` 已把 feed 的
             // 当前集与播放进度写进历史，PlayerPage 从同一条历史续播。
             shortSeries: true,
+            openFullScreen: openFullScreen,
             aiGenerated: item.aiGenerated,
           ),
         ),
@@ -1612,9 +1822,7 @@ class _DramaPageState extends ConsumerState<DramaPage>
   }
 
   void _openDetail(MediaItem item) {
-    unawaited(
-      _pushOverFeed(() => openBookDetail(context, item)),
-    );
+    unawaited(_pushOverFeed(() => openBookDetail(context, item)));
   }
 
   /// feed 卡片标题行「剧名 >」→ 剧集详情页（官方 `ql3/v0.a1()` 默认分支，
@@ -1742,15 +1950,18 @@ class _TopBar extends StatelessWidget {
           // Official compressed header `ap4.xml`: search row is 38dp,
           // `marginStart/End` 16dp, no `paddingTop` (that 6dp belongs to
           // uncompressed `ap3.xml`).
-          SizedBox(
-            height: _DramaPageState._searchRowHeight,
-            child: Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 16),
-              // 官方 `ap4.xml` 的搜索行 38dp、框体 36dp（`c5e.xml` `@dimen/zl`），
-              // 垂直居中。
-              child: Center(child: _searchField(context, light: light)),
+          // 桌面端不渲染这一行：分区搜索只留频道条右端的搜索图标一处
+          // 入口（与 _DramaPageState._topChromeHeight 的桌面高度一致）。
+          if (!isWindowsDesktop)
+            SizedBox(
+              height: _DramaPageState._searchRowHeight,
+              child: Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 16),
+                // 官方 `ap4.xml` 的搜索行 38dp、框体 36dp（`c5e.xml` `@dimen/zl`），
+                // 垂直居中。
+                child: Center(child: _searchField(context, light: light)),
+              ),
             ),
-          ),
 
           SizedBox(
             height: _DramaPageState._stripHeight,
@@ -1949,6 +2160,10 @@ class _DramaFeedCard extends StatelessWidget {
   final Widget? errorOverlay;
   final InlineVideoPlayback? playback;
   final VoidCallback? onFullscreen;
+
+  /// 右侧横屏钮（官方 `nk3.c.g` → `transformToLandActivity`），与
+  /// [onFullscreen] 是两条路：那颗钮起独立的横屏页，不是「观看全集」。
+  final VoidCallback? onLandscape;
   final VoidCallback? onQuickCatalog;
   final VoidCallback onTogglePlay;
   final VoidCallback onOpenMorePanel;
@@ -1971,6 +2186,7 @@ class _DramaFeedCard extends StatelessWidget {
     this.errorOverlay,
     this.playback,
     this.onFullscreen,
+    this.onLandscape,
     this.onQuickCatalog,
     required this.onTogglePlay,
     required this.onOpenMorePanel,
@@ -2124,6 +2340,7 @@ class _DramaFeedCard extends StatelessWidget {
               playback: playback,
               onOpenSeriesDetail: onOpenSeriesDetail,
               onFullscreen: onFullscreen,
+              onLandscape: onLandscape,
               onQuickCatalog: onQuickCatalog,
               hotComments: hotComments,
               onHotCommentTap: onHotCommentTap,
@@ -2766,6 +2983,9 @@ class _InfoPanel extends StatefulWidget {
   final MediaItem item;
   final InlineVideoPlayback? playback;
   final VoidCallback? onFullscreen;
+
+  /// 右侧横屏钮（官方 `nk3.c.g`）。null 时该钮不渲染。
+  final VoidCallback? onLandscape;
   final VoidCallback? onQuickCatalog;
 
   /// 标题行「剧名 >」点击 → 剧集详情页。
@@ -2778,6 +2998,7 @@ class _InfoPanel extends StatefulWidget {
     required this.item,
     required this.playback,
     required this.onFullscreen,
+    this.onLandscape,
     this.onQuickCatalog,
     required this.onOpenSeriesDetail,
     this.hotComments = const [],
@@ -2809,11 +3030,11 @@ class _InfoPanelState extends State<_InfoPanel> {
                   const SizedBox(width: 8),
                   _QuickCatalogButton(onTap: widget.onQuickCatalog!),
                 ],
-                if (widget.playback != null) ...[
+                if (widget.playback != null && widget.onLandscape != null) ...[
                   const SizedBox(width: 8),
                   _FullscreenRoundButton(
                     playback: widget.playback!,
-                    onTap: widget.onFullscreen!,
+                    onTap: widget.onLandscape!,
                   ),
                 ],
               ],
@@ -3050,9 +3271,13 @@ class _QuickCatalogButton extends StatelessWidget {
   }
 }
 
-/// 官方 30×30dp 圆形全屏钮（`ad9.xml` 的 `@id/dgu`）。官方只在横版片源上
-/// 显示（`vk3.a.a`：非 vertical 才可见），这里用解码尺寸比例（≥1.666，
-/// 同 `VideoFit.landscapeRatio`）作代理；解码前不显示。
+/// 官方 30×30dp 圆形全屏钮（`ad9.xml` 的 `@id/dgu`），进入横屏播放页。
+///
+/// 显隐照官方 `vk3.a.a(saasVideoData, false)`：判据是横版片源，而不是「解码
+/// 尺寸此刻是否已知」。官方读的是数据层 `isVertical()`，换集立刻成立；本地
+/// 源数据没有该字段，只能等解码器报尺寸，但结论一旦拿到就由
+/// [InlineVideoPlayback.landscapeSource] 记住，不随 `videoSize` 换集重置而
+/// 退回未知——那正是「上划一集后钮再也不出现」的成因。
 class _FullscreenRoundButton extends StatelessWidget {
   final InlineVideoPlayback playback;
   final VoidCallback onTap;
@@ -3060,14 +3285,11 @@ class _FullscreenRoundButton extends StatelessWidget {
   const _FullscreenRoundButton({required this.playback, required this.onTap});
 
   @override
-  Widget build(BuildContext context) => ValueListenableBuilder<Size>(
-    valueListenable: playback.videoSize,
-    builder: (context, size, _) {
-      final landscape =
-          size.width > 0 &&
-          size.height > 0 &&
-          size.width / size.height >= PlayerVideoLayout.landscapeRatio;
-      if (!landscape) return const SizedBox.shrink();
+  Widget build(BuildContext context) => ValueListenableBuilder<bool?>(
+    valueListenable: playback.landscapeSource,
+    builder: (context, landscape, _) {
+      // `null`（还没解出尺寸）与竖版同样不渲染，避免闪出又消失。
+      if (landscape != true) return const SizedBox.shrink();
       return GestureDetector(
         key: const Key('drama_fullscreen_button'),
         onTap: onTap,
@@ -3314,7 +3536,7 @@ class _InlineVideoLayer extends StatelessWidget {
               // Official display mode for a feed card: fill the frame unless
               // the source is wide enough to be pinned to its width. The
               // overflow is clipped by the ClipRRect above this layer.
-              fit: VideoFit.fillFrame,
+              fit: isWindowsDesktop ? VideoFit.contain : VideoFit.fillFrame,
             );
             return Stack(
               fit: StackFit.expand,
@@ -3326,12 +3548,17 @@ class _InlineVideoLayer extends StatelessWidget {
                     rect: layout.video,
                     child: RotatedBox(
                       quarterTurns: playback.rotation.value,
-                      child: Texture(
-                        key: ValueKey(
-                          'drama_inline_texture_${item.kind}_${item.id}',
-                        ),
-                        textureId: textureId,
-                      ),
+                      child: isWindowsDesktop
+                          ? DesktopPlatform.instance.videoSurface(
+                              textureId,
+                              key: ValueKey('drama_inline_${item.id}'),
+                            )
+                          : Texture(
+                              key: ValueKey(
+                                'drama_inline_texture_${item.kind}_${item.id}',
+                              ),
+                              textureId: textureId,
+                            ),
                     ),
                   ),
                 // A first-frame event may beat the size event. Never expose a

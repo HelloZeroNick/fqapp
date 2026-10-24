@@ -2,7 +2,7 @@
 
 面向构建、修改和调试本项目的开发者。用户使用说明见 [README.md](README.md)。
 
-> **核心设计**：Rust 原生核心在 Flutter 进程内运行，UI 通过 flutter_rust_bridge 直接调用；同一分发器另开 loopback HTTP 适配器（`127.0.0.1:8080`），继续服务内置 Web UI、`/api/*` 桥和 `/src/*` 漫画图。不需要自建服务器，不需要 root；签名、解密和本地缓存由手机完成，但在线内容仍需访问上游。
+> **核心设计**：Rust 原生核心在 Flutter 进程内运行，UI 通过 flutter_rust_bridge 直接调用；同一分发器另开 loopback HTTP 适配器（`127.0.0.1:18921`），把 `/api/v1/*` 只读路由和 `/src/*` 漫画图开放给外部阅读软件（如 Legado 书源）和本机工具。不需要自建服务器，不需要 root；签名、解密和本地缓存由手机完成，但在线内容仍需访问上游。
 
 ---
 
@@ -22,6 +22,16 @@
 ---
 
 ## 架构总览
+
+### 番茄书架原始采集与历史导入
+
+设置 → 数据 → 备份与导入提供本机备份/恢复入口，并集中进入“导入番茄书架”。网页登录、最近采集与旧版历史 JSON 共用导入预览和本机书架/历史合并流程。原始响应、分卷导出与补取资料放在折叠详情中。
+
+Android WebView 由用户本人完成官方手机号登录和人机验证。Cookie 保存在本应用私有 WebView 存储中，关闭窗口时 flush，只有显式“退出网页登录”才清除 Cookie 与网页存储；上游仍可使会话过期。交给 Rust 的会话副本只在内存和 `ApiClient._get` 的 POST 请求体中使用，不写进采集或备份。原生登录界面跟随应用主题，仅点击发送/获取验证码或重新发送按钮后尝试一次缩放适配；输入框获得焦点时取消尚未执行的自动适配，验证容器和键盘布局变化不触发缩放，提供手动“适应全页”和双指缩放；只读取按钮文字与布局尺寸，不读取输入框、验证答案或跨域 iframe 内容。
+
+固定白名单覆盖历史、书架、进度、文件夹、置顶与标签，仍只调用已确认的读取接口。采集保留响应 JSON 原始字段并移除凭证，结果分卷存入 Android 私有目录 `files/fanqie-library-captures/`。清单 `fqapp.fanqie-library-capture` v2 的 `sources` 为索引，`parts` 为原始分卷；支持读取最近一次、续取公开详情和系统选择器导出 ZIP，兼容 v1 单文件。采集本身不写入书架，解析预览后才合并。
+
+小说按章节 ID 对照目录恢复续读位置，保留较新的本机进度；未确认的段内偏移不转换为本地文字偏移。采集数量不等于书籍数量或全部云端数据；失败、取消、分页未完成和目录暂不可用均分别保留。协议证据与私人采集放在本地 `.agents/research/fanqie-history-20261018/`，不随源码分发。
 
 ```
 ┌──────────────────────────────────────────────────┐
@@ -47,14 +57,14 @@
               └──────┬─────────────┬──────┘
                      │             │
       loopback HTTP  │             │ HTTPS (reqwest)
-      127.0.0.1:8080 │             ▼
+      127.0.0.1:18921 │             ▼
                      ▼      上游 API
-          内置 Web UI / /src/* 漫画图
+          外部客户端 / /src/* 漫画图
 ```
 
 ### 数据流
 
-1. **启动**：`main.dart` → `BackendService.start()` 将配置、过滤器、Web 页面及其 CSS/字体、插件部署到 app 私有目录 → 通过 flutter_rust_bridge 在进程内初始化 Rust 核心（`libfqapi_core.so`）→ 轮询 `/health` 直到 200。核心没有独立进程，也不再有 Kotlin/JNI 桥或桌面可执行文件。
+1. **启动**：`main.dart` → `BackendService.start()` 将配置、过滤器、插件部署到 app 私有目录 → 通过 flutter_rust_bridge 在进程内初始化 Rust 核心（`libfqapi_core.so`）→ 轮询 `/health` 直到 200。核心没有独立进程，也不再有 Kotlin/JNI 桥或桌面可执行文件。
 2. **请求**：UI 页面 → `ApiClient` → `BackendTransport`（默认 `RustBackendTransport`，经 flutter_rust_bridge 直调 Rust 分发器；Web/测试用 loopback HTTP）→ 同一 Rust 分发器完成签名（Argus551）、设备池管理、请求上游、解密内容 → 返回归一化 JSON。
 3. **存储**：历史和阅读时长走 `LibraryStore`（Hive）。
 
@@ -75,7 +85,7 @@ fqapp/
 ├── android/                         # Android 工程、原生插件与 JVM 测试
 ├── ohos/                            # OHOS 工程（Flutter for OHOS 生成的 HAR/HAP 壳）
 ├── native/                          # CENC 流式 C 解密库、JNI 与 CMake
-├── assets/                          # 配置示例、Web UI、插件、图片和动画
+├── assets/                          # 配置示例、插件、图片和动画
 ├── test/                            # Flutter 测试及 Node 主机回归
 ├── scripts/                         # 构建、验证和资源生成；见 scripts/README.md
 ├── .github/workflows/               # Android APK 与原生库 CI
@@ -86,10 +96,10 @@ fqapp/
 > **仓库不含原生二进制**：`libfqapi_core.so` 和 `libshortplay_crypto.so` 均被 Git 忽略。
 > 前者可由 `rust/` 中的 Rust 源码经 `scripts/build_rust_backend.*` 重建；
 > `libshortplay_crypto.so` 由本仓库 `native/` 中的 C 源码在 Android 构建时自动生成。
-> Android 构建前需先运行 Rust 构建脚本生成 ARM64 核心库。
+> Android 构建前需先运行 Rust 构建脚本生成两个 ABI 的核心库。
 > OHOS 构建前需运行 `scripts/build_rust_ohos.ps1`，把核心库放进 `ohos/entry/libs/arm64-v8a/`。
 >
-> 体积参考：Rust ARM64 `libfqapi_core.so` 为 6,125,392 字节（约 5.84 MiB）。这是本地 release
+> 体积参考：Rust `libfqapi_core.so`（arm64-v8a）为 6,125,392 字节（约 5.84 MiB）。这是本地 release
 > 构建产物的实测大小，不是安装包体积，也不是性能结论。
 
 ---
@@ -108,9 +118,15 @@ fqapp/
 | JDK | 17 | Android Gradle 构建 |
 | Android NDK | 28.2.13676358 | 交叉编译 Rust ARM64 核心与 C 流式解密库 |
 | CMake | 3.22.1 | Android 构建自动编译 C 库 |
+| Visual Studio | 2022（「使用 C++ 的桌面开发」工作负载） | 仅构建 Windows 桌面端（可选） |
 | OpenHarmony SDK | 5.0.5(17)+ | 构建 HAP（`OHOS_SDK_HOME` 指向 `native` 目录）；另需 Rust target `aarch64-unknown-linux-ohos` |
 
 > Windows 下构建注意：Kotlin 增量编译在部分环境会报 `Could not close incremental caches`，已在 `android/gradle.properties` 中关闭（`kotlin.incremental=false`）。
+
+> **桌面插件与「开发人员模式」**：仓库已包含 Windows 桌面端插件，`flutter pub get` / `flutter test` /
+> `flutter run` 需要系统开启「开发人员模式」（插件通过符号链接注册），否则报
+> `Building with plugins requires symlink support`。只跑 `dart pub get` 或 `flutter analyze` 不受影响；
+> 不打算本地跑测试时，用 GitHub Actions 的 CI 即可。桌面端构建与验证见 [WINDOWS.md](WINDOWS.md)。
 
 ### 1. 编译 Rust 原生核心
 
@@ -167,6 +183,11 @@ flutter build apk --release --target-platform android-arm64
 
 生成的 APK 仅支持 `arm64-v8a`；如果要支持 32 位或 x86 设备，需要先为
 对应 ABI 交叉编译并打包 `libfqapi_core.so` 和 `libshortplay_crypto.so`，同时调整 ABI 配置。
+
+> **release 构建不要加 `--no-pub`**：`integration_test` 在 `dev_dependencies` 里，`flutter test` 会把
+> 它写进 Android 插件注册表；随后用 `--no-pub` 构建 release，Gradle 会报
+> `package dev.flutter.plugins.integration_test does not exist`。先跑测试再构建时保留 pub 步骤即可
+> （CI 正是这样构建的）。
 
 ### 4. 构建 HAP（OHOS）
 
@@ -292,7 +313,7 @@ maven { url = uri("https://maven.aliyun.com/repository/public") }
 
 1. 将 `config.json`、`filter.json`、`device_pool.example.json` 部署到应用私有目录 `files/backend/config/`。
 2. 首次启动时用示例初始化 `device_pool.json`；以后保留后端注册并保存的实际设备池。
-3. 从 Flutter 资源清单枚举并部署全部 `filters/`、`web/`、`plugins/` 文件，包含 CSS 和字体。内容变更时替换旧资源。
+3. 从 Flutter 资源清单枚举并部署全部 `filters/`、`plugins/` 文件。内容变更时替换旧资源。
 4. 运行时资源不含任何可执行后端二进制；Rust 核心以 `libfqapi_core.so` 随 APK 打包，在进程内加载。
 
 ### 启动流程（`BackendService.start`）
@@ -300,9 +321,9 @@ maven { url = uri("https://maven.aliyun.com/repository/public") }
 ```dart
 // 默认：flutter_rust_bridge 直调 Rust 核心（进程内，无独立进程）
 await rust.init(
-  configPath: ..., poolPath: ..., filterPath: ..., runtimeDir: ..., port: 8080,
+  configPath: ..., poolPath: ..., filterPath: ..., runtimeDir: ..., port: 18921,
 );
-// Web / 测试：同一分发器另开 loopback HTTP 适配器，供浏览器入口与 /src/* 资源
+// 端口来自部署后的 config.json；外部客户端（Legado 书源等）按该端口访问 /api/v1/*
 ```
 
 - 并发 `start()` 等待同一次完整启动，`stop()` 会等待进行中的部署与启动结束再清理。
@@ -328,15 +349,16 @@ await rust.init(
 .\scripts\build_rust_backend.ps1
 ```
 
-Rust 核心会使用配置文件推导运行目录，静态页面、过滤器和 `src/` 均按绝对路径加载；
-loopback HTTP 适配器只绑定 `127.0.0.1`，`/health`、`/api/*`、`/src/*` 与 Web 入口共用同一分发器。
+Rust 核心会使用配置文件推导运行目录，过滤器和 `src/` 均按绝对路径加载；
+loopback HTTP 适配器只绑定 `127.0.0.1`，`/health`、`/api/v1/*` 与 `/src/*` 共用同一分发器。
+读路由对任何本机客户端开放（供阅读软件等外部工具调用），写路由仍要求每次启动的能力值。
 加密播放所需的 `libshortplay_crypto.so` 由 APK 构建自动从 `native/` 生成。
 
 ---
 
 ## API 对接说明
 
-App 主要通过 `ApiClient` 调用后端 **`/api/*` 桥接层**（Rust 核心 `rust/src/endpoints/webui.rs`），首页推荐使用
+App 通过 `ApiClient` 调用后端 **`/api/v1/*` 业务路由**（Rust 核心 `rust/src/endpoints/`），首页推荐使用
 `/api/v1/recommend/homepage`。漫剧首页使用 `tab_type=24`；听书使用现有音频播放接口，漫画首页使用真实漫画分类搜索。
 客户端模型同时兼容归一化结果及部分旧版响应结构：
 
@@ -575,7 +597,7 @@ adb shell run-as com.fqapp.fqapp cat files/backend/backend.log
 adb shell run-as com.fqapp.fqapp ls -la files/backend/
 
 # 端口转发测试（后端起来后）
-adb forward tcp:18080 tcp:8080
+adb forward tcp:18080 tcp:18921
 curl http://127.0.0.1:18080/health
 
 # Flutter 日志
@@ -612,6 +634,12 @@ adb logcat -s flutter
 ---
 
 ## 开发计划
+
+番茄原始采集可在“设置 → 数据 → 备份与导入 → 导入番茄书架”中查看最近采集，
+选择“解析并预览已保存的数据”，预览后合并到本机书架和历史。
+导入复用现有 Hive 书架和阅读历史；按章节 ID 对照目录，不把上游 `order` 当成目录下标。
+较新的本机位置优先，缺目录时保留章节 ID，点书时重新匹配；段内偏移暂不转换。
+导入记录保留到用户手动删除（导入历史超过 10000 条时按最旧时间淘汰），备份也保留该标记。本机转换工具见 `scripts/README.md`。
 
 - [x] **Rust 原生核心**：`fqapi_core` → `libfqapi_core.so` → flutter_rust_bridge 进程内调用（替代 Go/Kotlin JNI）
 - [x] 小说搜索、目录、正文、章节/滚动位置续读

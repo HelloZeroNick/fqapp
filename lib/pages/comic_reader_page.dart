@@ -1,3 +1,5 @@
+import '../services/desktop_platform.dart';
+import '../widgets/desktop_chapter_sidebar.dart';
 import 'dart:async';
 import 'dart:math' as math;
 
@@ -8,9 +10,13 @@ import '../models/media_item.dart';
 import '../services/api_client.dart';
 import '../services/backend_transport.dart';
 import '../services/comic_page_layout.dart';
+import '../services/fair_memory.dart';
 import '../services/library_store.dart';
+import '../services/chapter_cache_store.dart';
 import '../services/media_history_store.dart';
 import '../services/reader_history.dart';
+import '../services/shelf_store.dart';
+import '../services/shelf_toggle.dart';
 import '../services/user_facing_error.dart';
 
 typedef ComicChapterLoader = Future<List<ComicImage>> Function(Chapter chapter);
@@ -49,6 +55,16 @@ class ComicReaderPage extends StatefulWidget {
   final ComicChapterLoader? chapterLoader;
   final ComicImageProviderFactory? imageProviderFactory;
 
+  /// 目录缓存，供「最近阅读/书架」下次直接续读漫画用。
+  ///
+  /// 漫画没有正文缓存（图片带 per-launch 能力值，不能落盘），所以这里只存
+  /// 目录本身；空表示用默认的 ChapterCacheStore。
+  final ChapterCache? cache;
+
+  /// 加入书架时用的条目（issue #103）。详情页传入原 `MediaItem`，书架卡片因此
+  /// 保留作者/徽标；其他入口省略，按 [bookId]/[title]/[cover] 兜底成漫画条目。
+  final MediaItem? shelfItem;
+
   const ComicReaderPage({
     super.key,
     required this.bookId,
@@ -59,6 +75,8 @@ class ComicReaderPage extends StatefulWidget {
     this.readerStore,
     this.chapterLoader,
     this.imageProviderFactory,
+    this.cache,
+    this.shelfItem,
   });
 
   @override
@@ -73,6 +91,20 @@ class _ComicReaderPageState extends State<ComicReaderPage>
     'manga',
   );
   late final _history = ReaderHistory(_readerStore);
+
+  /// 漫画阅读器自己的书架条目（issue #103）：详情页传了原 item 就用它，否则按
+  /// 本页已有的书籍字段兜底。书架 key 是 `kind:id`，漫画固定 'manga'。
+  MediaItem get _shelfEntry =>
+      widget.shelfItem ??
+      MediaItem(
+        id: widget.bookId,
+        title: widget.title,
+        cover: widget.cover,
+        author: '',
+        badge: '',
+        ep: '',
+        kind: 'manga',
+      );
   late int _chapterIndex;
   List<ComicImage> _images = const [];
   List<double> _ratios = const [];
@@ -98,6 +130,8 @@ class _ComicReaderPageState extends State<ComicReaderPage>
   bool _sessionActive = false;
   DateTime _readStart = DateTime.now();
   Timer? _saveTimer;
+  // 小米公平运行内存 KILL 广播的刷盘注销函数，见 reader_page.dart。
+  VoidCallback? _unregisterFairMemoryFlush;
   String? _error;
 
   Chapter get _chapter => widget.chapters[_chapterIndex];
@@ -106,6 +140,9 @@ class _ComicReaderPageState extends State<ComicReaderPage>
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
+    // 小米公平运行内存：KILL 广播到达时刷一次漫画进度，避免被杀丢进度。
+    _unregisterFairMemoryFlush = FairMemoryService.instance
+        .registerFlushHandler(_saveProgress);
     _appActive =
         WidgetsBinding.instance.lifecycleState == null ||
         WidgetsBinding.instance.lifecycleState == AppLifecycleState.resumed;
@@ -117,6 +154,7 @@ class _ComicReaderPageState extends State<ComicReaderPage>
       _loading = false;
       _error = '暂无可阅读章节';
     } else {
+      unawaited(_rememberCatalogue());
       unawaited(_loadChapter());
     }
   }
@@ -125,12 +163,33 @@ class _ComicReaderPageState extends State<ComicReaderPage>
   void dispose() {
     _imageRequest?.cancel();
     WidgetsBinding.instance.removeObserver(this);
+    _unregisterFairMemoryFlush?.call();
+    _unregisterFairMemoryFlush = null;
     _saveTimer?.cancel();
     _settleReadTime();
     _sessionActive = false;
     unawaited(_saveProgress());
     _scroll.dispose();
     super.dispose();
+  }
+
+  /// 记住目录，让「最近阅读/书架」下次能跳过详情页直接进漫画。
+  ///
+  /// 写入失败不影响阅读：拿不到目录最多是下次仍走详情页。
+  Future<void> _rememberCatalogue() async {
+    try {
+      final store = widget.cache ?? ChapterCacheStore.instance;
+      await store.saveBook(
+        CachedBook(
+          id: widget.bookId,
+          title: widget.title,
+          cover: widget.cover,
+          chapters: widget.chapters,
+        ),
+      );
+    } catch (_) {
+      // 缓存不可写时保持原有入口。
+    }
   }
 
   @override
@@ -422,6 +481,30 @@ class _ComicReaderPageState extends State<ComicReaderPage>
 
   @override
   Widget build(BuildContext context) {
+    if (!isWindowsDesktop) return _buildSurface(context);
+    return LayoutBuilder(
+      builder: (context, bounds) => Row(
+        children: [
+          if (bounds.maxWidth >= 1000)
+            DesktopChapterSidebar(
+              chapters: widget.chapters,
+              currentIndex: _chapterIndex,
+              onSelected: (index) => _changeChapter(index),
+            ),
+          Expanded(
+            child: Center(
+              child: ConstrainedBox(
+                constraints: const BoxConstraints(maxWidth: 1000),
+                child: _buildSurface(context),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildSurface(BuildContext context) {
     final empty = widget.chapters.isEmpty;
     return Scaffold(
       appBar: AppBar(
@@ -435,13 +518,32 @@ class _ComicReaderPageState extends State<ComicReaderPage>
             : [
                 IconButton(
                   tooltip: _pagedMode ? '切换为条漫模式' : '切换为翻页模式',
-                  onPressed: _loading ? null : () => setState(() => _pagedMode = !_pagedMode),
+                  onPressed: _loading
+                      ? null
+                      : () => setState(() => _pagedMode = !_pagedMode),
                   icon: Icon(_pagedMode ? Icons.view_day : Icons.auto_stories),
                 ),
                 IconButton(
                   tooltip: '刷新章节',
                   onPressed: _loading ? null : _reloadChapter,
                   icon: const Icon(Icons.refresh),
+                ),
+                ValueListenableBuilder<int>(
+                  valueListenable: ShelfStore.instance.listenable,
+                  builder: (context, _, _) {
+                    final inShelfNow = inShelf(_shelfEntry);
+                    return IconButton(
+                      key: const Key('comic_reader_shelf_button'),
+                      tooltip: inShelfNow ? '已在书架' : '加入书架',
+                      onPressed: () =>
+                          unawaited(toggleShelf(context, _shelfEntry)),
+                      icon: Icon(
+                        inShelfNow
+                            ? Icons.bookmark_added
+                            : Icons.bookmark_add_outlined,
+                      ),
+                    );
+                  },
                 ),
                 IconButton(
                   tooltip: '目录',
@@ -518,7 +620,8 @@ class _ComicReaderPageState extends State<ComicReaderPage>
                     return PageView.builder(
                       key: const ValueKey('comic-reader-paged-view'),
                       itemCount: _images.length,
-                      onPageChanged: (page) => setState(() => _visiblePage = page),
+                      onPageChanged: (page) =>
+                          setState(() => _visiblePage = page),
                       itemBuilder: (context, index) => Center(
                         child: SizedBox(
                           width: width,

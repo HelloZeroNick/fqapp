@@ -1,3 +1,4 @@
+import '../services/desktop_platform.dart';
 // 书架页：官方免费小说书架形态的本地重设计（双 tab + 页头分层 +
 // 三档版式 + 编辑态）。设计 token、版式/排序枚举集中在
 // lib/widgets/shelf/shelf_design.dart（docs/system_design.md）。
@@ -14,6 +15,7 @@ import 'package:flutter_lucide/flutter_lucide.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../models/media_item.dart';
+import '../services/book_open_preferences.dart';
 import '../services/chapter_cache_store.dart';
 import '../services/connectivity_status.dart';
 import '../services/imported_book_store.dart';
@@ -316,20 +318,41 @@ class _LibraryPageState extends State<LibraryPage> {
     );
   }
 
-  /// 点书：离线且本地有缓存时直接进阅读器，否则走详情页。
-  ///
-  /// 官方客户端书架点书就是直接起阅读器（`ReaderBundleBuilder`），中间没有
-  /// 那个要联网取目录的页面。这里只在「无网 + 有缓存」时抄这条捷径：联网时
-  /// 仍走详情页（或按设置 → 阅读 →「点击书籍直接进入阅读」自动进阅读器），
-  /// 段评、章节目录预览这些联网能力不会被悄悄降级。
-  Future<void> _open(MediaItem item) async {
+  /// 优先用缓存续读；未命中时保留离线阅读与详情页加载入口。
+  Future<void> _open(MediaItem item, {bool importedResume = false}) async {
     if (ImportedBookStore.isLocalBookId(item.id)) {
       await _openLocalBook(item);
       return;
     }
+    final preferences = BookOpenPreferences.instance;
+    await preferences.load();
+    if (!mounted) return;
+    if ((importedResume || preferences.shelfDirectReader.value) &&
+        await openRecentBook(
+          context,
+          item,
+          cache: widget.cacheStore,
+          readerStore: widget.readerStore,
+        )) {
+      return;
+    }
+    if (!mounted) return;
     if (await _openCached(item)) return;
     if (!mounted) return;
-    await openBookDetail(context, item);
+    if (importedResume) {
+      await Navigator.push(
+        context,
+        MaterialPageRoute<void>(
+          builder: (_) => DetailPage(
+            item: item,
+            readerStore: widget.readerStore,
+            autoOpenReader: true,
+          ),
+        ),
+      );
+      return;
+    }
+    await openBookDetail(context, item, entry: BookOpenEntry.shelf);
   }
 
   Future<void> _openLocalBook(MediaItem item) async {
@@ -857,12 +880,17 @@ class _LibraryPageState extends State<LibraryPage> {
           ShelfTokens.contentBottomInset,
         ),
         gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
-          crossAxisCount: ShelfTokens.gridColumns,
+          crossAxisCount: isWindowsDesktop
+              ? (constraints.maxWidth / 170).floor().clamp(3, 10)
+              : ShelfTokens.gridColumns,
           crossAxisSpacing: ShelfTokens.gridSpacing,
           mainAxisSpacing: ShelfTokens.gridRunSpacing,
           childAspectRatio: shelfGridChildAspectRatio(
             context,
             availableWidth: constraints.maxWidth,
+            columns: isWindowsDesktop
+                ? (constraints.maxWidth / 170).floor().clamp(3, 10)
+                : ShelfTokens.gridColumns,
           ),
         ),
         itemCount: entries.length,
@@ -966,7 +994,7 @@ class _LibraryPageState extends State<LibraryPage> {
     if (_editing) {
       _toggleSelected(entry);
     } else {
-      _open(entry.item);
+      _open(entry.item, importedResume: entry.importedResume);
     }
   }
 
@@ -1105,6 +1133,10 @@ class _ShelfEntry {
   final double? progress;
   final int? episode;
 
+  /// 目录总章数。旧历史没有这个字段（null），书架回退到百分比显示。
+  final int? chapterCount;
+  final bool importedResume;
+
   const _ShelfEntry({
     required this.item,
     required this.selectionKey,
@@ -1113,6 +1145,8 @@ class _ShelfEntry {
     this.readTime,
     this.progress,
     this.episode,
+    this.chapterCount,
+    this.importedResume = false,
   });
 
   factory _ShelfEntry.fromRecord(
@@ -1127,6 +1161,11 @@ class _ShelfEntry {
     readTime: _timeOf(history),
     progress: _progressOf(history),
     episode: _episodeOf(history),
+    chapterCount: _chapterCountOf(history),
+    importedResume:
+        record.item.kind == 'book' &&
+        history?['fanqieImported'] == true &&
+        history?['chapterId'] != null,
   );
 
   factory _ShelfEntry.fromHistory(Map<String, dynamic> history) {
@@ -1150,20 +1189,56 @@ class _ShelfEntry {
       readTime: _timeOf(history),
       progress: _progressOf(history),
       episode: _episodeOf(history),
+      chapterCount: _chapterCountOf(history),
+      importedResume:
+          item.kind == 'book' &&
+          history['fanqieImported'] == true &&
+          history['chapterId'] != null,
     );
   }
 
+  /// 是否读到最后一章（含章内进度）。
+  ///
+  /// 官方用「共 N 章·已读完」（strings `bm6`）表达这个状态，而不是把百分比
+  /// 四舍五入成 100%——总章数多、剩余章数少时 100% 无法区分「差一点」和
+  /// 「读完了」（issue #110 第 3 条）。
+  bool get _finished {
+    final total = chapterCount;
+    final chapter = episode;
+    if (total == null || chapter == null) return false;
+    if (chapter < total - 1) return false;
+    final value = progress;
+    return value == null || value >= 1;
+  }
+
   /// 角标（官方是「更新」角标位）里放真实进度，没有进度时不出角标。
+  ///
+  /// 读完时不再显示 100%，让「已读完」只由 [readingText] 表达一次。
   String? get badgeText {
+    if (_finished) return null;
+    final total = chapterCount;
+    final chapter = episode;
+    // 有总章数时用章序号，读者能看出「还剩多少章」。
+    if (total != null && chapter != null && chapter >= 0) {
+      return '${chapter + 1}/$total';
+    }
     final value = progress;
     if (value == null || value <= 0) return null;
     return '${(value * 100).round()}%';
   }
 
-  /// 宫格副信息 / 列表进度行：例如「第12章 · 35%」。
+  /// 宫格副信息 / 列表进度行。
+  ///
+  /// 有总章数时对齐官方：“第12章 · 共84章”，读完则是“共84章·已读完”
+  /// （strings `bm6`）。旧历史没有总章数，回退到原来的百分比。
   String? get readingText {
-    final parts = <String>[];
+    final total = chapterCount;
     final chapter = episode;
+    if (total != null && chapter != null && chapter >= 0) {
+      if (_finished) return '共$total章·已读完';
+      return '第${chapter + 1}章 · 共$total章';
+    }
+    final parts = <String>[];
     if (chapter != null && chapter >= 0) parts.add('第${chapter + 1}章');
     final value = progress;
     if (value != null && value > 0) {
@@ -1424,6 +1499,12 @@ double? _progressOf(Map<String, dynamic>? history) {
 int? _episodeOf(Map<String, dynamic>? history) {
   final value = history?['episode'];
   return value is num && value >= 0 ? value.toInt() : null;
+}
+
+/// 目录总章数，用于区分「读到末尾」与「全书读完」（issue #110）。
+int? _chapterCountOf(Map<String, dynamic>? history) {
+  final value = history?['chapterCount'];
+  return value is num && value > 0 ? value.toInt() : null;
 }
 
 int? _timeOf(Map<String, dynamic>? history) {

@@ -8,6 +8,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import 'package:fqapp/models/media_item.dart';
 import 'package:fqapp/pages/reader_page.dart';
+import 'package:fqapp/services/app_theme.dart';
 import 'package:fqapp/services/chapter_cache_store.dart';
 import 'package:fqapp/services/chapter_text_formatter.dart';
 import 'package:fqapp/services/reader_device.dart';
@@ -32,6 +33,71 @@ void main() {
   tearDown(() {
     PaintingBinding.instance.imageCache.clear();
     PaintingBinding.instance.imageCache.clearLiveImages();
+  });
+
+  testWidgets('「上一章」固定落在章首，「下一章」也落章首（issue #110）', (
+    tester,
+  ) async {
+    await _size(tester);
+    final store = MemoryReaderStore();
+    final cache = MemoryChapterCache();
+    for (final chapter in [_chapter, _nextChapter]) {
+      await cache.write(
+        bookId: _bookId,
+        chapterId: chapter.itemId,
+        title: chapter.title,
+        text: ChapterContent.fromPlainText(
+          // 需要多页正文：单页时章首和章末的 textOffset 都是 0，测不出落点。
+          List.generate(
+            120,
+            (i) => '${chapter.title}第$i段正文内容，用于撑出多页。',
+          ).join('\n\n'),
+          illustrationsChecked: true,
+        ).toCacheText(),
+      );
+    }
+    await tester.pumpWidget(
+      MaterialApp(
+        theme: AppTheme.createTheme(Brightness.light),
+        home: ReaderPage(
+          bookId: _bookId,
+          title: _bookTitle,
+          // 从第二章起：`上一章` 按钮在首章是禁用的，从 0 开始点不到它。
+          startIndex: 1,
+          chapters: [_chapter, _nextChapter],
+          readerStore: store,
+          chapterCache: cache,
+          chapterLoader: (chapter) async => _content().toCacheText(),
+          readerDevice: _Device(),
+          imageProviderFactory: _providerFor(portrait),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+    expect(store.entry?['chapterId'], 'second');
+
+    // 前一章：官方 Y(chapterId, 0, …) 一律从章首进入，不落在上一章末尾。
+    await _openMenu(tester);
+    await _openSettings(tester);
+    await tester.tap(find.byTooltip('上一章'));
+    await tester.pumpAndSettle();
+    expect(store.entry?['chapterId'], 'first');
+    // 章首/末尾的判据是 textOffset：startAtEnd 会把它设成 pages.last.start。
+    expect(
+      store.entry?['textOffset'] ?? 0,
+      lessThan(50),
+      reason: '上一章应落在章首，而不是上一章末尾',
+    );
+
+    // 后一章同样从章首进入，两者对称。
+    await _openMenu(tester);
+    await _openSettings(tester);
+    await tester.tap(find.byTooltip('下一章'));
+    await tester.pumpAndSettle();
+    expect(store.entry?['chapterId'], 'second');
+    expect(store.entry?['textOffset'] ?? 0, lessThan(50));
+    expect(tester.takeException(), isNull);
+    await _leave(tester);
   });
 
   testWidgets(
@@ -359,6 +425,21 @@ void main() {
     await tester.pumpAndSettle();
     final viewer = find.byKey(const ValueKey('reader-illustration-viewer'));
     expect(viewer, findsOneWidget);
+    final title = find.text('插图');
+    expect(
+      tester.widget<Text>(title).style?.color ??
+          DefaultTextStyle.of(tester.element(title)).style.color,
+      Colors.white,
+    );
+    final closeIcon = find.descendant(
+      of: find.byTooltip('关闭插图'),
+      matching: find.byType(Icon),
+    );
+    final icon = tester.widget<Icon>(closeIcon);
+    expect(
+      icon.color ?? IconTheme.of(tester.element(closeIcon)).color,
+      Colors.white,
+    );
     expect(store.entry!['textOffset'], anchor);
     final center = tester.getCenter(viewer);
     final left = await tester.startGesture(
@@ -826,6 +907,7 @@ Widget _app({
   ChapterTextLoader? loader,
   List<Chapter>? chapters,
 }) => MaterialApp(
+  theme: AppTheme.createTheme(Brightness.light),
   home: ReaderPage(
     bookId: _bookId,
     title: _bookTitle,

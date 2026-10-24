@@ -1,3 +1,4 @@
+import 'platform_channel.dart';
 import 'dart:async';
 
 import 'package:flutter/services.dart';
@@ -21,8 +22,8 @@ class SystemTtsEngine {
 }
 
 class SystemTts {
-  static const _channel = MethodChannel('fqapp/system_tts');
-  static const _events = EventChannel('fqapp/system_tts_events');
+  static const _channel = AppMethodChannel('fqapp/system_tts');
+  static const _events = AppEventChannel('fqapp/system_tts_events');
   static final events = _events.receiveBroadcastStream();
 
   static Future<T?> _call<T>(String method, [Object? arguments]) => _channel
@@ -414,6 +415,11 @@ class SystemTtsPlayback extends ChangeNotifier with WidgetsBindingObserver {
       duration: Duration.zero,
       playing: wantPlay && !loading && error == null,
       textProgress: progress,
+      // The piece being spoken is one sentence (see _speak's sentence-sized
+      // split). Before the first piece the range is empty: no highlight.
+      sentenceRange: _pieceEnd > _pieceStart
+          ? (start: _pieceStart, end: _pieceEnd)
+          : null,
     );
     notifyListeners();
     if (notification) {
