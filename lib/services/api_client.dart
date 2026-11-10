@@ -6,6 +6,9 @@ import 'dart:typed_data';
 import 'package:http/http.dart' as http;
 
 import '../models/audio_extra.dart';
+import '../models/audio_time_track.dart';
+import '../models/home_cell.dart';
+import '../models/homepage_page.dart';
 import '../models/author_profile.dart';
 import '../models/backend_resource_url.dart';
 import '../models/book_comment.dart';
@@ -20,28 +23,19 @@ import '../models/media_id.dart';
 import '../models/playlet_comment.dart';
 import '../models/rank.dart';
 import '../models/related_series.dart';
+import '../models/reader_video_match.dart';
+import '../models/category_front.dart';
 import '../models/search_discovery.dart';
 import '../models/series_detail.dart';
 import 'app_log.dart';
+import 'api_response_decoder.dart';
 import 'backend_service.dart';
 import 'backend_transport.dart';
 import 'chapter_text_formatter.dart';
 import 'request_gate.dart';
 
-/// A parsed homepage page. Keeping the cursor next to the parsed cards lets
-/// callers update the feed atomically after checking that the request is
-/// still current.
-class HomepagePage {
-  final List<MediaItem> items;
-  final int? nextOffset;
-  final String? sessionId;
-
-  const HomepagePage({
-    required this.items,
-    required this.nextOffset,
-    required this.sessionId,
-  });
-}
+export '../models/homepage_page.dart';
+part 'reader_video_api.dart';
 
 /// API client talking to the local Rust core.
 ///
@@ -64,6 +58,72 @@ class ApiClient {
                : BackendService.instance.transport);
 
   static final ApiClient instance = ApiClient();
+
+  /// Fixed read-only library resources; credentials stay in the POST body.
+  Future<Map<String, dynamic>> fanqieLibraryResource({
+    required String cookie,
+    required String resource,
+    String? deviceId,
+    int offset = 0,
+    int bookType = 0,
+    List<String> bookIds = const [],
+    String? folderId,
+  }) async {
+    final response = await _get(
+      '$_base/api/v1/account/fanqie/library',
+      method: 'POST',
+      body: Uint8List.fromList(
+        utf8.encode(
+          jsonEncode({
+            'cookie': cookie,
+            'resource': resource,
+            'device_id': ?deviceId,
+            'offset': offset,
+            'book_type': bookType,
+            'book_ids': bookIds,
+            'folder_id': ?folderId,
+          }),
+        ),
+      ),
+    );
+    return _decodeAsync(response);
+  }
+
+  /// Preserve the detail payload for later interpretation instead of dropping
+  /// fields through the display model. This endpoint needs no account cookie.
+  Future<Map<String, dynamic>> fanqieBookMetadata(String bookId) async =>
+      _decodeAsync(
+        await _get(
+          _url('/api/v1/books/${Uri.encodeComponent(bookId)}/detail', {}),
+        ),
+      );
+
+  /// Read-only upstream operation. POST keeps the temporary login cookie out
+  /// of URLs; the Rust adapter only permits the fixed upstream history GET.
+  Future<Map<String, dynamic>> fanqieHistoryPage({
+    required String cookie,
+    required int offset,
+    required int lastMinReadTimestampMs,
+    required bool firstLoad,
+    String? deviceId,
+  }) async {
+    final response = await _get(
+      '$_base/api/v1/account/fanqie/history',
+      method: 'POST',
+      body: Uint8List.fromList(
+        utf8.encode(
+          jsonEncode({
+            'cookie': cookie,
+            'offset': offset,
+            'last_min_read_timestamp_ms': lastMinReadTimestampMs,
+            'is_first_load': firstLoad,
+            'device_id': ?deviceId,
+          }),
+        ),
+      ),
+    );
+    return _decodeAsync(response);
+  }
 
   /// Per-instance gate: coalescing must not reach across test instances, and
   /// a restarted backend service gets a fresh flight table.
@@ -99,6 +159,14 @@ class ApiClient {
   /// 每个 tab 一个值，几天内都不会变；取不到时按老路径走，所以缓存过期只会
   /// 退化成第一段的结果。
   final Map<int, String> _seriesCellIds = {};
+
+  /// Raw detail payload [audioVoices] just fetched, offered to [bookDetail].
+  ///
+  /// The listening page resolves voices and its decorations through two
+  /// callers, but both need the same `/detail` envelope in one session. Handing
+  /// the payload across keeps that open to one upstream request. One-shot: the
+  /// entry is consumed on use, so a later refresh always fetches again.
+  ({String bookId, Map<String, dynamic> payload})? _detailHandoff;
 
   /// Timeout applied to every backend request. The backend runs locally, so a
   /// healthy call returns in well under this; a hung child process or a stuck
@@ -138,12 +206,17 @@ class ApiClient {
     return resolveBackendResource(_resourceBase, raw);
   }
 
-  /// Decodes and envelope-checks a response body on a background isolate so
-  /// large JSON payloads never jank the UI thread.
-  Future<Map<String, dynamic>> _decodeAsync(http.Response r) async {
+  /// Decodes and envelope-checks a response body.
+  ///
+  /// Small envelopes stay on the calling isolate — an isolate hop costs more
+  /// than the decode — while large payloads move off the UI thread.
+  Future<Map<String, dynamic>> _decodeAsync(http.Response r) {
     final statusCode = r.statusCode;
     final bodyBytes = r.bodyBytes;
-    return Isolate.run(() => _decodeEnvelope(statusCode, bodyBytes));
+    return decodeResponseBody(
+      bodyBytes.length,
+      () => _decodeEnvelope(statusCode, bodyBytes),
+    );
   }
 
   /// Sends a request to the local backend with a timeout.
@@ -169,16 +242,24 @@ class ApiClient {
     // —— 隐私纪律同 PlayerLoadSample：never URLs, keys or API bodies。
     final route = '$method ${_logRoute(url)}';
     final watch = Stopwatch()..start();
+    Duration? queueTime;
     final future = _gate.run(
       '$method $url ${effectiveTimeout.inMilliseconds}',
       request: request is BackendRequest ? request : null,
       share: method == 'GET' && body == null,
+      timeout: effectiveTimeout,
       send: () async {
+        queueTime = watch.elapsed;
+        final remaining = effectiveTimeout - watch.elapsed;
+        // FRB uses integer milliseconds; zero there means no deadline.
+        if (remaining.inMilliseconds <= 0) {
+          throw BackendRequestAborted('请求超时', timedOut: true);
+        }
         final response = await _transport.send(
           method,
           Uri.parse(url),
           body: body,
-          timeout: effectiveTimeout,
+          timeout: remaining,
           request: request is BackendRequest ? request : null,
         );
         return http.Response.bytes(
@@ -196,7 +277,8 @@ class ApiClient {
         watch.stop();
         AppLog.d(
           'api',
-          '$route ${response.statusCode} ${watch.elapsedMilliseconds}ms',
+          '$route ${response.statusCode} ${watch.elapsedMilliseconds}ms '
+              'queue=${queueTime?.inMilliseconds ?? 'shared'}',
         );
       },
       onError: (Object error) {
@@ -205,7 +287,8 @@ class ApiClient {
         // parameters. Keep the failure observable without logging that detail.
         AppLog.w(
           'api',
-          '$route 失败 ${watch.elapsedMilliseconds}ms (${error.runtimeType})',
+          '$route 失败 ${watch.elapsedMilliseconds}ms (${error.runtimeType}) '
+              'queue=${queueTime?.inMilliseconds ?? 'waiting/shared'}',
         );
       },
     );
@@ -233,16 +316,67 @@ class ApiClient {
   String _url(String path, Map<String, String> query) =>
       Uri.parse(_base).resolve(path).replace(queryParameters: query).toString();
 
-  String _searchUrl(String query, int page) =>
-      _url('/api/search', {'source': '番茄', 'query': query, 'page': '$page'});
-
+  /// Directory route for [bookId].
+  ///
+  /// The old `/api/directory` Web bridge is gone; `/api/v1/books/<id>/directory`
+  /// reaches the same `directory` endpoint. It returns the upstream payload, so
+  /// the chapter list arrives as `data.item_data_list` instead of the bridge's
+  /// pre-flattened `data.data.chapterListWithVolume` - [parseDirectory] accepts
+  /// both.
   String _directoryUrl(String bookId, String tab) =>
-      _url('/api/directory', {'source': '番茄', 'book_id': bookId, 'tab': tab});
+      _url('/api/v1/books/${Uri.encodeComponent(bookId)}/directory', const {});
 
-  /// Search across content types.
-  /// Returns normalized {tabs: [{title, data:[...]}], ...} structure.
+  /// Search across content types (raw envelope).
   Future<Map<String, dynamic>> search(String query, {int page = 1}) async {
-    final r = await _get(_searchUrl(query, page));
+    final offset = (page > 1 ? page - 1 : 0) * 10;
+    final r = await _get(
+      _url('/api/v1/search', {
+        'query': query,
+        'offset': '$offset',
+        'count': '10',
+      }),
+    );
+    return _decodeAsync(r);
+  }
+
+  /// 书旗数据源：搜索。
+  ///
+  /// 书旗搜索是单次返回，服务端不支持分页（`page` 参数在源协议里是模块名常量，
+  /// 不是页码），所以这里不接收 page。
+  Future<Map<String, dynamic>> shuqiSearch(String key) async {
+    final r = await _get(_url('/api/v1/shuqi/search', {'key': key}));
+    return _decodeAsync(r);
+  }
+
+  /// 书旗数据源：书籍详情（含总章数）。
+  Future<Map<String, dynamic>> shuqiBook(String bookId) async {
+    final r = await _get(_url('/api/v1/shuqi/book', {'book_id': bookId}));
+    return _decodeAsync(r);
+  }
+
+  /// 书旗数据源：目录。
+  ///
+  /// 主路返回真章名（`data.path == 'h5'`）；回退路径的章名是「第N章」占位，
+  /// 调用方可用 `data.path` 区分。
+  Future<Map<String, dynamic>> shuqiToc(String bookId) async {
+    final r = await _get(_url('/api/v1/shuqi/toc', {'book_id': bookId}));
+    return _decodeAsync(r);
+  }
+
+  /// 书旗数据源：正文。
+  ///
+  /// `data.path == 'cdn'` 是免签 CDN 直出的明文；`'chapterinfo'` 是加密口兜底
+  /// 解码后的结果，两者正文都已归一（`<br>` 已转换行）。
+  Future<Map<String, dynamic>> shuqiChapter(
+    String bookId,
+    String chapterId,
+  ) async {
+    final r = await _get(
+      _url('/api/v1/shuqi/chapter', {
+        'book_id': bookId,
+        'chapter_id': chapterId,
+      }),
+    );
     return _decodeAsync(r);
   }
 
@@ -256,14 +390,12 @@ class ApiClient {
     int? offset,
   }) async {
     final searchOffset = offset ?? (page > 1 ? page - 1 : 0) * 10;
-    final url = tabType == null
-        ? _searchUrl(query, page)
-        : _url('/api/v1/search', {
-            'query': query,
-            'tab_type': '$tabType',
-            'offset': '${searchOffset < 0 ? 0 : searchOffset}',
-            'count': '10',
-          });
+    final url = _url('/api/v1/search', {
+      'query': query,
+      if (tabType != null) 'tab_type': '$tabType',
+      'offset': '${searchOffset < 0 ? 0 : searchOffset}',
+      'count': '10',
+    });
     final r = await _get(url);
     final statusCode = r.statusCode;
     final bodyBytes = r.bodyBytes;
@@ -308,13 +440,16 @@ class ApiClient {
     return null;
   }
 
-  /// Book detail.
+  /// Book detail, addressed through the v1 route.
+  ///
+  /// Kept as a plain envelope accessor (unlike [bookDetail], which parses a
+  /// model) for callers and tests that only need the raw payload.
   Future<Map<String, dynamic>> detail(
     String bookId, {
     String tab = '小说',
   }) async {
     final r = await _get(
-      _url('/api/detail', {'source': '番茄', 'book_id': bookId, 'tab': tab}),
+      _url('/api/v1/books/${Uri.encodeComponent(bookId)}/detail', const {}),
     );
     return _decodeAsync(r);
   }
@@ -342,19 +477,24 @@ class ApiClient {
     );
   }
 
-  /// Chapter content (decrypted by backend).
+  /// Chapter content route, by content type.
+  ///
+  /// The old `/api/content?tab=` Web bridge dispatched to a different endpoint
+  /// per tab; the v1 routes are addressed directly instead.
   String _contentUrl(
     String itemId, {
     required String tab,
     String? toneId,
     String? mode,
-  }) => _url('/api/content', {
-    'source': '番茄',
-    'item_id': itemId,
-    'tab': tab,
-    'tone_id': ?toneId,
-    'mode': ?mode,
-  });
+    String? bookId,
+  }) {
+    final id = Uri.encodeComponent(itemId);
+    return switch (tab) {
+      '漫画' => _url('/api/v1/manga/$id', {'book_id': ?bookId}),
+      '短剧' || '漫剧' => _url('/api/v1/videos/$id', {'mode': ?mode}),
+      _ => _url('/api/v1/chapters/$id', {'tone_id': ?toneId}),
+    };
+  }
 
   Future<Map<String, dynamic>> content(
     String itemId, {
@@ -434,7 +574,9 @@ class ApiClient {
   /// Optional metadata failures must not prevent playing the default voice.
   Future<List<AudioVoice>> audioVoices(String bookId) async {
     try {
-      return parseAudioVoices(await detail(bookId, tab: '小说'));
+      final payload = await detail(bookId, tab: '小说');
+      _detailHandoff = (bookId: bookId, payload: payload);
+      return parseAudioVoices(payload);
     } on Exception {
       return defaultAudioVoices;
     }
@@ -448,6 +590,11 @@ class ApiClient {
   /// Rich book metadata (category, word count, rating, tags, author level…).
   /// Returns an empty model when the backend has no detail record.
   Future<BookDetail> bookDetail(String bookId) async {
+    final handoff = _detailHandoff;
+    if (handoff != null && handoff.bookId == bookId) {
+      _detailHandoff = null;
+      return BookDetail.fromPayload(handoff.payload);
+    }
     final response = await _get(
       _url('/api/v1/books/${Uri.encodeComponent(bookId)}/detail', {}),
     );
@@ -532,8 +679,68 @@ class ApiClient {
     }
   }
 
-  /// Chapter ideas (段评 / 章评): per-paragraph counts and comment ids.
+  /// 听书 → 正文的同步映射（官方 AudioTimePoint）。
   ///
+  /// 阅读页的朗读高亮靠它：上游按音频毫秒直出「第几段第几个字符」，客户端
+  /// 不需要做句子匹配。没有生成过时间轴的书返回 [AudioTimeTrack.empty]，
+  /// 这是正常应答而不是失败。
+  ///
+  /// [reqType] 默认 3：实测只有 3 会返回可用的偏移。1 对无 TTS 的书回
+  /// `101049`，2 回 `101002`，4 虽然 `code:0` 但偏移全为 0。
+  ///
+  /// 真人讲书用 2 取音频时间轴；这一版上游对部分书直接拒绝（`101002
+  /// NOVEL_DATA_GET_ERROR`）或给空轨。失败的那一章随即改用 3 再取一次，并
+  /// 记住回落结果：同一章之后直接取 3，不反复试错。
+  Future<AudioTimeTrack> chapterTimePoints(
+    String bookId,
+    String itemId, {
+    String toneId = '0',
+    int reqType = 3,
+  }) async {
+    if (reqType != 2) {
+      return _chapterTimePoints(bookId, itemId, toneId, reqType);
+    }
+    final fallbackKey = '$itemId|$toneId';
+    if (_timePointFallbacks.contains(fallbackKey)) {
+      return _chapterTimePoints(bookId, itemId, toneId, 3);
+    }
+    final direct = await _chapterTimePoints(bookId, itemId, toneId, 2);
+    if (direct.isNotEmpty) return direct;
+    _timePointFallbacks.add(fallbackKey);
+    return _chapterTimePoints(bookId, itemId, toneId, 3);
+  }
+
+  /// 已经回落到 `req_type=3` 的章节（`itemId|toneId`）。只在内存里记，
+  /// 进程重启后重新探测一次没有代价。
+  final Set<String> _timePointFallbacks = {};
+
+  Future<AudioTimeTrack> _chapterTimePoints(
+    String bookId,
+    String itemId,
+    String toneId,
+    int reqType,
+  ) async {
+    try {
+      final response = await _get(
+        _url('/api/v1/chapters/${Uri.encodeComponent(itemId)}/timepoints', {
+          'book_id': bookId,
+          'tone_id': toneId,
+          'req_type': '$reqType',
+        }),
+      );
+      final status = response.statusCode;
+      final bytes = response.bodyBytes;
+      return await Isolate.run(() {
+        final payload = _decodeEnvelope(status, bytes);
+        if (isUnavailableCode(payload['code'])) return AudioTimeTrack.empty;
+        return AudioTimeTrack.fromPayload(payload, audioItemId: itemId);
+      });
+    } on Exception {
+      return AudioTimeTrack.empty;
+    }
+  }
+
+  /// Chapter ideas (段评 / 章评): per-paragraph counts and comment ids.
   /// These come from the item-ideas service, not the book review list — the
   /// latter rejects the item and paragraph comment types outright. The payload
   /// carries counts and comment ids only; comment bodies need a second call
@@ -666,6 +873,46 @@ class ApiClient {
       );
     } on Exception {
       return HotSearch.empty;
+    }
+  }
+
+  /// The category front page (left-rail channels + tiles).
+  ///
+  /// Returns [CategoryFront.empty] on failure: the category entry then shows
+  /// its error state instead of blocking the home page.
+  Future<CategoryFront> categoryFront({int tab = 1}) async {
+    try {
+      final response = await _get(
+        _url('/api/v1/category', {'category_tab': '$tab'}),
+        timeout: const Duration(seconds: 15),
+      );
+      final status = response.statusCode;
+      final bytes = response.bodyBytes;
+      return await Isolate.run(
+        () => CategoryFront.fromPayload(_decodeEnvelope(status, bytes)),
+      );
+    } on Exception {
+      return CategoryFront.empty;
+    }
+  }
+
+  /// The bookstore search-bar cue words, rotated in the home search box.
+  /// Returns [SearchCue.empty] on failure: the box then keeps its static hint.
+  Future<SearchCue> searchCue({int tabType = 2, String tabName = ''}) async {
+    try {
+      final response = await _get(
+        _url('/api/v1/search/cue', {
+          'tab_type': '$tabType',
+          if (tabName.isNotEmpty) 'tab_name': tabName,
+        }),
+      );
+      final status = response.statusCode;
+      final bytes = response.bodyBytes;
+      return await Isolate.run(
+        () => SearchCue.fromPayload(_decodeEnvelope(status, bytes)),
+      );
+    } on Exception {
+      return SearchCue.empty;
     }
   }
 
@@ -1088,9 +1335,9 @@ class ApiClient {
   }
 
   /// Returns comic pages in backend order with absolute HTTP(S) URLs.
-  Future<List<ComicImage>> comicImages(String itemId) async {
+  Future<List<ComicImage>> comicImages(String itemId, {String? bookId}) async {
     final response = await _get(
-      _contentUrl(itemId, tab: '漫画'),
+      _contentUrl(itemId, tab: '漫画', bookId: bookId),
       timeout: _comicTimeout,
     );
     final statusCode = response.statusCode;
@@ -1171,12 +1418,6 @@ class ApiClient {
     }
   }
 
-  /// Resolve a share URL to a book id.
-  Future<Map<String, dynamic>> resolve(String url) async {
-    final r = await _get(_url('/api/resolve', {'url': url}));
-    return _decodeAsync(r);
-  }
-
   /// Real homepage recommendations (the Flutter home page previously used a
   /// search for the literal word "推荐", which is not a recommendation API).
   ///
@@ -1187,8 +1428,18 @@ class ApiClient {
     int tabType = 2,
     int offset = 0,
     String? sessionId,
+    int? tabIndex,
+    int? lastTabIndex,
   }) async {
-    final r = await _get(_homepageUrl(tabType, offset, sessionId));
+    final r = await _get(
+      _homepageUrl(
+        tabType,
+        offset,
+        sessionId,
+        tabIndex: tabIndex,
+        lastTabIndex: lastTabIndex,
+      ),
+    );
     return _decodeAsync(r);
   }
 
@@ -1204,6 +1455,8 @@ class ApiClient {
     int tabType = 2,
     int offset = 0,
     String? sessionId,
+    int? tabIndex,
+    int? lastTabIndex,
   }) async {
     // 翻页时第一段只是用来开 cell 的：它的游标和视频流不是一回事，而且把第二段
     // 的 session 再传给 tab 接口会被上游拒掉（客户端表现为 SERVICE_ERROR）。所以
@@ -1221,7 +1474,15 @@ class ApiClient {
       );
       if (flow != null) return flow;
     }
-    final r = await _get(_homepageUrl(tabType, offset, sessionId));
+    final r = await _get(
+      _homepageUrl(
+        tabType,
+        offset,
+        sessionId,
+        tabIndex: tabIndex,
+        lastTabIndex: lastTabIndex,
+      ),
+    );
     final statusCode = r.statusCode;
     final bodyBytes = r.bodyBytes;
     final tab = await Isolate.run(() {
@@ -1229,16 +1490,28 @@ class ApiClient {
       int? nextOffset;
       String? nextSessionId;
       var selectedPayload = payload;
+      final tabs = <HomeTabItem>[];
+      var tabScoped = false;
+      int? answeredTabType;
       final data = payload['data'];
       if (data is Map) {
         final tabItems = data['tab_item'];
         if (tabItems is List) {
+          tabScoped = true;
           selectedPayload = <String, dynamic>{};
           for (final raw in tabItems) {
-            if (raw is! Map || raw['tab_type']?.toString() != '$tabType') {
+            if (raw is! Map) continue;
+            // 顶栏分类：官方用服务端 title 当名字、tab_type 当身份，这里照抄。
+            final rawType = raw['tab_type'];
+            final rawTitle = raw['title'];
+            if (rawType is num && rawTitle is String && rawTitle.isNotEmpty) {
+              tabs.add(HomeTabItem(type: rawType.toInt(), title: rawTitle));
+            }
+            if (raw['tab_type']?.toString() != '$tabType') {
               continue;
             }
             selectedPayload = Map<String, dynamic>.from(raw);
+            answeredTabType = rawType is num ? rawType.toInt() : tabType;
             final candidate = raw['next_offset'];
             if (candidate is num &&
                 candidate.toInt() > offset &&
@@ -1256,11 +1529,16 @@ class ApiClient {
         selectedPayload,
         kind: tabType == 24 ? 'manju' : null,
       );
+      final cells = parseHomeCells(selectedPayload);
       return (
         page: HomepagePage(
           items: items,
+          cells: cells,
+          tabs: tabs,
           nextOffset: nextOffset,
           sessionId: nextSessionId,
+          answeredTabType: answeredTabType,
+          tabScoped: tabScoped,
         ),
         // 数字型 `cell_id` 在 JSON 里是 double，会被精度截断成上游认不出的值，
         // 必须取 `cell_id_str`。
@@ -1311,6 +1589,7 @@ class ApiClient {
           kind: tabType == 24 ? 'manju' : 'video',
         );
         if (items.isEmpty) return null;
+        final cells = parseHomeCells(payload);
         int? nextOffset;
         String? nextSessionId;
         final data = payload['data'];
@@ -1326,8 +1605,13 @@ class ApiClient {
         }
         return HomepagePage(
           items: items,
+          cells: cells,
           nextOffset: nextOffset,
           sessionId: nextSessionId,
+          // 第二段本来就是我们拿着这个分类的 `cell_id` 换来的流，归属由
+          // 请求本身确定，不需要响应再声明一遍。
+          answeredTabType: tabType,
+          tabScoped: true,
         );
       });
     } catch (error) {
@@ -1388,12 +1672,23 @@ class ApiClient {
     }
   }
 
-  String _homepageUrl(int tabType, int offset, String? sessionId) =>
-      _url('/api/v1/recommend/homepage', {
-        'tab_type': '$tabType',
-        'offset': '$offset',
-        if (sessionId != null && sessionId.isNotEmpty) 'session_id': sessionId,
-      });
+  String _homepageUrl(
+    int tabType,
+    int offset,
+    String? sessionId, {
+    int? tabIndex,
+    int? lastTabIndex,
+  }) => _url('/api/v1/recommend/homepage', {
+    'tab_type': '$tabType',
+    'offset': '$offset',
+    // 上游按 `tab_index` 决定回哪个 tab 的 `cell_data`；只带 `tab_type` 时
+    // 后端补 0，等于永远要推荐流的区块（「听书」会显示推荐榜）。官方请求
+    // 模型里 `tabIndex`/`lastTabIndex` 都是正式字段
+    // （J:rpc/model/BookstoreTabRequest.java:130,182）。
+    if (tabIndex != null) 'tab_index': '$tabIndex',
+    if (lastTabIndex != null) 'last_tab_index': '$lastTabIndex',
+    if (sessionId != null && sessionId.isNotEmpty) 'session_id': sessionId,
+  });
 
   /// Health check.
   Future<bool> health() async {
@@ -1438,9 +1733,17 @@ Map<String, dynamic> _decodeEnvelope(int statusCode, List<int> bodyBytes) {
   final payload = Map<String, dynamic>.from(decoded);
   // The web bridge uses code=200; REST upstream-compatible endpoints use
   // code=0. Both are successful envelopes.
+  //
+  // The "unavailable" codes are exempted rather than thrown: they mean "this
+  // item has no subtitles / no paragraph comments", which the subtitle and
+  // chapter-idea callers answer with an empty result. Throwing here made their
+  // `isUnavailableCode`/`isUnavailableIdeaCode` guards unreachable dead code -
+  // they only ever saw the exception path.
   if (payload['code'] != null &&
       payload['code'] != 200 &&
-      payload['code'] != 0) {
+      payload['code'] != 0 &&
+      !isUnavailableCode(payload['code']) &&
+      !isUnavailableIdeaCode(payload['code'])) {
     throw ApiException(
       '${payload['message'] ?? '请求失败'}',
       upstreamCode: payload['code'] is int ? payload['code'] as int : null,

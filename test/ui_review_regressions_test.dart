@@ -2,7 +2,6 @@ import 'dart:async';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
-import 'package:shared_preferences/shared_preferences.dart';
 
 import 'package:fqapp/models/audio_extra.dart';
 import 'package:fqapp/models/book_comment.dart';
@@ -14,12 +13,12 @@ import 'package:fqapp/pages/audio_page.dart';
 import 'package:fqapp/pages/reader_page.dart';
 import 'package:fqapp/widgets/audio/audio_sections.dart';
 import 'package:fqapp/widgets/detail/detail_reviews.dart';
-import 'package:fqapp/widgets/detail/detail_sections.dart';
 import 'package:fqapp/widgets/reader/reader_paged_view.dart';
 import 'package:fqapp/widgets/reader/reader_status_bar.dart';
 
 import 'support/controlled_player.dart';
 import 'support/fakes.dart';
+import 'support/reader_settings_nav.dart';
 
 const _track = SubtitleTrack([
   SubtitleCue(startMs: 0, text: '第一句同步字幕'),
@@ -29,7 +28,7 @@ const _nextTrack = SubtitleTrack([SubtitleCue(startMs: 0, text: '下一章同步
 
 void main() {
   setUp(() {
-    SharedPreferences.setMockInitialValues({});
+    setSingleChapterPrefs({});
     TestWidgetsFlutterBinding.instance.handleAppLifecycleStateChanged(
       AppLifecycleState.resumed,
     );
@@ -68,17 +67,50 @@ void main() {
     expect(catalog, 2);
   });
 
+  testWidgets('the audio book card keeps the portrait 3:4 cover ratio', (
+    tester,
+  ) async {
+    // Issue #85: the card feeds the novel's portrait cover (same image the
+    // detail page shows at 3:4). A near-square frame made BoxFit.cover crop
+    // the top/bottom of the cover, so the frame itself must be 3:4.
+    await tester.pumpWidget(
+      const MaterialApp(
+        home: Scaffold(
+          body: AudioBookCard(bookTitle: '听书', chapterTitle: '第一章'),
+        ),
+      ),
+    );
+    final ratio = tester.widget<AspectRatio>(
+      find.descendant(
+        of: find.byType(AudioBookCard),
+        matching: find.byType(AspectRatio),
+      ),
+    );
+    expect(ratio.aspectRatio, 3 / 4);
+    final cardSize = tester.getSize(
+      find.descendant(
+        of: find.byType(AudioBookCard),
+        matching: find.byType(ClipRRect),
+      ),
+    );
+    expect(cardSize.width, 293);
+    expect(cardSize.height, 293 * 4 / 3);
+  });
+
   testWidgets('an open read-along sheet receives late subtitles', (
     tester,
   ) async {
     final subtitles = Completer<SubtitleTrack>();
     await _mount(tester, _AudioSession((_, _) => subtitles.future).app());
     await _openReadAlong(tester);
-    expect(find.text('本章暂无同步字幕'), findsOneWidget);
+    expect(
+      find.byKey(const ValueKey('audio-read-along-empty')),
+      findsOneWidget,
+    );
     subtitles.complete(_track);
     await _flush(tester);
     expect(_currentSubtitle(tester), '第一句同步字幕');
-    expect(find.text('本章暂无同步字幕'), findsNothing);
+    expect(find.byKey(const ValueKey('audio-read-along-empty')), findsNothing);
   });
 
   testWidgets(
@@ -96,9 +128,15 @@ void main() {
       expect(_currentSubtitle(tester), '第二句同步字幕');
       session.players.first.emitCompleted();
       await _flush(tester);
+      // 官方连播倒计时（`te`「%s后播放下一集」）：播完要先过 3 秒窗口才换章。
+      await tester.pump(const Duration(seconds: 3));
+      await _flush(tester);
       expect(session.players, hasLength(2));
       expect(find.text('第二句同步字幕'), findsNothing);
-      expect(find.text('本章暂无同步字幕'), findsOneWidget);
+      expect(
+        find.byKey(const ValueKey('audio-read-along-empty')),
+        findsOneWidget,
+      );
       expect(
         tester
             .widget<Text>(
@@ -128,7 +166,10 @@ void main() {
     );
     await _mount(tester, session.app());
     await _openReadAlong(tester);
-    expect(find.text('本章暂无同步字幕'), findsOneWidget);
+    expect(
+      find.byKey(const ValueKey('audio-read-along-empty')),
+      findsOneWidget,
+    );
     expect(session.players.single.isPlaying, isTrue);
     expect(tester.takeException(), isNull);
   });
@@ -189,6 +230,8 @@ void main() {
       );
       await _flush(tester);
       expect(tester.widget<Switch>(toggle).onChanged, isNotNull);
+      // 面板顶部多了官方的「语速/定时/音色」三行，开关可能落在视口外。
+      await tester.ensureVisible(toggle);
       await tester.tap(toggle);
       await _flush(tester);
       expect(session.store.entry?['autoAdvance'], isFalse);
@@ -202,18 +245,21 @@ void main() {
     await _mount(tester, session.app());
     await tester.tap(find.byTooltip('更多'));
     await tester.pumpAndSettle();
-    await tester.tap(find.text('定时关闭'));
+    // 官方面板的「定时」快捷行取代了原来的「定时关闭」列表项。
+    await tester.tap(find.byKey(const Key('audio_more_timer')));
     await tester.pumpAndSettle();
     await tester.tap(find.text('15 分钟后'));
     await tester.pumpAndSettle();
     await tester.tap(find.byTooltip('更多'));
     await tester.pumpAndSettle();
-    String remaining() => tester.widget<Text>(find.textContaining('剩余 ')).data!;
+    // 官方 dod 口径：「剩余播放 MM:SS」。
+    String remaining() =>
+        tester.widget<Text>(find.textContaining('剩余播放 ')).data!;
     final before = remaining();
     await tester.pump(const Duration(seconds: 61));
     await _flush(tester);
     expect(remaining(), isNot(before));
-    expect(remaining(), matches(RegExp(r'^剩余 1[34] 分钟$')));
+    expect(remaining(), matches(RegExp(r'^剩余播放 1[34]:\d\d$')));
   });
 
   testWidgets(
@@ -293,15 +339,16 @@ void main() {
         await _tapReaderCenter(tester);
         await tester.pumpAndSettle();
         await _openSettings(tester);
+        await openReaderSettingsCategory(tester, 'turn');
         expect(find.byKey(const ValueKey('reader-auto-turn')), findsOneWidget);
-        expect(find.text('自动翻页'), findsOneWidget);
+        // 行为区块里还有一行「自动翻页」秒数，所以这里允许出现多次。
+        expect(find.text('自动翻页'), findsWidgets);
       },
     );
   }
 
-  testWidgets('a six out of ten aggregate rating renders three filled stars', (
-    tester,
-  ) async {
+  testWidgets('书评区不再重复汇总评分', (tester) async {
+    // 改版后评分只在 hero 出现一次；书评区不再放「轻点评分」卡。
     await tester.pumpWidget(
       const MaterialApp(
         home: Scaffold(
@@ -312,12 +359,8 @@ void main() {
         ),
       ),
     );
-    final stars = find.descendant(
-      of: find.byKey(const Key('detail_score_card')),
-      matching: find.byType(DetailStarRow),
-    );
-    expect(tester.widget<DetailStarRow>(stars).stars, 3);
-    expect(find.text('6.0'), findsOneWidget);
+    expect(find.byKey(const Key('detail_score_card')), findsNothing);
+    expect(find.text('6.0'), findsNothing);
   });
 }
 
@@ -325,7 +368,8 @@ String? _currentSubtitle(WidgetTester tester) =>
     tester.widget<Text>(find.byKey(const Key('audio_subtitle_current'))).data;
 
 Future<void> _openReadAlong(WidgetTester tester) async {
-  final entry = find.byKey(const Key('audio_read_along'));
+  // 两种朗读模式共用同一张「边听边读」入口。
+  final entry = find.byKey(const Key('audio_real_read_along'));
   await tester.ensureVisible(entry);
   await tester.tap(entry);
   await tester.pumpAndSettle();
@@ -361,7 +405,7 @@ Future<void> _mountReader(
   bool longFirstChapter = false,
   List<String>? comments,
 }) async {
-  SharedPreferences.setMockInitialValues({
+  setSingleChapterPrefs({
     'reader_page_mode': scroll ? 'scroll' : 'paged',
     'reader_auto_turn_seconds': 3,
   });
@@ -409,6 +453,8 @@ Future<void> _startAutoTurn(WidgetTester tester) async {
   await _tapReaderCenter(tester);
   await tester.pumpAndSettle();
   await _openSettings(tester);
+  // 自动翻页在「翻页」分类里。
+  await openReaderSettingsCategory(tester, 'turn');
   await tester.tap(find.byKey(const ValueKey('reader-auto-turn')));
   await tester.pumpAndSettle();
 }
@@ -449,10 +495,14 @@ class _AudioSession {
   );
 }
 
-/// Expands the 设置 section of the reading menu. The section keeps its state
-/// across chapter changes, so this is a no-op while it is already open.
+/// 从阅读菜单的「外观」直接打开阅读设置面板。
 Future<void> _openSettings(WidgetTester tester) async {
-  if (find.byTooltip('上一章').evaluate().isNotEmpty) return;
+  if (find
+      .byKey(const ValueKey('reader-settings-close'))
+      .evaluate()
+      .isNotEmpty) {
+    return;
+  }
   await tester.tap(find.byKey(const ValueKey('reader-settings')));
   await tester.pumpAndSettle();
 }

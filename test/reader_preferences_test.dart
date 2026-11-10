@@ -11,6 +11,26 @@ void main() {
   });
 
   test(
+    'system status bar defaults on and preserves explicit choices',
+    () async {
+      final defaults = await ReaderPreferences.load();
+      expect(defaults.showSystemStatusBar, isTrue);
+      expect(const ReaderPreferences().showSystemStatusBar, isTrue);
+      await defaults.copyWith(showSystemStatusBar: false).save();
+      final restored = await ReaderPreferences.load();
+      expect(restored.showSystemStatusBar, isFalse);
+      expect(restored.copyWith(fontSize: 22).showSystemStatusBar, isFalse);
+      await restored.copyWith(showSystemStatusBar: true).save();
+      expect((await ReaderPreferences.load()).showSystemStatusBar, isTrue);
+      SharedPreferences.setMockInitialValues({
+        'reader_show_system_status_bar': 'yes',
+      });
+      // 存储值无效时回到默认（显示）。
+      expect((await ReaderPreferences.load()).showSystemStatusBar, isTrue);
+    },
+  );
+
+  test(
     'reading info migrates the old switch and remembers an explicit mode',
     () async {
       expect(
@@ -56,6 +76,7 @@ void main() {
       fontName: '测试宋体.ttf',
       pageMode: ReaderPageMode.scroll,
       continuousReading: false,
+      showParagraphBubbles: false,
     );
 
     await expected.save();
@@ -78,6 +99,7 @@ void main() {
     expect(restored.fontName, '测试宋体.ttf');
     expect(restored.pageMode, ReaderPageMode.scroll);
     expect(restored.continuousReading, isFalse);
+    expect(restored.showParagraphBubbles, isFalse);
   });
 
   test('reader preferences normalize invalid stored values', () async {
@@ -97,6 +119,7 @@ void main() {
       'reader_brightness': 0,
       'reader_page_mode': 'unknown',
       'reader_continuous_reading': 'yes',
+      'reader_show_paragraph_bubbles': 'yes',
     });
 
     final restored = await ReaderPreferences.load();
@@ -117,6 +140,7 @@ void main() {
     expect(restored.pageMode, ReaderPageMode.paged);
     // A wrong-typed stored value falls back to the default (on).
     expect(restored.continuousReading, isTrue);
+    expect(restored.showParagraphBubbles, isTrue);
   });
 
   test(

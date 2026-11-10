@@ -3,6 +3,7 @@ import 'package:flutter_test/flutter_test.dart';
 
 import 'package:fqapp/models/playlet_comment.dart';
 import 'package:fqapp/widgets/player/playlet_danmaku_layer.dart';
+import 'package:fqapp/widgets/player/playlet_danmaku_settings.dart';
 
 /// 弹幕时间轴的用例。
 ///
@@ -100,6 +101,7 @@ void main() {
       bool enabled = true,
       bool tickerMode = true,
       double rate = 1,
+      double topInset = 0,
     }) => Directionality(
       textDirection: TextDirection.ltr,
       child: Center(
@@ -115,6 +117,7 @@ void main() {
               rate: rate,
               playing: playing,
               enabled: enabled,
+              topInset: topInset,
             ),
           ),
         ),
@@ -420,6 +423,30 @@ void main() {
       },
     );
 
+    testWidgets('topInset starts the first lane below the feed chrome', (
+      tester,
+    ) async {
+      final position = ValueNotifier<Duration>(
+        const Duration(milliseconds: 1000),
+      );
+      addTearDown(position.dispose);
+      await tester.pumpWidget(
+        layer(
+          position: position,
+          entries: [danmaku('top-inset', 500)],
+          topInset: 92,
+        ),
+      );
+      final viewport = tester.getRect(
+        find.byKey(const ValueKey('danmaku-viewport')),
+      );
+      final bubble = tester.getRect(
+        find.byKey(const ValueKey('danmaku-top-inset')),
+      );
+      // 容器 inset 92dp + 弹幕层自己的 8dp 首轨偏移。
+      expect(bubble.top - viewport.top, closeTo(100, .5));
+    });
+
     testWidgets('renders the entries that are inside the window', (
       tester,
     ) async {
@@ -470,6 +497,45 @@ void main() {
         ),
       );
       expect(find.byKey(const ValueKey('danmaku-d1')), findsNothing);
+    });
+
+    testWidgets('transparent background drops the bubble plate', (
+      tester,
+    ) async {
+      final position = ValueNotifier<Duration>(const Duration(seconds: 1));
+      addTearDown(position.dispose);
+      Widget bubble(DanmakuSettings settings) => MaterialApp(
+        home: SizedBox(
+          width: 400,
+          height: 300,
+          child: Stack(
+            children: [
+              PlayletDanmakuLayer(
+                entries: [danmaku('d1', 500)],
+                position: position,
+                settings: settings,
+              ),
+            ],
+          ),
+        ),
+      );
+
+      await tester.pumpWidget(bubble(const DanmakuSettings()));
+      BoxDecoration? plate() =>
+          tester
+                  .widget<Container>(find.byKey(const ValueKey('danmaku-d1')))
+                  .decoration
+              as BoxDecoration?;
+      // 默认仍画官方 40% 黑底，压在亮画面上也能看清。
+      expect(plate()?.color, const Color(0x66000000));
+
+      // 开关打开后只剩文字与描边阴影。
+      await tester.pumpWidget(
+        bubble(const DanmakuSettings(transparentBackground: true)),
+      );
+      await tester.pump();
+      expect(plate(), isNull);
+      expect(find.text('前方高能'), findsOneWidget);
     });
   });
 }

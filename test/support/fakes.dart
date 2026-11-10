@@ -3,12 +3,21 @@ import 'dart:io';
 import 'dart:ui' show Size;
 
 import 'package:flutter/foundation.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 import 'package:fqapp/models/media_item.dart';
 import 'package:fqapp/services/chapter_cache_store.dart';
 import 'package:fqapp/services/drama_download_store.dart';
 import 'package:fqapp/services/library_store.dart';
 import 'package:fqapp/services/native_player.dart';
+
+/// Fixtures that assert the legacy single-chapter list explicitly opt into
+/// direct switching. Joined-reader tests use normal preferences and defaults.
+void setSingleChapterPrefs(Map<String, Object> values) =>
+    SharedPreferences.setMockInitialValues({
+      'reader_scroll_chapter_mode': 'replace',
+      ...values,
+    });
 
 class MemoryReaderStore implements ReaderStore {
   Map<String, dynamic>? entry;
@@ -108,6 +117,9 @@ class MemoryChapterCache implements ChapterCache {
       content[bookId]?.keys.toSet() ?? {};
 
   @override
+  Future<CachedBook?> savedCatalogue(String bookId) async => catalogs[bookId];
+
+  @override
   Future<CachedBook?> cachedBook(String bookId) async {
     final chapters = content[bookId];
     if (chapters == null || chapters.isEmpty) return null;
@@ -131,6 +143,9 @@ class MemoryDramaDownloadStore implements DramaDownloadStore {
   final Directory? videoDirectory;
   final Map<String, CachedEpisode> _episodes = {};
   final Map<String, CachedDrama> _dramas = {};
+
+  @override
+  bool get isReady => true;
 
   @override
   final ValueNotifier<int> changes = ValueNotifier(0);
@@ -201,8 +216,10 @@ class MemoryDramaDownloadStore implements DramaDownloadStore {
     final directory = videoDirectory;
     if (episode != null && directory != null) {
       final file = File(episode.filePath);
-      if (file.existsSync() && file.parent.path == directory.path) {
-        await file.delete();
+      if (file.existsSync()) {
+        final parent = file.parent.resolveSymbolicLinksSync();
+        final root = directory.resolveSymbolicLinksSync();
+        if (parent == root) await file.delete();
       }
     }
     touch();
@@ -227,15 +244,24 @@ class FakeNativePlayer extends NativePlayer {
   int width;
   int height;
 
-  FakeNativePlayer({this.width = 1920, this.height = 1080});
+  FakeNativePlayer({
+    this.width = 1920,
+    this.height = 1080,
+    // 传 [Duration.zero] 模拟「create 完成时还不知道时长」：之后用
+    // [emitDuration] 补发 `duration` 事件。
+    this.totalDuration = const Duration(minutes: 2),
+  });
 
   final calls = <String>[];
 
   /// create 收到的 keyHex（按序）：用来断言「档位的 key」而非主地址的
   /// key 被传进播放器。
   final createdKeys = <String>[];
+
+  /// create 收到的起播位置（毫秒，按序）：原生把它当初始播放位置。
+  final createdStartMs = <int>[];
   Duration currentPosition = const Duration(seconds: 20);
-  Duration totalDuration = const Duration(minutes: 2);
+  Duration totalDuration;
   bool isPlaying = false;
   bool playbackRequested = false;
   bool isBuffering = false;
@@ -297,9 +323,15 @@ class FakeNativePlayer extends NativePlayer {
   }
 
   @override
-  Future<int> create(String cdnUrl, String keyHex) async {
+  Future<int> create(String cdnUrl, String keyHex, {int? startMs}) async {
     calls.add('create:$cdnUrl');
     createdKeys.add(keyHex);
+    // 与生产一致：只有正数才下发 startPositionMs，0 等同于从头播。
+    if (startMs != null && startMs > 0) {
+      createdStartMs.add(startMs);
+      // 原生在 prepare() 之前就定位到这个位置，等效于「起手即此处」。
+      currentPosition = Duration(milliseconds: startMs);
+    }
     return 1;
   }
 

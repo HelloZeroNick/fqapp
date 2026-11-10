@@ -1,5 +1,5 @@
 name: fqapp
-description: "A new Flutter project."
+description: "什锦铺 — 小说 / 短剧 / 漫剧 / 漫画 / 听书聚合客户端。"
 # The following line prevents the package from being accidentally published to
 # pub.dev using `flutter pub publish`. This is preferred for private packages.
 publish_to: 'none' # Remove this line if you wish to publish to pub.dev
@@ -16,7 +16,7 @@ publish_to: 'none' # Remove this line if you wish to publish to pub.dev
 # https://developer.apple.com/library/archive/documentation/General/Reference/InfoPlistKeyReference/Articles/CoreFoundationKeys.html
 # In Windows, build-name is used as the major, minor, and patch parts
 # of the product and file versions while build-number is used as the build suffix.
-version: 1.0.121+126
+version: 1.0.201+206
 
 environment:
   sdk: ^3.12.2
@@ -30,18 +30,17 @@ environment:
 dependencies:
   flutter:
     sdk: flutter
+  # 中文 Material 文案（复制/粘贴/全选等系统文本菜单）：没有 delegates 时
+  # Flutter 一律回退英文，即使系统语言是中文（issue #79）。
+  flutter_localizations:
+    sdk: flutter
 
-  # The following adds the Cupertino Icons font to your application.
-  # Use with the CupertinoIcons class for iOS style icons.
-  cupertino_icons: ^1.0.8
   http: ^1.6.0
+  crypto: 3.0.8
+  characters: ^1.4.1
   path_provider: ^2.1.0
   shared_preferences: ^2.3.0
   url_launcher: ^6.3.0
-  # Retained for the existing tests, which still import package:hive.
-  # Production code uses hive_ce below; drop these once the tests migrate.
-  hive: ^2.2.3
-  hive_flutter: ^1.1.0
   # hive_ce is the maintained Hive fork; all boxes open encrypted via
   # EncryptedHive (P1-3). Keys live in flutter_secure_storage (Keystore).
   hive_ce: ^2.0.0
@@ -53,13 +52,31 @@ dependencies:
   archive: ^4.3.0
   html: 0.15.6
   xml: ^7.0.1
-  flutter_lucide: ^1.43.0
+  flutter_lucide: 1.59.0
+  cupertino_icons: ^1.0.8
+  liquid_glass_easy:
+    path: third_party/liquid_glass_easy
   lottie: ^3.6.1
   flutter_rust_bridge: 2.13.0
   connectivity_plus: ^7.3.1
   image: ^4.12.0
   flutter_svg: ^2.3.0
+  media_kit: 1.2.6
+  media_kit_video: 2.0.1
+  # Windows 专用 libmpv；不要把 umbrella 的 media_kit_libs_video 加回来，否则
+  # Android/iOS/macOS/Linux 的播放库会一起进包（APK 多出 ~11 MB）。
+  media_kit_libs_windows_video: 1.0.11
+  file_selector: ^1.1.0
+  flutter_tts: ^4.2.5
+  webview_windows:
+    path: third_party/webview_windows
+  window_manager: ^0.5.1
+  screen_retriever: 0.2.2
+  smtc_windows: ^1.1.0
+  ffi: ^2.1.4
 dev_dependencies:
+  integration_test:
+    sdk: flutter
   flutter_test:
     sdk: flutter
 
@@ -89,21 +106,43 @@ flutter:
     - assets/config/filter.json
     - assets/config/device_pool.example.json
     - assets/filters/
-    - assets/web/
-    - assets/web/assets/
-    - assets/web/assets/css/
-    - assets/web/assets/webfonts/
-    - assets/plugins/
     - assets/images/app_logo.webp
+    - assets/images/wechat_reward.png
     - assets/images/bubble/
+    # 评论/回复正文的官方表情（`emoji_config.json` 的 53 个令牌），
+    # 图片从 `ckao/fanqie-7.0.9.32/apktool/res/drawable-xxhdpi/` 原样抽出。
+    - assets/images/emoji/
     # 短剧单列卡右侧栏/信息层的官方图标，从
     # `ckao/decompile/apktool/res/drawable*/` 原样抽出（见
     # docs/research/short-drama-decompile-comparison-20260921.md §8）。
     - assets/images/drama/
+    - assets/images/reader/
     # 「上滑查看更多视频」的官方箭头动画（`more_wonderful_series_up_arrow.json`），
     # 原样复制、仅把填充色改为白色——官方运行时用 LottieValueCallback 强制
     # `@color/al`=#ffffffff（见同文档 §19）。
     - assets/lottie/
+    # 字体许可文本随字体一起打包（两者都是 OFL 1.1）。
+    - assets/fonts/NotoSerifCJK-OFL.txt
+    - assets/fonts/RobotoMono-OFL.txt
+    - assets/licenses/wenku8/NOTICE
+    - assets/licenses/wenku8/LICENSE
+    - assets/licenses/wenku8/GPL-3.0.txt
+    - assets/licenses/wenku8/PORTING.md
+
+  # 首页档案版式用的衬线/等宽字体。CJK 衬线只取 GB2312 常用字（6763 个
+  # 汉字 + 标点，约 5.2MB）；超出范围的生僻字由 homeSerifFallback 的系统
+  # 衬线兜底。等宽字体只取拉丁与标点，中文按 mockup 的
+  # `"Roboto Mono", monospace` 同样走系统回退。
+  fonts:
+    - family: Home Serif
+      fonts:
+        - asset: assets/fonts/NotoSerifSC-Regular.otf
+        - asset: assets/fonts/NotoSerifSC-Bold.otf
+          weight: 700
+    - family: Home Mono
+      fonts:
+        - asset: assets/fonts/RobotoMono-Medium.ttf
+          weight: 500
 
   # To add assets to your application, add an assets section, like this:
   # assets:

@@ -4,6 +4,9 @@ import 'package:flutter/material.dart';
 
 import '../../services/chapter_text_formatter.dart';
 import '../../services/reader_preferences.dart';
+import '../../services/reader_dialogue.dart';
+import '../../services/ai_reading/ai_models.dart';
+import '../../services/text_replacement_engine.dart';
 import '../../services/reader_underline_store.dart';
 import 'reader_bubble.dart';
 import 'reader_illustration.dart';
@@ -113,7 +116,19 @@ class ReaderContentBlock {
 
   /// Upstream paragraph id, when the source carried one. Paragraph-comment
   /// bubbles are keyed by this, not by the block's ordinal position.
+  ///
+  /// The 听书 timeline addresses text by this id too, so listen-along
+  /// highlighting resolves through it rather than through [index].
   final int? paraIndex;
+
+  /// Inline `<blk>` boundaries of this paragraph, in reading order.
+  ///
+  /// `positionV2` from the audio timeline addresses text as
+  /// `(element index, offset inside that element)`, so turning it into a
+  /// paragraph offset needs these. Empty when the markup had no `<blk>` or the
+  /// paragraph was rewritten while parsing; callers then use the paragraph-level
+  /// offsets, which every point carries as well.
+  final List<ChapterBlkSpan> blkSpans;
 
   /// Identity of this paragraph for local features (划线, the long-press menu):
   /// [paraIndex] when the markup carried one, else an ordinal-derived id. The
@@ -151,6 +166,7 @@ class ReaderContentBlock {
     this.bubbleCount,
     this.bubbleVariant,
     this.underlined = false,
+    this.blkSpans = const [],
   });
 
   int get end => start + text.length;
@@ -194,6 +210,101 @@ class ReaderContentBlock {
   return (start: layoutStart, end: layoutEnd);
 }
 
+/// Maps a 听书 time-point range onto the layout's absolute character offsets.
+///
+/// The upstream addresses text by **paragraph id** (`<p idx="N">`, which the
+/// official client calls `IDragonParagraph.getId()`), not by display order, so
+/// the match goes through [ReaderContentBlock.paraIndex]. Display order and id
+/// order disagree whenever the markup holds marker-only or empty paragraphs —
+/// which is why counting paragraphs here lit the wrong text.
+/// Replacement maps translate the original paragraph offsets into display text.
+///
+/// Offsets are half-open here: the caller passes `endOffset + 1` because the
+/// upstream end offset is inclusive (official `toTargetTextBlock` does the same
+/// `+1`).
+///
+/// When [startElementIndex]/[startElementOffset] are supplied and the paragraph
+/// recorded its `<blk>` spans, the start is narrowed to that element:
+/// `positionV2` addresses text one level deeper than the paragraph.
+///
+/// Returns `null` when the point addresses nothing in this layout — a stale
+/// timeline, a title-only point, or a paragraph this chapter does not render.
+/// Callers treat that as "no highlight": a wrong highlight is worse than none.
+({int start, int end})? audioTimePointLayoutRange(
+  ReaderChapterLayout layout,
+  int startPara,
+  int startParaOff,
+  int endPara,
+  int endParaOff, {
+  int? startElementIndex,
+  int? startElementOffset,
+}) {
+  final from = _blockByParaId(layout, startPara);
+  final to = endPara == startPara ? from : _blockByParaId(layout, endPara);
+  if (from == null || to == null) return null;
+
+  final fromSource = layout._sourceBlocks[from.index];
+  final toSource = layout._sourceBlocks[to.index];
+  final startInPara = _paraOffset(
+    from,
+    startParaOff,
+    startElementIndex,
+    startElementOffset,
+  ).clamp(0, fromSource.text.length);
+  // A range that spans paragraphs lights from this paragraph's start offset to
+  // the last one's end offset; the single absolute span covers everything
+  // between them, which is what the reader paints.
+  final endInPara = endParaOff.clamp(0, toSource.text.length);
+
+  final start =
+      from.start +
+      (fromSource.map?.toDisplay(startInPara, bias: TextBoundaryBias.start) ??
+          startInPara);
+  final end =
+      to.start +
+      (toSource.map?.toDisplay(endInPara, bias: TextBoundaryBias.end) ??
+          endInPara);
+  if (end <= start) return null;
+  return (start: start, end: end);
+}
+
+/// The block whose upstream paragraph id is [paraId], if this layout renders it.
+ReaderContentBlock? _blockByParaId(ReaderChapterLayout layout, int paraId) {
+  for (final block in layout.blocks) {
+    if (block.isImage) continue;
+    if (block.paraIndex == paraId) return block;
+  }
+  return null;
+}
+
+/// Paragraph offset for a point, preferring the `positionV2` element when the
+/// paragraph recorded its `<blk>` boundaries.
+int _paraOffset(
+  ReaderContentBlock block,
+  int paraOffset,
+  int? elementIndex,
+  int? elementOffset,
+) {
+  final spans = block.blkSpans;
+  // element_index < 0 means the upstream sent no element coordinate, and in that
+  // case element_offset already is the paragraph offset (official `S(-1, x)`
+  // returns x unchanged).
+  if (spans.isEmpty || elementIndex == null || elementIndex < 0) {
+    return paraOffset;
+  }
+  final offset = elementOffset ?? 0;
+  for (final span in spans) {
+    if (span.elementIndex < elementIndex) continue;
+    if (span.elementIndex == elementIndex) {
+      return span.start + offset.clamp(0, span.length);
+    }
+    break;
+  }
+  // The element is not in this paragraph: trust the paragraph-level offset,
+  // which the upstream sends alongside every positionV2.
+  return paraOffset;
+}
+
 /// A slice retains its original paragraph layout, including justification.
 /// Reflowing a substring here would change line breaks and repeat indentation.
 @immutable
@@ -231,6 +342,22 @@ class ReaderTextPage {
 
 // Note: 两种阅读方式共用行测量，进度保存规范化正文的文字偏移；见
 // .agents/notes/implemented/feature/2026-09-10-reader-pagination.md
+class _SourceBlock {
+  const _SourceBlock(
+    this.start,
+    this.text,
+    this.displayStart,
+    this.displayLength,
+    this.map,
+    this.sourceIndex,
+  );
+  final int start, displayStart, displayLength;
+  final String text;
+  final int? sourceIndex;
+  final TextOffsetMap? map;
+  int get end => start + text.length;
+}
+
 class ReaderChapterLayout {
   final ReaderLayoutSpec spec;
   final List<ReaderContentBlock> blocks;
@@ -238,6 +365,12 @@ class ReaderChapterLayout {
   final int textLength;
   final double contentHeight;
   final int legacyTextLength;
+  final List<_SourceBlock> _sourceBlocks;
+  final int sourceTextLength;
+
+  /// Lazy, presentation-only ranges: toggling marks never reflows the text.
+  late final Map<int, List<(int, int)>> dialogueRangesByBlock =
+      _dialogueRangesByBlock();
 
   ReaderChapterLayout._(
     this.spec,
@@ -246,19 +379,28 @@ class ReaderChapterLayout {
     this.textLength,
     this.contentHeight,
     this.legacyTextLength,
+    this._sourceBlocks,
+    this.sourceTextLength,
   );
 
   factory ReaderChapterLayout({
     required String title,
     required ChapterContent content,
     required ReaderLayoutSpec spec,
+    TextReplacementResult? replacement,
     Map<int, int> paragraphBubbles = const {},
     Map<int, ParagraphBubbleVariant> paragraphBubbleVariants = const {},
     Set<int> underlinedParagraphs = const {},
     Widget Function(int paraIndex, int count, ParagraphBubbleVariant variant)?
     bubbleBuilder,
   }) {
-    final body = content.withoutLeadingTitle(title);
+    final source = replacement?.source ?? content;
+    final body = source.withoutLeadingTitle(title);
+    final sourceIndices = {
+      for (var i = 0; i < source.blocks.length; i++) source.blocks[i]: i,
+    };
+    final sourceBlocks = <_SourceBlock>[];
+    var sourceOffset = 0;
     final legacyText = [
       if (title.isNotEmpty) title,
       ...splitChapterParagraphs(body.legacyText),
@@ -268,15 +410,42 @@ class ReaderChapterLayout {
     var legacyCursor = 0;
     var top = 0.0;
     for (final element in [ChapterParagraph(title), ...body.blocks]) {
-      final text = element is ChapterParagraph ? element.text : '\uFFFC';
+      final sourceText = element is ChapterParagraph ? element.text : '\uFFFC';
+      final originalIndex = sourceIndices[element];
+      final transformed = originalIndex == null
+          ? element
+          : replacement?.content.blocks[originalIndex] ?? element;
+      final text = transformed is ChapterParagraph
+          ? transformed.text
+          : '\uFFFC';
+      sourceBlocks.add(
+        _SourceBlock(
+          sourceOffset,
+          sourceText,
+          offset,
+          text.length,
+          originalIndex == null
+              ? null
+              : replacement?.paragraphMaps[originalIndex],
+          originalIndex,
+        ),
+      );
+      sourceOffset +=
+          sourceText.length + (blocks.isEmpty && sourceText.isEmpty ? 0 : 1);
       var legacyStart = legacyCursor;
       if (element is ChapterParagraph) {
-        final found = legacyText.indexOf(text, legacyCursor);
+        final found = legacyText.indexOf(sourceText, legacyCursor);
         if (found >= 0) legacyStart = found;
-        legacyCursor = (legacyStart + text.length).clamp(0, legacyText.length);
+        legacyCursor = (legacyStart + sourceText.length).clamp(
+          0,
+          legacyText.length,
+        );
       }
       final paraIndex = element is ChapterParagraph ? element.paraIndex : null;
       final startMs = element is ChapterParagraph ? element.startMs : null;
+      final blkSpans = element is ChapterParagraph
+          ? element.blkSpans
+          : const <ChapterBlkSpan>[];
       final bubbleCount = paraIndex == null
           ? null
           : paragraphBubbles[paraIndex];
@@ -318,6 +487,7 @@ class ReaderChapterLayout {
               paraIndex: paraIndex,
               textId: textId,
               startMs: startMs,
+              blkSpans: blkSpans,
               bubbleCount: bubbleCount,
               bubbleVariant: bubbleVariant,
               bubble: bubble,
@@ -338,7 +508,114 @@ class ReaderChapterLayout {
       math.max(0, offset - 1),
       top,
       legacyText.length,
+      List.unmodifiable(sourceBlocks),
+      math.max(0, sourceOffset - 1),
     );
+  }
+
+  Map<int, List<(int, int)>> _dialogueRangesByBlock() {
+    if (blocks.length <= 1) return const {};
+    final body = blocks.skip(1);
+    final base = blocks[1].start;
+    final ranges = readerDialogueRanges(
+      body.map((block) => block.text).join('\n'),
+    );
+    if (ranges.isEmpty) return const {};
+    final byBlock = <int, List<(int, int)>>{};
+    var first = 0;
+    for (final block in body) {
+      if (block.isImage || block.text.isEmpty) continue;
+      while (first < ranges.length && ranges[first].$2 + base <= block.start) {
+        first++;
+      }
+      final local = <(int, int)>[];
+      for (var index = first; index < ranges.length; index++) {
+        final range = ranges[index];
+        if (range.$1 + base >= block.end) break;
+        local.add((
+          math.max(range.$1 + base, block.start) - block.start,
+          math.min(range.$2 + base, block.end) - block.start,
+        ));
+      }
+      if (local.isNotEmpty) byBlock[block.index] = List.unmodifiable(local);
+    }
+    return Map.unmodifiable(byBlock);
+  }
+
+  /// Maps a final display offset to the AI canonical paragraph/requestText
+  /// offset. The layout includes a synthetic title block and image blocks; the
+  /// AI snapshot excludes both, so using sourceOffsetForDisplay directly would
+  /// shift a selection by the title length or land on the wrong paragraph.
+  ({int paragraph, int offset})? snapshotLocationForDisplayOffset(
+    int offset,
+    AiChapterSnapshot snapshot, {
+    TextBoundaryBias bias = TextBoundaryBias.start,
+  }) {
+    final sourceOffset = sourceOffsetForDisplay(offset, bias: bias);
+    final index = _floorIndex(
+      _sourceBlocks.length,
+      (i) => _sourceBlocks[i].start <= sourceOffset,
+    );
+    final block = _sourceBlocks[index];
+    final sourceIndex = block.sourceIndex;
+    if (sourceIndex == null) return null;
+    final paragraph = snapshot.paragraphBlockIndices.indexOf(sourceIndex);
+    if (paragraph < 0) return null;
+    final local = (sourceOffset - block.start).clamp(0, block.text.length);
+    return (
+      paragraph: paragraph,
+      offset: snapshot.paragraphStarts[paragraph] + local,
+    );
+  }
+
+  int sourceOffsetForDisplay(
+    int offset, {
+    TextBoundaryBias bias = TextBoundaryBias.start,
+  }) {
+    final block =
+        _sourceBlocks[_floorIndex(
+          _sourceBlocks.length,
+          (i) => _sourceBlocks[i].displayStart <= offset,
+        )];
+    final local = (offset - block.displayStart).clamp(0, block.displayLength);
+    return (block.start + (block.map?.toSource(local, bias: bias) ?? local))
+        .clamp(0, sourceTextLength);
+  }
+
+  int displayOffsetForSource(
+    int offset, {
+    TextBoundaryBias bias = TextBoundaryBias.start,
+  }) {
+    var index = _floorIndex(
+      _sourceBlocks.length,
+      (i) => _sourceBlocks[i].start <= offset,
+    );
+    final block = _sourceBlocks[index];
+    if (block.displayLength == 0) {
+      while (++index < blocks.length) {
+        if (blocks[index].text.isNotEmpty) return blocks[index].start;
+      }
+      for (final previous in blocks.reversed) {
+        if (previous.text.isNotEmpty) return previous.end;
+      }
+      return 0;
+    }
+    final local = (offset - block.start).clamp(0, block.text.length);
+    return (block.displayStart +
+            (block.map?.toDisplay(local, bias: bias) ?? local))
+        .clamp(0, textLength);
+  }
+
+  String sourceTextInRange(int start, int end) {
+    final out = StringBuffer();
+    for (final block in _sourceBlocks) {
+      final from = math.max(start, block.start) - block.start;
+      final to = math.min(end, block.end) - block.start;
+      if (to > from) {
+        out.write(block.text.substring(from, to).replaceAll('\uFFFC', ''));
+      }
+    }
+    return out.toString();
   }
 
   double get maxScroll => math.max(
@@ -362,8 +639,10 @@ class ReaderChapterLayout {
       if (candidate.legacyStart > target) break;
       block = candidate;
     }
-    return block.start +
-        (target - block.legacyStart).clamp(0, block.text.length);
+    final raw = _sourceBlocks[block.index];
+    return displayOffsetForSource(
+      raw.start + (target - block.legacyStart).clamp(0, raw.text.length),
+    );
   }
 
   int legacyOffsetForText(int offset) {
@@ -373,7 +652,9 @@ class ReaderChapterLayout {
     return (block.legacyStart +
             (block.isImage
                 ? 0
-                : (offset - block.start).clamp(0, block.text.length)))
+                : (sourceOffsetForDisplay(offset) -
+                          _sourceBlocks[block.index].start)
+                      .clamp(0, _sourceBlocks[block.index].text.length)))
         .clamp(0, legacyTextLength);
   }
 
@@ -403,6 +684,14 @@ class ReaderChapterLayout {
           blocks.length,
           (index) => blocks[index].start <= offset,
         )];
+    if (block.lines.isEmpty) {
+      final visible = blocks.where(
+        (b) => b.lines.isNotEmpty && b.start >= offset,
+      );
+      return visible.isEmpty
+          ? maxScroll
+          : (spec.verticalPadding + visible.first.top).clamp(0, maxScroll);
+    }
     final line =
         block.lines[_floorIndex(
           block.lines.length,
@@ -437,7 +726,9 @@ class ReaderChapterLayout {
         rawOffset == rawOffset.truncateToDouble()) {
       final offset = saved?['positionVersion'] == 1
           ? offsetFromLegacyText(rawOffset.clamp(0, legacyTextLength).toInt())
-          : rawOffset.clamp(0, textLength).toInt();
+          : displayOffsetForSource(
+              rawOffset.clamp(0, sourceTextLength).toInt(),
+            );
       return (textOffset: offset, scroll: scrollForTextOffset(offset));
     }
     final rawPosition = saved?['position'];
@@ -610,6 +901,7 @@ class ReaderChapterLayout {
     int? paraIndex,
     int? textId,
     int? startMs,
+    List<ChapterBlkSpan> blkSpans = const [],
     int? bubbleCount,
     ParagraphBubbleVariant? bubbleVariant,
     Widget? bubble,
@@ -647,7 +939,7 @@ class ReaderChapterLayout {
         ?bubbleSpan,
       ],
     );
-    if (title && text.isEmpty) {
+    if (text.isEmpty) {
       return ReaderContentBlock(
         index: index,
         text: text,
@@ -661,6 +953,7 @@ class ReaderChapterLayout {
         paraIndex: paraIndex,
         textId: textId,
         startMs: startMs,
+        blkSpans: blkSpans,
         bubbleCount: bubbleCount,
         bubbleVariant: bubbleVariant,
         underlined: underlined,
@@ -751,6 +1044,7 @@ class ReaderChapterLayout {
         paraIndex: paraIndex,
         textId: textId,
         startMs: startMs,
+        blkSpans: blkSpans,
         bubbleCount: bubbleCount,
         bubbleVariant: bubbleVariant,
       );
@@ -926,7 +1220,8 @@ class ReaderBlockContent extends StatelessWidget {
           onParagraphLongPress!(block, details.globalPosition),
       onLongPressMoveUpdate: onParagraphLongPressMoveUpdate == null
           ? null
-          : (details) => onParagraphLongPressMoveUpdate!(details.globalPosition),
+          : (details) =>
+                onParagraphLongPressMoveUpdate!(details.globalPosition),
       onLongPressEnd: onParagraphLongPressEnd == null
           ? null
           : (details) => onParagraphLongPressEnd!(details.globalPosition),

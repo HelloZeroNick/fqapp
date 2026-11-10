@@ -72,27 +72,50 @@ class SearchSuggestion {
   }
 }
 
+/// One row of the 热搜榜.
+class HotSearchEntry {
+  const HotSearchEntry({
+    required this.title,
+    this.hotValue = '',
+    this.badge = '',
+  });
+
+  /// The word to search for (`tag_title`).
+  final String title;
+
+  /// 热搜值 without the trailing 「热搜值」, e.g. `183.8万`. Empty when the
+  /// upstream put something else in `tag_attached` (an editorial line).
+  final String hotValue;
+
+  /// 榜单角标: 巅峰榜 / 热聊 / 霸榜 / 新 / 神作 … (`display_tag[0].text`).
+  final String badge;
+}
+
 /// The hot search board.
 ///
-/// The payload nests the words two levels deep
-/// (`data[].search_tag_data[].tag_title`) and includes cells without words, so
-/// empty entries are skipped rather than surfaced.
+/// Upstream is the 热搜榜 rank list (`search/rank_list/v`, `show_type=472`):
+/// one cell with up to 50 tags, each carrying `tag_title`, `tag_attached` and
+/// `display_tag`. The payload nests them two levels deep
+/// (`data[].search_tag_data[]`) and can include cells without tags, so empty
+/// entries are skipped rather than surfaced.
 class HotSearch {
-  const HotSearch({this.words = const []});
+  const HotSearch({this.entries = const []});
 
   static const empty = HotSearch();
 
-  final List<String> words;
+  final List<HotSearchEntry> entries;
 
-  bool get isEmpty => words.isEmpty;
-  bool get isNotEmpty => words.isNotEmpty;
+  List<String> get words => [for (final entry in entries) entry.title];
+
+  bool get isEmpty => entries.isEmpty;
+  bool get isNotEmpty => entries.isNotEmpty;
 
   static HotSearch fromPayload(Map<String, dynamic> payload) {
     final code = payload['code'];
     if (code != null && code != 0 && code != 200) return empty;
     final data = payload['data'];
     if (data is! List) return empty;
-    final words = <String>[];
+    final entries = <HotSearchEntry>[];
     final seen = <String>{};
     for (final cell in data) {
       if (cell is! Map) continue;
@@ -102,10 +125,34 @@ class HotSearch {
         if (tag is! Map) continue;
         final title = _string(tag['tag_title']);
         if (title.isEmpty || !seen.add(title)) continue;
-        words.add(title);
+        entries.add(
+          HotSearchEntry(
+            title: title,
+            hotValue: _hotValue(_string(tag['tag_attached'])),
+            badge: _badge(tag['display_tag']),
+          ),
+        );
       }
     }
-    return HotSearch(words: List.unmodifiable(words));
+    return HotSearch(entries: List.unmodifiable(entries));
+  }
+
+  /// `183.8万热搜值` -> `183.8万`; anything else stays empty rather than
+  /// leaking an editorial sentence into the number column.
+  static String _hotValue(String attached) {
+    const suffix = '热搜值';
+    if (!attached.endsWith(suffix)) return '';
+    return attached.substring(0, attached.length - suffix.length).trim();
+  }
+
+  static String _badge(dynamic displayTag) {
+    if (displayTag is! List) return '';
+    for (final entry in displayTag) {
+      if (entry is! Map) continue;
+      final text = _string(entry['text']);
+      if (text.isNotEmpty) return text;
+    }
+    return '';
   }
 }
 
@@ -123,4 +170,55 @@ String _string(dynamic value) {
 
 extension _IfEmpty on String {
   String ifEmpty(String fallback) => isEmpty ? fallback : this;
+}
+
+/// The bookstore search-bar cue words (`/reading/bookapi/search/cue/v`).
+///
+/// The official bar rotates `data_v1[]` on a `VerticalFlipper` with the
+/// response's `rotate_interval_ms` (`SearchWordDisplayView.m`); the display
+/// text of one word is `display_text`/`display_text_v2`, falling back to
+/// `text` (`SearchCueWord.java`).
+class SearchCue {
+  const SearchCue({
+    this.words = const [],
+    this.rotateIntervalMs = defaultIntervalMs,
+  });
+
+  /// Milliseconds one word stays on screen before the next flip.
+  static const defaultIntervalMs = 5000;
+
+  static const empty = SearchCue();
+
+  final List<String> words;
+
+  /// `rotate_interval_ms`; [defaultIntervalMs] when the payload carries none.
+  final int rotateIntervalMs;
+
+  bool get isEmpty => words.isEmpty;
+
+  static SearchCue fromPayload(Map<String, dynamic> payload) {
+    final code = payload['code'];
+    if (code != null && code != 0 && code != 200) return empty;
+    final dataV1 = payload['data_v1'];
+    if (dataV1 is! List) return empty;
+    final words = <String>[];
+    final seen = <String>{};
+    for (final entry in dataV1) {
+      if (entry is! Map) continue;
+      final text = _string(
+        entry['display_text_v2'],
+      ).ifEmpty(_string(entry['display_text'])).ifEmpty(_string(entry['text']));
+      if (text.isEmpty || !seen.add(text)) continue;
+      words.add(text);
+    }
+    if (words.isEmpty) return empty;
+    final rawInterval = payload['rotate_interval_ms'];
+    final interval = rawInterval is num
+        ? rawInterval.toInt()
+        : int.tryParse('$rawInterval') ?? 0;
+    return SearchCue(
+      words: List.unmodifiable(words),
+      rotateIntervalMs: interval > 0 ? interval : defaultIntervalMs,
+    );
+  }
 }

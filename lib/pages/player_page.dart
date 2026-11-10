@@ -1,3 +1,6 @@
+import '../services/desktop_platform.dart';
+import '../services/audio_floating_routes.dart';
+import '../services/app_log.dart';
 import 'dart:async';
 import 'dart:io';
 
@@ -17,24 +20,35 @@ import '../services/player_panel_preferences.dart';
 import '../services/watched_episodes.dart';
 import 'listen_mode_page.dart';
 import '../services/episode_source_cache.dart';
+import '../services/fair_memory.dart';
+import '../services/drama_cache_preferences.dart';
 import '../services/drama_download_store.dart';
+import '../services/drama_downloader.dart';
+import '../services/connectivity_status.dart';
 import 'drama_download_sheet.dart';
 import '../services/library_store.dart';
 import '../services/native_player.dart';
 import '../services/playback_issue.dart';
 import '../services/player_history.dart';
+import '../services/video_catalogue.dart';
+import '../services/player_layout_preferences.dart';
 import '../services/player_load_diagnostics.dart';
 import '../services/player_preferences.dart';
 import '../services/player_style_config.dart';
+import '../services/quality_memory.dart';
 import '../services/swipe_guide_store.dart';
 import '../widgets/player/playlet_comment_panel.dart';
 import '../widgets/player/playlet_danmaku_layer.dart';
 import '../widgets/player/playlet_danmaku_loader.dart';
 import '../widgets/player/playlet_danmaku_settings.dart';
 import '../widgets/player/story_player_panel.dart';
-import '../widgets/player/player_cover.dart';
 import '../widgets/player/player_feedback.dart';
+import '../widgets/player/player_split_panel.dart';
+import '../widgets/player/player_toast.dart';
 import '../widgets/video_player_chrome.dart';
+
+part 'player_page_preload.dart';
+part 'player_page_progress.dart';
 
 class PlayerPage extends StatefulWidget {
   final String bookId;
@@ -43,6 +57,9 @@ class PlayerPage extends StatefulWidget {
   final String cover;
   final List<Chapter> eps;
   final int startIndex;
+
+  /// Explicit entry position; null preserves the episode's saved progress.
+  final Duration? startPosition;
   final Future<Map<String, dynamic>> Function(Chapter)? contentLoader;
   final NativePlayer Function()? playerFactory;
   final ReaderStore? historyStore;
@@ -58,12 +75,29 @@ class PlayerPage extends StatefulWidget {
   final Future<PlayletCommentPage> Function(DanmakuFetchRequest request)?
   danmakuFetcher;
 
+  /// 热评取数的可注入实现（默认走 ApiClient.playletHotComments），参数是
+  /// 剧集 id 与当前集 vid。测试注入用，与 [danmakuFetcher] 同一套缝。
+  final Future<PlayletCommentPage> Function(String seriesId, String vid)?
+  hotCommentsLoader;
+
   /// 官方短剧播放页形态（`apf.xml`）：竖屏无运输条、单击=播放/暂停。
   /// 详情页的电影/电视剧走通用形态（默认 false）。
   final bool shortSeries;
 
   /// 播放页信息层的 AI 声明行。
   final bool aiGenerated;
+
+  /// 进页即全屏（并请求横屏）。官方 feed 卡片右侧的横屏钮不是「观看全集」
+  /// 的同一条路：它 `transformToLandActivity` → 起独立
+  /// `ShortSeriesLandActivity`（`jq3/x.java:4499-4538`，manifest 锁
+  /// `userLandscape`），页面一起来就是横屏全屏。本地用同一个播放页承载，
+  /// 靠这个参数在进页时置全屏态。
+  final bool openFullScreen;
+
+  /// 离线下载引擎与缓存的注入缝（测试用）。缺省用全局单例 —— 生产环境
+  /// 下载队列就是进程级的一个，测试里换成假实现才不碰 Hive 与真网。
+  final DramaDownloader? downloader;
+  final DramaDownloadStore? store;
 
   const PlayerPage({
     super.key,
@@ -73,6 +107,7 @@ class PlayerPage extends StatefulWidget {
     this.cover = '',
     required this.eps,
     required this.startIndex,
+    this.startPosition,
     this.contentLoader,
     this.playerFactory,
     this.historyStore,
@@ -80,8 +115,12 @@ class PlayerPage extends StatefulWidget {
     this.seriesLoader,
     this.initialSeriesDetail,
     this.danmakuFetcher,
+    this.hotCommentsLoader,
     this.shortSeries = false,
     this.aiGenerated = false,
+    this.openFullScreen = false,
+    this.downloader,
+    this.store,
   });
 
   @override
@@ -95,8 +134,21 @@ class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
   bool _hasDisplayed = false;
   NativePlayer? _player;
   Timer? _progressTimer;
+  // 小米公平运行内存 KILL 广播的刷盘注销函数，见 reader_page.dart。
+  VoidCallback? _unregisterFairMemoryFlush;
   bool _initVideo = false;
   bool _paging = false;
+
+  /// 悬浮窗播放中（#24）：应用切后台后画面搬进系统悬浮窗继续播。
+  /// 服务在 inactive（仍属前台过渡态）时启动，hidden 确认切后台后显示；
+  /// 回前台 / 页面销毁 / 打开听视频时停掉并恢复 Flutter 纹理。
+  int? _floatingOwner;
+  _FloatingAttempt? _pendingFloating;
+  bool get _floating => _floatingOwner != null;
+
+  /// 最近一次生命周期状态：悬浮窗启动是异步的，启动完成时要按当前
+  /// 状态收尾（已回前台就立刻停，已切后台就立即显示）。
+  AppLifecycleState _lastLifecycleState = AppLifecycleState.resumed;
   Completer<void>? _pagingSettled;
   int? _pendingCompletion;
   NativePlayer? _pendingAutoplay;
@@ -106,11 +158,42 @@ class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
   final List<StreamSubscription<dynamic>> _subs = [];
   Future<void> _releases = Future<void>.value();
   late final EpisodeSourceCache _sources;
+
+  DramaDownloadStore get _downloadStore =>
+      widget.store ?? HiveDramaDownloadStore.instance;
+
+  DramaDownloader get _downloader =>
+      widget.downloader ?? DramaDownloader.instance;
   late final PlayerLoadDiagnostics _diagnostics;
   PlayerLoadTrace? _loadTrace;
   Timer? _prefetchTimer;
   int? _prefetchQueuedGeneration;
+
+  /// 边看边往后缓存（见 [_scheduleAutoCache]）。
+  Timer? _autoCacheTimer;
+
+  /// 已经为哪一集排过自动缓存，避免同一集反复入队。
+  int? _autoCacheFor;
+
+  /// 待触发的调度是为哪一集排的（同一集反复出首帧不推迟截止时间）。
+  int? _autoCacheTimerIndex;
+
+  /// 播放器最近一次**实际选中**的档位高度（按 [QualityMemory] 的名字套用，
+  /// 或用户在画质菜单里换档）。null = 没选过档，播的是上游默认流。
+  int? _renditionHeight;
   int? _prefetchAttemptedGeneration;
+
+  /// 还没出画面的这一集失败后，还能静默重来几次（见 [_retrySilently]）。
+  int _silentRetriesLeft = 0;
+
+  /// 静默重试只在这之前发起：网络整个卡死时，加载封面不能一直挂着，
+  /// 到点就把错误和「重试」交给用户。
+  DateTime _silentRetryUntil = DateTime.now();
+  static const _silentRetryWindow = Duration(seconds: 20);
+  bool _lastAutoplay = true;
+
+  /// 当前集快播完时在后台建好的下一集播放器（见 [_updateWarmNext]）。
+  _WarmEpisode? _warm;
 
   /// 「左右滑动可调整进度」首次引导（每台设备一次，`of3/a`）。
   bool _seekHintVisible = false;
@@ -163,7 +246,11 @@ class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
+    // 小米公平运行内存：KILL 广播到达时刷一次播放进度，避免被杀丢进度。
+    _unregisterFairMemoryFlush = FairMemoryService.instance
+        .registerFlushHandler(_persistProgress);
     unawaited(NativePlayer.setKeepScreenOn(true).catchError((Object _) {}));
+    unawaited(PlayerPreferences.loadFloatingWindow());
     _index = widget.eps.isEmpty
         ? 0
         : widget.startIndex.clamp(0, widget.eps.length - 1);
@@ -286,11 +373,13 @@ class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
       _seriesStatus = status;
       _seriesTitle = series.title;
       _seriesCover = series.cover;
-      _episodeLabel = seriesEpisodeLabel(
-        status: series.status,
-        count: episodes,
-        currentIndex: _index,
-      );
+      _episodeLabel = !hasCompleteEpisodeCatalogue(widget.eps)
+          ? '完整目录暂不可用'
+          : seriesEpisodeLabel(
+              status: series.status,
+              count: episodes,
+              currentIndex: _index,
+            );
       _commentCount = series.commentCount;
       _originalBook = book == null
           ? null
@@ -371,7 +460,8 @@ class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
                 watchedIds: _watchedIds,
                 initialDetail: _seriesDetail,
                 historyStore: widget.historyStore,
-                hasPlaybackProgress: (_player?.position.inMilliseconds ?? 0) > 0,
+                hasPlaybackProgress:
+                    (_player?.position.inMilliseconds ?? 0) > 0,
                 seriesLoader: widget.seriesLoader,
                 onOpenRelatedSeries: (entry) {
                   Navigator.of(context).pop();
@@ -391,7 +481,13 @@ class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
   }
 
   Future<void> _openRelatedSeries() => _withPlayerOverlay(() async {
-    final entry = await RelatedSeriesSheet.show(context, widget.bookId);
+    // 横屏与选集抽屉/视频设置同一形态：右侧面板（宽屏上的底部弹层会被拉
+    // 成一条通栏）。竖屏仍是官方底部 sheet。
+    final size = MediaQuery.sizeOf(context);
+    final landscape = size.width > size.height;
+    final entry = landscape
+        ? await RelatedSeriesSheet.showSidePanel(context, widget.bookId)
+        : await RelatedSeriesSheet.show(context, widget.bookId);
     if (entry != null && mounted) await _switchRelatedSeries(entry);
   });
 
@@ -411,6 +507,7 @@ class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
     _pendingAutoplay = null;
     _prefetchTimer?.cancel();
     _progressTimer?.cancel();
+    _dropWarm();
     _watchTime.stop();
     _loadTrace?.finish('relatedSeries');
     try {
@@ -455,14 +552,22 @@ class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
   /// 热评数据：官方与评论计数同源（`comment/list` 的
   /// `comment_source=4/count=20` 那次请求，`a13/w.java:563-599`），
   /// 本地筛出 `dataType in {4,9}` 的条目。best-effort：失败就不显示胶囊。
+  ///
+  /// 请求按**当前集**的 vid 取（官方 `groupID = jVar.y()` 是单集 vid），
+  /// 切集重拉；晚到的旧集响应按 vid 丢弃。
   Future<void> _loadHotComments() async {
     if (!widget.shortSeries || widget.bookId.isEmpty) return;
+    final vid = widget.eps.isEmpty ? '' : widget.eps[_index].itemId;
     try {
-      final page = await ApiClient.instance.playletHotComments(
-        widget.bookId,
-        vid: widget.eps.isEmpty ? '' : widget.eps.first.itemId,
-      );
-      if (!mounted) return;
+      final loader = widget.hotCommentsLoader;
+      final page = loader != null
+          ? await loader(widget.bookId, vid)
+          : await ApiClient.instance.playletHotComments(
+              widget.bookId,
+              vid: vid,
+            );
+      final current = widget.eps.isEmpty ? '' : widget.eps[_index].itemId;
+      if (!mounted || current != vid) return;
       setState(() {
         if (page.totalCount > 0) _commentCount = page.totalCount;
         _hotComments = page.hotComments;
@@ -495,6 +600,7 @@ class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
   @override
   void didChangeDependencies() {
     super.didChangeDependencies();
+    AudioFloatingRouteScope.configure(context, hidden: true);
     // 画面撑满的缺省值取决于竖/横屏（`FillScreenDataManager.a()` 的
     // `e.q()` 分支），因此要等 MediaQuery 可用之后才能读。
     unawaited(_loadPanelPreferences());
@@ -523,7 +629,7 @@ class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
   }
 
   /// 标记一集已看（按剧集 id）。同一集只写一次存储：进度保存点里
-  /// 含 2 秒定时器，不去重会反复落盘。
+  /// 含 5 秒定时器，不去重会反复落盘。
   Future<void> _markWatched(int index) async {
     if (!widget.shortSeries ||
         widget.bookId.isEmpty ||
@@ -657,10 +763,9 @@ class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
     if (enabled) _loadDanmaku();
     await DanmakuPreference.save(enabled);
     if (!mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Text(enabled ? danmakuEnabledToast : danmakuDisabledToast),
-      ),
+    PlayerToast.show(
+      context,
+      enabled ? danmakuEnabledToast : danmakuDisabledToast,
     );
   }
 
@@ -671,6 +776,10 @@ class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
   /// 的回滚实验里。本地只有前两条可判，第三条的开关未接入。
   EpisodeRelateBook? get _episodeRelateBook {
     if (!PlayerStyleConfig.instance.relateBookInEpisodesDialog) return null;
+    return _relateBook;
+  }
+
+  EpisodeRelateBook? get _relateBook {
     final book = _originalBook;
     if (book == null) return null;
     return EpisodeRelateBook(id: book.id, title: book.title, cover: book.cover);
@@ -704,9 +813,14 @@ class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
+    _unregisterFairMemoryFlush?.call();
+    _unregisterFairMemoryFlush = null;
     unawaited(NativePlayer.setKeepScreenOn(false).catchError((Object _) {}));
+    unawaited(_stopFloating());
     _progressTimer?.cancel();
     _prefetchTimer?.cancel();
+    _autoCacheTimer?.cancel();
+    _dropWarm();
     _danmakuProgressTimer?.cancel();
     _danmakuFlight?.cancel();
     _danmakuLoader.dispose();
@@ -719,19 +833,216 @@ class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
     _watchTime.stop();
     unawaited(_persistProgress());
     unawaited(_teardownPlayer());
+    // 提示挂在根 Overlay 上，页面退出必须摘掉，否则会飘到下一页上。
+    PlayerToast.hide();
     super.dispose();
   }
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    _loadTrace?.setAppActive(state == AppLifecycleState.resumed);
+    _lastLifecycleState = state;
+    _loadTrace?.setAppActive(playbackAppIsActive(state));
     _syncWatchClock();
-    if (state == AppLifecycleState.resumed) {
+    if (playbackAppIsActive(state)) {
+      unawaited(_stopFloating());
       _resumePendingAutoplay();
     } else {
       unawaited(_persistProgress());
+      // 真正退到后台（不是悬浮窗）就不再占着第二个解码器。
+      if (!_floating) _dropWarm();
+      if (state == AppLifecycleState.inactive) {
+        // 悬浮窗在仍属前台的过渡态启动服务（后台启动前台服务会被系统拒绝），
+        // 等 hidden 确认切后台后再显示悬浮窗；只是下拉通知栏时 resumed 会
+        // 跟着来，服务随即停掉，悬浮窗全程不出现。
+        if (_canFloat()) unawaited(_startFloating());
+      } else if (state == AppLifecycleState.hidden ||
+          state == AppLifecycleState.paused) {
+        if (_floatingOwner case final int owner) {
+          unawaited(NativePlayer.showFloating(owner));
+        }
+      }
     }
+    if (state == AppLifecycleState.detached) unawaited(_stopFloating());
     _updatePrefetch();
+  }
+
+  /// 是否满足进悬浮窗的条件：开关开 + 正在播 + 播放器就绪。
+  bool _canFloat() =>
+      !isWindowsDesktop &&
+      !_floating &&
+      !_externalPanelOpen &&
+      !_switchingSeries &&
+      PlayerPreferences.floatingWindow.value &&
+      _player != null &&
+      _playing &&
+      _error == null;
+
+  String _episodeTitle() => widget.eps.isEmpty ? '' : widget.eps[_index].title;
+
+  // Install attempt identity synchronously, before allocation or permissions.
+  Future<void> _startFloating() {
+    final pending = _pendingFloating;
+    if (pending != null) return pending.settled.future;
+    final player = _player;
+    final playerId = player?.playerId;
+    if (!_canFloat() ||
+        _lastLifecycleState != AppLifecycleState.inactive ||
+        player == null ||
+        playerId == null) {
+      return Future<void>.value();
+    }
+    final attempt = _FloatingAttempt(player, playerId);
+    _pendingFloating = attempt;
+    unawaited(_runFloatingStart(attempt));
+    return attempt.settled.future;
+  }
+
+  bool _currentFloatingStart(_FloatingAttempt attempt) =>
+      mounted &&
+      identical(_pendingFloating, attempt) &&
+      !attempt.retired &&
+      identical(_player, attempt.player) &&
+      attempt.player.playerId == attempt.playerId &&
+      _canFloat() &&
+      _lastLifecycleState != AppLifecycleState.resumed &&
+      _lastLifecycleState != AppLifecycleState.detached;
+
+  Future<void> _runFloatingStart(_FloatingAttempt attempt) async {
+    var accepted = false;
+    try {
+      final owner = await NativePlayer.allocateFloatingOwner();
+      attempt.owner = owner;
+      if (!_currentFloatingStart(attempt)) return;
+      final allowed = await NativePlayer.canDrawOverlays();
+      // A permission result is not authority to start an FGS from hidden/paused.
+      if (!allowed ||
+          !_currentFloatingStart(attempt) ||
+          _lastLifecycleState != AppLifecycleState.inactive) {
+        return;
+      }
+      await NativePlayer.startFloating(
+        owner: owner,
+        playerId: attempt.playerId,
+        title: _seriesTitle.isNotEmpty ? _seriesTitle : widget.title,
+        episode: _episodeTitle(),
+        playing: _playing,
+        hasPrev: _index > 0,
+        hasNext: _index + 1 < widget.eps.length,
+        positionMs: attempt.player.position.inMilliseconds,
+        durationMs: attempt.player.duration.inMilliseconds,
+        videoWidth: attempt.player.videoWidth,
+        videoHeight: attempt.player.videoHeight,
+      );
+      if (!_currentFloatingStart(attempt)) return;
+      _floatingOwner = owner;
+      _pendingFloating = null;
+      accepted = true;
+      NativePlayer.setFloatingCommandHandler(
+        owner: owner,
+        onAction: (action) => _handleFloatingRemoteAction(owner, action),
+      );
+      if (_lastLifecycleState == AppLifecycleState.hidden ||
+          _lastLifecycleState == AppLifecycleState.paused) {
+        await NativePlayer.showFloating(owner);
+        if (!mounted ||
+            _floatingOwner != owner ||
+            _lastLifecycleState == AppLifecycleState.resumed ||
+            _lastLifecycleState == AppLifecycleState.detached) {
+          NativePlayer.clearFloatingCommandHandler(owner);
+          await NativePlayer.stopFloating(owner);
+        }
+      }
+    } catch (_) {
+      // Unsuccessful/late starts compensate their own allocation in finally.
+    } finally {
+      final pauseOnFailure =
+          !accepted &&
+          _currentFloatingStart(attempt) &&
+          (_lastLifecycleState == AppLifecycleState.hidden ||
+              _lastLifecycleState == AppLifecycleState.paused);
+      if (pauseOnFailure) {
+        try {
+          await attempt.player.pause();
+        } catch (_) {}
+      }
+      if (identical(_pendingFloating, attempt)) _pendingFloating = null;
+      if (attempt.owner case final int owner when !accepted) {
+        await NativePlayer.stopFloating(owner);
+      }
+      attempt.settled.complete();
+    }
+  }
+
+  Future<void> _retirePendingFloating() {
+    final attempt = _pendingFloating;
+    _pendingFloating = null;
+    if (attempt == null) return Future<void>.value();
+    attempt.retired = true;
+    final owner = attempt.owner;
+    return owner == null
+        ? Future<void>.value()
+        : NativePlayer.stopFloating(owner);
+  }
+
+  Future<void> _stopFloating() {
+    final pending = _retirePendingFloating();
+    final owner = _floatingOwner;
+    _floatingOwner = null;
+    if (owner != null) NativePlayer.clearFloatingCommandHandler(owner);
+    return Future.wait<void>([
+      pending,
+      if (owner != null) NativePlayer.stopFloating(owner),
+    ]).then<void>((_) {});
+  }
+
+  // Established episode swaps retain the same service/focus owner.
+  Future<void> _swapFloatingPlayer(NativePlayer player) async {
+    final owner = _floatingOwner;
+    final playerId = player.playerId;
+    if (owner == null || playerId == null) return;
+    try {
+      await NativePlayer.swapFloatingPlayer(owner: owner, playerId: playerId);
+    } catch (_) {
+      if (_floatingOwner == owner) await _stopFloating();
+      return;
+    }
+    if (!mounted || _floatingOwner != owner || !identical(_player, player)) {
+      return;
+    }
+    await NativePlayer.updateFloating(
+      owner: owner,
+      episode: _episodeTitle(),
+      playing: _playing,
+      hasPrev: _index > 0,
+      hasNext: _index + 1 < widget.eps.length,
+      positionMs: player.position.inMilliseconds,
+      durationMs: player.duration.inMilliseconds,
+    );
+  }
+
+  void _handleFloatingRemoteAction(int owner, String action) {
+    if (!mounted || _floatingOwner != owner) return;
+    final player = _player;
+    switch (action) {
+      case 'playPause':
+        if (player == null) return;
+        if (_playing) {
+          unawaited(player.pause());
+        } else {
+          unawaited(player.play());
+        }
+      case 'prev':
+        if (_index > 0) unawaited(_selectEpisode(_index - 1));
+      case 'next':
+        if (_index + 1 < widget.eps.length) {
+          unawaited(_selectEpisode(_index + 1));
+        }
+      case 'stop':
+        if (player != null) unawaited(player.pause());
+        unawaited(_stopFloating());
+      case 'fullscreen':
+        unawaited(_stopFloating());
+    }
   }
 
   void _onPagingChanged(bool paging) {
@@ -776,7 +1087,7 @@ class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
 
   bool get _appActive {
     final state = WidgetsBinding.instance.lifecycleState;
-    return state == null || state == AppLifecycleState.resumed;
+    return playbackAppIsActive(state);
   }
 
   void _resumePendingAutoplay() {
@@ -790,16 +1101,22 @@ class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
 
   Future<void> _tryAutoplay(int generation) async {
     final player = _pendingAutoplay;
+    if (isWindowsDesktop && player != null) {
+      AppLog.d(
+        'desktop-autoplay',
+        'active=$_appActive lifecycle=${WidgetsBinding.instance.lifecycleState} paging=$_paging current=${_current(generation, player)}',
+      );
+    }
     if (player == null ||
         !_current(generation, player) ||
-        !_appActive ||
+        (!_appActive && !_floating) ||
         _paging) {
       return;
     }
     _pendingAutoplay = null;
     _loadTrace?.playRequested();
     await player.play();
-    if (_current(generation, player) && !_appActive) {
+    if (_current(generation, player) && !_appActive && !_floating) {
       // The lifecycle can change while the platform acknowledges play.
       _pendingAutoplay = player;
       await player.pause();
@@ -877,9 +1194,16 @@ class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
       }
     }
     _updatePrefetch();
+    _updateWarmNext();
+    _scheduleAutoCache(player);
   }
 
   Future<void> _teardownPlayer() {
+    unawaited(_retirePendingFloating());
+    // 这一集的调度还没到点就作废：换集/换流后的 2 秒不该再去排它。
+    _autoCacheTimer?.cancel();
+    _autoCacheTimer = null;
+    _autoCacheTimerIndex = null;
     final old = _player;
     _player = null;
     _activeIndex = null;
@@ -909,16 +1233,30 @@ class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
     return _releases;
   }
 
-  Future<void> _loadVideo({bool refresh = false, bool autoplay = true}) async {
+  /// [silent] 是 [_retrySilently] 发起的重试：不重置重试次数，
+  /// [avoidVariant] 是刚失败的那一档清晰度。
+  Future<void> _loadVideo({
+    bool refresh = false,
+    bool autoplay = true,
+    bool silent = false,
+    String? avoidVariant,
+  }) async {
     if (!mounted || _switchingSeries || widget.eps.isEmpty) return;
     _loadTrace?.finish('superseded');
     final generation = ++_loadGeneration;
     final index = _index;
     final episode = widget.eps[index];
+    if (!silent) {
+      _silentRetriesLeft = 2;
+      _silentRetryUntil = DateTime.now().add(_silentRetryWindow);
+    }
+    _lastAutoplay = autoplay;
     final trace = _loadTrace = _diagnostics.begin(
       attempt: generation,
       episode: index + 1,
-      trigger: refresh
+      trigger: silent
+          ? 'autoRetry'
+          : refresh
           ? 'retry'
           : generation == 1
           ? 'initial'
@@ -935,6 +1273,9 @@ class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
     _watchTime.stop();
     unawaited(_persistProgress());
     final release = _teardownPlayer();
+    // 重试一律重新取流：预热的播放器可能就是用旧地址建的。
+    final warm = refresh ? null : _takeWarm(episode.itemId);
+    if (refresh) _dropWarm();
     _watchTime.reset();
     setState(() {
       _initVideo = true;
@@ -944,25 +1285,45 @@ class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
     });
 
     NativePlayer? candidate;
+    NativePlayer? adopted;
     try {
-      // 离线优先（官方 isOfflineVideo 语义）：已缓存的集直接读本地加密
-      // 文件，不请求取流接口；文件被用户清掉时静默回退在线链路。
-      final offline = await _offlineSource(episode);
-      final EpisodeSource source;
-      if (offline != null) {
-        trace.source = 'offline';
-        source = offline;
-      } else {
-        final request = _sources.request(episode, refresh: refresh);
-        trace.source = request.origin.name;
-        var online = await request.future;
-        // 会话内记住的画质选择（官方=引擎当前档）：同一集重新加载时沿用。
-        final chosen = _chosen[episode.itemId];
-        if (chosen != null) online = online.withVariant(chosen);
-        source = online;
+      EpisodeSource? warmSource;
+      if (warm != null) {
+        trace.source = 'warm';
+        // 通常早已就绪；还在建的话，等它比从头再建一遍快。
+        final ok = await warm.ready;
+        if (ok && warm.player.lastError == null && _current(generation)) {
+          adopted = warm.player;
+          warmSource = warm.source;
+        } else {
+          unawaited(warm.player.dispose());
+          if (!_current(generation)) return;
+        }
       }
-      if (!_current(generation)) return;
+      final EpisodeSource source;
+      int? renditionHeight;
+      if (warmSource != null) {
+        source = warmSource;
+        renditionHeight = warm!.renditionHeight;
+      } else {
+        (source, renditionHeight) = await _episodeSource(
+          episode,
+          refresh: refresh,
+          avoidVariant: avoidVariant,
+          trace: trace,
+        );
+      }
+      if (!_current(generation)) {
+        await adopted?.dispose();
+        return;
+      }
       _currentSource = source;
+      // 取流响应携带的分集方向：目录里没有时由它补上「全屏观看」的判据。
+      if (source.vertical case final bool vertical) {
+        _episodeVerticals[episode.itemId] = vertical;
+      }
+      // 每次装载都重新认领：换集后没选过档就是 null，不留上一集的高度。
+      _renditionHeight = renditionHeight;
       final sourceUri = Uri.tryParse(source.url);
       final isRemote =
           sourceUri != null &&
@@ -973,7 +1334,10 @@ class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
       }
       trace.stage('releaseWait');
       await release;
-      if (!_current(generation)) return;
+      if (!_current(generation)) {
+        await adopted?.dispose();
+        return;
+      }
       trace.stage('history');
       Map<String, dynamic>? saved;
       try {
@@ -982,21 +1346,60 @@ class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
         // Local storage is optional for starting a video.
       }
       trace.stage('pagingBeforeCreate');
-      if (!await _waitForPaging(generation)) return;
+      if (!await _waitForPaging(generation)) {
+        await adopted?.dispose();
+        return;
+      }
       if (saved?['kind'] == 'manju') _historyKind = 'manju';
+      // 起播位置要在 create 之前算：原生把它当初始播放位置，在 prepare() 之前
+      // 应用，避免「先按 0 开流、再 seek 到存档进度」多出来的一次开流往返。
+      // 锚点等 create 成功后再消费：创建失败重试时它是唯一比历史存档新的进度。
+      final pendingResume = _listenResume;
+      final listenResumeMs = pendingResume != null && pendingResume.$1 == index
+          ? pendingResume.$2.inMilliseconds
+          : -1;
+      final rawPosition = saved?['position'];
+      final savedPosition = rawPosition is num ? rawPosition.toDouble() : 0.0;
+      final rawDuration = saved?['duration'];
+      final savedDuration = rawDuration is num && rawDuration.isFinite
+          ? rawDuration.toDouble()
+          : 0.0;
+      final initialPosition = !_hasDisplayed && index == widget.startIndex
+          ? widget.startPosition
+          : null;
+      final requestedMs = listenResumeMs >= 0
+          ? listenResumeMs.toDouble()
+          : initialPosition?.inMilliseconds.toDouble() ?? savedPosition * 1000;
+      // 记录已播到末尾的不给起播位置（从头播）；记录没时长时由首个时长事件再校正。
+      final startMs =
+          (listenResumeMs >= 0 ||
+                  initialPosition != null ||
+                  resumeEpisodeIndex(saved, widget.eps) == index) &&
+              requestedMs.isFinite &&
+              requestedMs > 0 &&
+              requestedMs < 0x7fffffffffffffff &&
+              (savedDuration <= 0 || requestedMs < savedDuration * 1000)
+          ? requestedMs.round()
+          : null;
       trace.stage('create');
-      final player = candidate = widget.playerFactory?.call() ?? NativePlayer();
+      final player = candidate =
+          adopted ?? widget.playerFactory?.call() ?? NativePlayer();
       _player = player;
-      await player.create(source.url, source.keyHex);
+      if (adopted == null) {
+        await player.create(source.url, source.keyHex, startMs: startMs);
+      } else if (startMs != null) {
+        // 预热时还不知道续播点，按 0 建的；有续播点就在起播前跳过去。
+        await player.seek(Duration(milliseconds: startMs));
+      }
       if (!_current(generation, player)) {
         await player.dispose();
         return;
       }
       if (player.lastError case final Object error) throw error;
+      if (_listenResume == pendingResume) _listenResume = null;
       trace.stage('initialize');
-      _subscribe(player, generation);
+      _subscribe(player, generation, startMs: startMs);
       _onFirstFrame(player, generation);
-      // Keep the texture mounted beneath the cover while rate/seek initialize.
       setState(() {});
       var rate = 1.0;
       try {
@@ -1005,9 +1408,8 @@ class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
       if (!_current(generation, player)) return;
       await player.setRate(rate);
       if (!_current(generation, player)) return;
-      // 官方「默认静音」是**起播音量**（`tm3/b.java:17-20` 的静态标志），
-      // 每次新建播放器都要重新套一遍。音量失败不能拖垮播放：
-      // 官方音量只是表现层，起播照旧。
+      // 官方「默认静音」是**起播音量**（`tm3/b.java:17-20` 的静态标志），每次新建
+      // 播放器都要重新套一遍。音量失败不能拖垮播放：官方音量只是表现层。
       try {
         await player.setVolume(_defaultMute ? 0 : 1);
       } catch (_) {
@@ -1015,45 +1417,19 @@ class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
       }
       if (!_current(generation, player)) return;
 
-      final savedIndex = resumeEpisodeIndex(saved, widget.eps);
-      final rawPosition = saved?['position'];
-      final savedPosition = rawPosition is num ? rawPosition.toDouble() : 0.0;
-      final rawDuration = saved?['duration'];
-      final savedDuration = rawDuration is num && rawDuration.isFinite
-          ? rawDuration.toDouble()
-          : 0.0;
-      final durationSeconds = player.duration > Duration.zero
-          ? player.duration.inMilliseconds / 1000
-          : savedDuration;
-      // 听书回传的锚点优先于历史存档（更「新」）；只消费一次，非本集
-      // （load 被抢先换到别的集）则丢弃。
-      final pendingResume = _listenResume;
-      _listenResume = null;
-      final listenResumeMs = pendingResume != null && pendingResume.$1 == index
-          ? pendingResume.$2.inMilliseconds.toDouble()
-          : -1.0;
-      final requestedMs = listenResumeMs >= 0
-          ? listenResumeMs
-          : savedPosition * 1000;
-      final resumeSeconds = requestedMs / 1000;
-      if ((listenResumeMs >= 0 || savedIndex == index) &&
-          requestedMs.isFinite &&
-          requestedMs > 0 &&
-          requestedMs < 0x7fffffffffffffff &&
-          (durationSeconds <= 0 || resumeSeconds < durationSeconds)) {
-        // Completed/out-of-range entries restart instead of immediately
-        // reaching the end again. Unknown duration must not erase a valid seek.
-        final targetMs = requestedMs.round();
-        // chrome 的 onSeeked 只覆盖手势。恢复进度是直接 seek，不通知的话
-        // 调度器仍停在 0ms，首批 hasMore=false 后目标位置补不到。
-        _rememberDanmakuResume(index, targetMs);
-        await player.seek(Duration(milliseconds: targetMs));
+      final knownMs = player.duration.inMilliseconds;
+      if (startMs != null && knownMs > 0 && startMs >= knownMs) {
+        await player.seek(Duration.zero);
         if (!_current(generation, player)) return;
+      }
+      if (startMs != null && (knownMs == 0 || startMs < knownMs)) {
+        // chrome 的 onSeeked 只覆盖手势；恢复进度不通知的话，首批 hasMore=false 后
+        // 调度器仍停在 0ms，目标位置补不到。越界（已 seek 到 0）时不设锚点。
+        _rememberDanmakuResume(index, startMs);
         if (widget.shortSeries &&
             _danmakuLoader.videoId == widget.eps[index].itemId) {
-          _danmakuResumeIndex = null;
-          _danmakuResumeMs = null;
-          _onDanmakuSeek(Duration(milliseconds: targetMs));
+          _danmakuResumeIndex = _danmakuResumeMs = null;
+          _onDanmakuSeek(Duration(milliseconds: startMs));
         }
       }
 
@@ -1068,14 +1444,18 @@ class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
       trace.stage('autoplayWait');
       _onFirstFrame(player, generation);
       _pendingAutoplay = autoplay ? player : null;
+      if (_floating) await _swapFloatingPlayer(player);
+      if (!_current(generation, player)) return;
       await _tryAutoplay(generation);
       if (!_current(generation, player)) return;
       _onFirstFrame(player, generation);
       _updatePrefetch();
       _syncWatchClock();
-      _progressTimer = Timer.periodic(const Duration(seconds: 2), (_) {
+      _progressTimer = Timer.periodic(const Duration(seconds: 5), (_) {
         // A paused episode must not keep re-stamping its history record.
+        // 5s 心跳与听书页一致：暂停/切集/退出都另有即时保存，只在这里兜底。
         if (_playing) unawaited(_persistProgress());
+        _updateWarmNext();
       });
     } catch (error) {
       if (_current(generation)) {
@@ -1096,6 +1476,7 @@ class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
     };
     _loadTrace?.fail(errorCode: errorCode, httpStatusCode: httpStatusCode);
     _sources.invalidate(widget.eps[_index].itemId);
+    if (error is! OfflineEpisodeUnavailable && _retrySilently()) return;
     _prefetchTimer?.cancel();
     _prefetchTimer = null;
     ++_loadGeneration;
@@ -1103,6 +1484,10 @@ class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
     _watchTime.stop();
     unawaited(_persistProgress());
     unawaited(_teardownPlayer());
+    // 悬浮窗里播失败：通知状态改成暂停，用户可用悬浮窗 / 通知的关闭收起。
+    if (_floatingOwner case final int owner) {
+      unawaited(NativePlayer.updateFloating(owner: owner, playing: false));
+    }
     setState(() {
       _error = PlaybackIssue.fromError(error);
       _initVideo = false;
@@ -1111,11 +1496,16 @@ class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
   }
 
   /// The source the current player was created from (includes the rendition
-  /// list), and the session-level quality choice per episode id. The official
-  /// client keeps the resolution on the engine for the session only; no
-  /// cross-launch preference exists there, so none is stored here either.
+  /// list). The session-level quality choice lives in [QualityMemory],
+  /// shared with the feed: the official client keeps the resolution on the
+  /// engine for the session only; no cross-launch preference exists there,
+  /// so none is stored here either.
   EpisodeSource? _currentSource;
-  final Map<String, EpisodeVariant> _chosen = {};
+
+  /// 按集记住的 `vertical`（官方 `VideoInfo.vertical`）。目录回包若已带该
+  /// 字段，[Chapter.vertical] 优先；这里兜住「目录没有、取流响应才有」的
+  /// 情况——播放页「全屏观看」的显隐只看当前集。
+  final Map<String, bool> _episodeVerticals = {};
 
   /// 听书页回传的续看锚点 (集号, 进度)：[_openListenMode] 在自动连播跨集
   /// 时设置，只对匹配集的下一次 [_loadVideo] 生效一次——此时本地历史
@@ -1138,8 +1528,11 @@ class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
     final resumeMs = resume.inMilliseconds;
     final wasPlaying = _playing;
     final episode = widget.eps[_index];
-    _chosen[episode.itemId] = variant;
+    QualityMemory.remember(widget.bookId, variant.name);
+    // 预热的下一集还是旧档位：作废，快播完时按新档位重新预热。
+    _dropWarm();
     _currentSource = source.withVariant(variant);
+    _renditionHeight = variant.height > 0 ? variant.height : null;
     final release = _teardownPlayer();
     NativePlayer? candidate;
     try {
@@ -1156,13 +1549,13 @@ class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
       // Note: 换档清空 `_activeIndex` 引发的四个后果与本位置的取值依据 —
       // 见 .agents/notes/implemented/bug-fix/2026-10-14-quality-switch-clears-active-index.md
       _activeIndex = _index;
-      await fresh.create(variant.url, variant.keyHex);
+      await fresh.create(variant.url, variant.keyHex, startMs: resumeMs);
       if (!_current(generation, fresh)) {
         await fresh.dispose();
         return;
       }
       if (fresh.lastError case final Object error) throw error;
-      _subscribe(fresh, generation);
+      _subscribe(fresh, generation, startMs: resumeMs > 0 ? resumeMs : null);
       _onFirstFrame(fresh, generation);
       setState(() {});
       var rate = 1.0;
@@ -1178,19 +1571,17 @@ class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
       if (!_current(generation, fresh)) return;
       if (resumeMs > 0) {
         _rememberDanmakuResume(_index, resumeMs);
-        await fresh.seek(resume);
-        if (!_current(generation, fresh)) return;
         if (widget.shortSeries && _danmakuLoader.videoId == episode.itemId) {
-          _danmakuResumeIndex = null;
-          _danmakuResumeMs = null;
+          _danmakuResumeIndex = _danmakuResumeMs = null;
           _onDanmakuSeek(resume);
         }
       }
-      if (wasPlaying) {
-        await fresh.play();
-        if (!_current(generation, fresh)) return;
-      }
-      setState(() => _playing = wasPlaying);
+      if (_floating) await _swapFloatingPlayer(fresh);
+      if (!_current(generation, fresh)) return;
+      if (wasPlaying) _pendingAutoplay = fresh;
+      await _tryAutoplay(generation);
+      if (!_current(generation, fresh)) return;
+      setState(() => _playing = fresh.playWhenReady);
     } catch (error) {
       if (_current(generation)) {
         _fail(error, generation);
@@ -1200,7 +1591,7 @@ class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
     }
   }
 
-  void _subscribe(NativePlayer player, int generation) {
+  void _subscribe(NativePlayer player, int generation, {int? startMs}) {
     _subs.addAll([
       player.bufferingStream.listen((_) {
         if (!_current(generation, player)) return;
@@ -1220,15 +1611,34 @@ class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
         setState(() {});
       }),
       player.durationStream.listen((duration) {
-        if (_current(generation, player) && _duration != duration) {
-          setState(() => _duration = duration);
+        if (!_current(generation, player)) return;
+        // 起播时还不知道时长（MP4 头没解析完）：首个时长事件里退回从头，
+        // 否则一进页面就停在片尾、play() 也推不动。
+        if (startMs != null && startMs! >= duration.inMilliseconds) {
+          startMs = null; // 只校正一次，后面的时长更新不再 seek。
+          _danmakuResumeIndex = _danmakuResumeMs = null;
+          unawaited(player.seek(Duration.zero));
         }
+        if (_duration != duration) setState(() => _duration = duration);
       }),
       player.playingStream.listen((playing) {
         if (!_current(generation, player)) return;
+        // 官方在暂停时写 video_progress：心跳改成 5s 后不能只靠它兜底。
+        if (_playing && !playing) unawaited(_persistProgress());
         if (_playing != playing) setState(() => _playing = playing);
         _syncWatchClock();
         _updatePrefetch();
+        // 悬浮窗通知里的播放状态跟着变（系统按最后同步的位置 + 倍速外推）。
+        if (_floatingOwner case final int owner) {
+          unawaited(
+            NativePlayer.updateFloating(
+              owner: owner,
+              playing: playing,
+              positionMs: player.position.inMilliseconds,
+              durationMs: player.duration.inMilliseconds,
+            ),
+          );
+        }
       }),
       player.completedStream.listen((completed) {
         if (!_current(generation, player) || _activeIndex != _index) {
@@ -1254,7 +1664,7 @@ class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
 
   void _syncWatchClock() {
     final state = WidgetsBinding.instance.lifecycleState;
-    final active = state == null || state == AppLifecycleState.resumed;
+    final active = playbackAppIsActive(state);
     if (active &&
         !_switchingSeries &&
         _hasDisplayed &&
@@ -1265,34 +1675,6 @@ class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
     } else {
       _watchTime.stop();
     }
-  }
-
-  Map<String, dynamic> _historyEntry(int index, NativePlayer player) {
-    final durationMs = player.duration > Duration.zero
-        ? player.duration.inMilliseconds
-        : 0;
-    final rawPositionMs = player.position.inMilliseconds;
-    final positionMs = durationMs > 0
-        ? rawPositionMs.clamp(0, durationMs)
-        : rawPositionMs < 0
-        ? 0
-        : rawPositionMs;
-    return {
-      'id': widget.bookId,
-      'kind': _historyKind,
-      'title': widget.title,
-      'bookId': widget.bookId,
-      'seriesId': widget.bookId,
-      'episodeId': widget.eps[index].itemId,
-      'chapterId': widget.eps[index].itemId,
-      'episode': index,
-      'progress': durationMs > 0 ? positionMs / durationMs : 0.0,
-      'position': positionMs / 1000,
-      'duration': durationMs / 1000,
-      'maxScroll': durationMs / 1000,
-      'cover': widget.cover,
-      'time': DateTime.now().millisecondsSinceEpoch,
-    };
   }
 
   /// 保存当前集的续播进度；除首帧外的所有调用点都对应官方
@@ -1330,8 +1712,11 @@ class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
       _index = index;
       // 切集：官方清时间线整池重灌（container/l.java:1496-1528）。
       _danmaku.reset();
+      // 热评按集取：先撤掉上一集的，免得新集画面上挂着旧热评。
+      _hotComments = const [];
     });
     _loadDanmaku();
+    unawaited(_loadHotComments());
     // _loadVideo invalidates prior work synchronously; no network or history
     // operation may delay recording the user's newest target.
     return _loadVideo();
@@ -1339,10 +1724,21 @@ class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
 
   @override
   Widget build(BuildContext context) {
+    // 设置页切「播放页布局」后要立刻换形态：偏好走全局 notifier，回到播放页
+    // 时 chrome 与分屏面板一起重建，不依赖路由回弹时的偶然 build。
+    return ValueListenableBuilder<PlayerLayoutMode>(
+      valueListenable: PlayerLayoutPreferences.mode,
+      builder: (context, layoutMode, _) => _chrome(layoutMode),
+    );
+  }
+
+  Widget _chrome(PlayerLayoutMode layoutMode) {
     // 官方播放页开关来自 config.json（`PlayerBottomStyleConfig` 等），
     // 每次 build 重读，配置变化无需重启页面。
     final style = PlayerStyleConfig.instance;
     return VideoPlayerChrome(
+      layoutMode: layoutMode,
+      splitPanel: _buildSplitPanel(),
       player: _player,
       title: widget.title,
       episodes: widget.eps,
@@ -1351,6 +1747,11 @@ class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
       duration: _duration,
       playing: _playing,
       shortSeries: widget.shortSeries,
+      currentEpisodeVertical: widget.eps.isEmpty
+          ? null
+          : widget.eps[_index].vertical ??
+                _episodeVerticals[widget.eps[_index].itemId],
+      openFullScreen: widget.openFullScreen,
       watchedEpisodes: watchedIndexes(_watchedIds, widget.eps),
       interactionBlocked: _externalPanelOpen || _switchingSeries,
       aiGenerated: widget.aiGenerated,
@@ -1378,6 +1779,7 @@ class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
       hotComments: _hotComments,
       onHotCommentTap: widget.shortSeries ? _openHotComment : null,
       seriesTitle: _seriesTitle,
+      synopsis: _seriesDetail?.intro ?? '',
       // 官方播放页标题行「剧名 >」（ql3/v0 `a1()`）与选集面板头部箭头
       // 都进剧集详情页（`series_detail`）。
       onOpenSeriesDetail: widget.shortSeries ? _openSeriesDetail : null,
@@ -1414,9 +1816,7 @@ class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
       onQualitySelected: widget.shortSeries
           ? (variant) {
               // 官方 `bgw`：切换的 Toast 立即出，不等换流完成。
-              ScaffoldMessenger.of(context).showSnackBar(
-                SnackBar(content: Text('清晰度已成功切换至${variant.name}')),
-              );
+              PlayerToast.show(context, '清晰度已成功切换至${variant.name}');
               unawaited(_switchVariant(variant));
             }
           : null,
@@ -1430,6 +1830,46 @@ class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
     );
   }
 
+  /// 分屏下半区（竖屏）/ 右侧栏（横屏）。非短剧返回 null，chrome 自动
+  /// 退回沉浸式整屏；桌面走 [DesktopVideoChrome]，不会走到这里。
+  Widget? _buildSplitPanel() {
+    if (!widget.shortSeries) return null;
+    final relatedSeries = (_seriesDetail?.hasRelatedSeries ?? false)
+        ? () => unawaited(_openRelatedSeries())
+        : null;
+    final hasEpisodes = widget.eps.isNotEmpty;
+    return PlayerSplitPanel(
+      seriesId: widget.bookId,
+      title: _seriesTitle.isNotEmpty ? _seriesTitle : widget.title,
+      cover: ApiClient.instance.absoluteUrl(_seriesCover),
+      episodeLabel: _episodeLabel,
+      status: _seriesStatus,
+      synopsis: _seriesDetail?.intro ?? '',
+      episodes: widget.eps,
+      currentIndex: _index,
+      playingIndex: _activeIndex,
+      playing: _playing,
+      watched: watchedIndexes(_watchedIds, widget.eps),
+      commentCount: _commentCount,
+      onSelectEpisode: (index) => unawaited(_selectEpisode(index)),
+      onOpenSeriesDetail: widget.bookId.isEmpty ? null : _openSeriesDetail,
+      onOpenRelatedSeries: relatedSeries,
+      // 简介不是选集弹窗，不受 relate_book_in_episodes_dialog 的实验门控制。
+      relateBook: _relateBook,
+      onOpenRelateBook: _relateBook == null ? null : _openOriginalBook,
+      onOpenListenMode: hasEpisodes ? () => unawaited(_openListenMode()) : null,
+      onOpenDownload: hasEpisodes
+          ? () => unawaited(_openDownloadSheet())
+          : null,
+      // 分屏里发评论/加载分页后，页面的评论入口计数（整屏右栏与热评弹窗）
+      // 也要跟上，不能只更新下半区 Tab。
+      onCommentTotalChanged: (total) {
+        if (!mounted || total <= 0 || total == _commentCount) return;
+        setState(() => _commentCount = total);
+      },
+    );
+  }
+
   /// 选集下载弹窗（官方 `jm3.u` 的面板行语义）：先把剧集目录交给下载
   /// 引擎，弹窗内选集并入队；管理页从弹窗头部进入。
   Future<void> _openDownloadSheet() async {
@@ -1439,6 +1879,9 @@ class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
       title: _seriesTitle,
       cover: widget.cover,
       episodes: widget.eps,
+      currentIndex: _index,
+      // 画质只列这部剧真实给到的档位，避免"选了 720 实际只有 360"。
+      qualities: _currentSource?.variants ?? const [],
     );
   }
 
@@ -1447,7 +1890,7 @@ class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
   ///
   /// store 未就绪（Hive 未初始化的测试环境）直接跳过，不触碰 openBox。
   Future<EpisodeSource?> _offlineSource(Chapter episode) async {
-    final store = HiveDramaDownloadStore.instance;
+    final store = _downloadStore;
     if (!store.isReady) return null;
     try {
       final cached = await store.episode(episode.itemId);
@@ -1469,10 +1912,15 @@ class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
   /// 听视频（官方 `jm3.d0.y()` 的听书模式页语义）：视频页暂停，推入独立
   /// 听书页；关闭时把「听到哪一集 + 进度」写回视频页续看（官方的
   /// `sync_progress_strategy_listen_mode` 进度同步的本地等价）。
-  Future<void> _openListenMode() async {
+  Future<void> _openListenMode() => _withPlayerOverlay(_pushListenMode);
+
+  Future<void> _pushListenMode() async {
+    final stopped = _stopFloating();
     final player = _player;
     final wasPlaying = _playing;
     if (player != null) await player.pause();
+    // 听视频接手播放：先收起悬浮窗，避免两个播放面同时占着播放器。
+    await stopped;
     if (!mounted) return;
     final result = await Navigator.of(context).push<(int, Duration)>(
       MaterialPageRoute<(int, Duration)>(
@@ -1511,6 +1959,8 @@ class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
 
     final player = _player;
     final texture = player?.textureId;
+    // 加载期不铺封面：封面是竖图，铺进 16:9 盒里会被裁成一条，也容易让人
+    // 以为盒子尺寸来自封面（实际是屏幕/解码尺寸）。这里只留黑底 + 加载圈。
     final waiting =
         _initVideo ||
         texture == null ||
@@ -1524,15 +1974,15 @@ class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
         if (texture != null)
           RotatedBox(
             quarterTurns: _player!.videoRotationCorrection ~/ 90,
-            child: Texture(
-              key: const ValueKey('player-texture'),
-              textureId: texture,
-            ),
-          ),
-        if (waiting || _error != null)
-          PlayerCover(
-            key: const ValueKey('player-cover'),
-            url: ApiClient.instance.absoluteUrl(widget.cover),
+            child: isWindowsDesktop
+                ? DesktopPlatform.instance.videoSurface(
+                    texture,
+                    key: const ValueKey('player-texture'),
+                  )
+                : Texture(
+                    key: const ValueKey('player-texture'),
+                    textureId: texture,
+                  ),
           ),
         if (_error != null)
           PlayerErrorFeedback(
@@ -1543,10 +1993,23 @@ class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
         if (_error == null && (waiting || _player!.buffering))
           PlayerLoadingFeedback(
             key: ValueKey('player-loading-$generation'),
-            label: waiting ? '正在加载第 ${_index + 1} 集' : null,
+            label: waiting
+                ? widget.eps[_index].hasKnownIndex
+                      ? '正在加载第 ${_index + 1} 集'
+                      : '正在加载当前视频'
+                : null,
             onRetry: retry,
           ),
       ],
     );
   }
+}
+
+class _FloatingAttempt {
+  _FloatingAttempt(this.player, this.playerId);
+  final NativePlayer player;
+  final int playerId;
+  final Completer<void> settled = Completer<void>();
+  int? owner;
+  bool retired = false;
 }

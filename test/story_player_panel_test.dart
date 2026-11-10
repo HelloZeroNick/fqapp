@@ -4,6 +4,7 @@ import 'package:lottie/lottie.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'package:fqapp/models/media_item.dart';
+import 'package:fqapp/services/app_theme.dart';
 import 'package:fqapp/widgets/video_player_chrome.dart';
 
 import 'support/fakes.dart';
@@ -114,11 +115,7 @@ void main() {
   testWidgets(
     'current tile is orange with the corner playing lottie; watched tiles are gray',
     (tester) async {
-      await _mount(
-        tester,
-        currentIndex: 3,
-        watched: {0, 1, 2},
-      );
+      await _mount(tester, currentIndex: 3, watched: {0, 1, 2});
       await openEpisodes(tester);
       Text tileText(int index) => tester.widget<Text>(
         find.descendant(of: _episode(index), matching: find.byType(Text)).first,
@@ -130,7 +127,8 @@ void main() {
       // 当前集底色 #1AFA6725 只出现在这一块格子上。
       expect(
         find.byWidgetPredicate(
-          (widget) => widget is Material && widget.color == const Color(0x1AFA6725),
+          (widget) =>
+              widget is Material && widget.color == const Color(0x1AFA6725),
         ),
         findsOneWidget,
       );
@@ -149,6 +147,36 @@ void main() {
       expect(tester.takeException(), isNull);
     },
   );
+
+  testWidgets('深色主题下面板与选集格子改用深色色板', (tester) async {
+    await _mount(
+      tester,
+      theme: AppTheme.createTheme(Brightness.dark),
+      watched: {1},
+    );
+    await openEpisodes(tester);
+    // 面板不再强制白底：取浮层色（深色非 OLED = surface）。
+    final panel = tester.widget<Material>(
+      find.byKey(const ValueKey('story-panel')),
+    );
+    expect(panel.color, const Color(0xFF242424));
+    Text tileText(int index) => tester.widget<Text>(
+      find.descendant(of: _episode(index), matching: find.byType(Text)).first,
+    );
+    // 当前集仍用品牌橙；普通集换色板 ink；已看集用 muted。
+    expect(tileText(0).style?.color, const Color(0xFFFA6725));
+    expect(tileText(10).style?.color, const Color(0xFFF2F2F2));
+    expect(tileText(1).style?.color, const Color(0xFFB7B7B7));
+    // 普通格底在深色面板上换成亮 overlay（#08000000 会看不见）。
+    expect(
+      find.byWidgetPredicate(
+        (widget) =>
+            widget is Material && widget.color == const Color(0x14FFFFFF),
+      ),
+      findsWidgets,
+    );
+    expect(tester.takeException(), isNull);
+  });
 
   for (final size in [
     const Size(1080, 1920),
@@ -345,6 +373,7 @@ Future<_Fixture> _mount(
   int currentIndex = 0,
   Set<int>? watched,
   List<Chapter>? episodes,
+  ThemeData? theme,
 }) async {
   await tester.binding.setSurfaceSize(window);
   addTearDown(() => tester.binding.setSurfaceSize(null));
@@ -359,6 +388,7 @@ Future<_Fixture> _mount(
   });
   await tester.pumpWidget(
     MaterialApp(
+      theme: theme,
       builder: (context, child) => MediaQuery(
         data: MediaQuery.of(context).copyWith(
           textScaler: scale,
@@ -383,8 +413,7 @@ Future<_Fixture> _mount(
         playingIndex: currentIndex,
         playing: true,
         duration: player.duration,
-        watchedEpisodes:
-            watched ?? {for (var i = 0; i < currentIndex; i++) i},
+        watchedEpisodes: watched ?? {for (var i = 0; i < currentIndex; i++) i},
         onSelectEpisode: (index) async => selected.add(index),
         onError: (error) => throw error,
         child: const ColoredBox(color: Colors.black),

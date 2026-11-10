@@ -2,14 +2,31 @@ import 'dart:async';
 
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import '../models/home_cell.dart';
 import '../models/media_item.dart';
 import '../services/api_client.dart';
+import '../services/app_log.dart';
 import '../services/backend_transport.dart';
 import '../services/home_feed_cache.dart';
+import '../services/home_page_affinity.dart';
 import '../services/user_facing_error.dart';
 
 typedef HomepageLoader =
     Future<HomepagePage> Function({int tabType, int offset, String? sessionId});
+
+/// 生产加载器（[ApiClient.homepagePage]）的形状。
+///
+/// 顶栏选中下标是这一页自己的状态，测试里的 loader 只关心 `tabType`，
+/// 所以注入点保持 [HomepageLoader] 的宽签名，真正要下发的下标在
+/// [_loadInitial] / [_loadNext] 里按形状喂给生产加载器。
+typedef HomepageLoaderWithIndex =
+    Future<HomepagePage> Function({
+      int tabType,
+      int offset,
+      String? sessionId,
+      int? tabIndex,
+      int? lastTabIndex,
+    });
 typedef SearchTabsLoader =
     Future<List<SearchTab>> Function(String query, {int page});
 typedef CategorySearchLoader = Future<List<SearchTab>> Function({int offset});
@@ -17,7 +34,28 @@ typedef CategorySearchLoader = Future<List<SearchTab>> Function({int offset});
 /// Immutable view-model of the home recommendation feed.
 class HomeState {
   final List<MediaItem> items;
+
+  /// The same page keeping upstream block boundaries (see [HomeCell]).
+  ///
+  /// Empty when the payload had no recognisable blocks, or when the page came
+  /// from the disk cache. Callers that render blocks must fall back to [items]
+  /// rather than showing nothing.
+  final List<HomeCell> cells;
+
+  /// 这份 [cells] 属于哪个顶栏分类（加载它的那个 tab 的下标）。
+  ///
+  /// 渲染区块前必须拿它和 [tabIndex] 比一次：上游曾把 `tab_index` 写死成 0，
+  /// 于是「听书」里画出了推荐榜。请求侧已经修好，这里让数据自己声明归属，
+  /// 页面就不必猜这份区块是谁的。`null` 表示来源没有声明（旧快照/测试构造），
+  /// 此时按原来的方式照常渲染。
+  final int? cellsTabIndex;
+
   final int tabIndex;
+
+  /// 服务端下发的顶栏分类（`data.tab_item`）。空时调用方用 [HomeNotifier.tabs]
+  /// 的本地兜底表。
+  final List<HomeTabItem> tabs;
+
   final bool isLoading;
   final bool isLoadMore;
   final bool hasMore;
@@ -25,6 +63,9 @@ class HomeState {
 
   const HomeState({
     this.items = const [],
+    this.cells = const [],
+    this.cellsTabIndex,
+    this.tabs = const [],
     this.tabIndex = 0,
     this.isLoading = false,
     this.isLoadMore = false,
@@ -34,6 +75,10 @@ class HomeState {
 
   HomeState copyWith({
     List<MediaItem>? items,
+    List<HomeCell>? cells,
+    int? cellsTabIndex,
+    bool clearCellsTabIndex = false,
+    List<HomeTabItem>? tabs,
     int? tabIndex,
     bool? isLoading,
     bool? isLoadMore,
@@ -43,6 +88,12 @@ class HomeState {
   }) {
     return HomeState(
       items: items ?? this.items,
+      cells: cells ?? this.cells,
+      // 区块换了归属要能一起改；没给就沿用上一次的归属。
+      cellsTabIndex: clearCellsTabIndex
+          ? null
+          : (cellsTabIndex ?? this.cellsTabIndex),
+      tabs: tabs ?? this.tabs,
       tabIndex: tabIndex ?? this.tabIndex,
       isLoading: isLoading ?? this.isLoading,
       isLoadMore: isLoadMore ?? this.isLoadMore,
@@ -55,6 +106,18 @@ class HomeState {
 /// Mutable pagination state owned by exactly one tab.
 class _TabFeed {
   List<MediaItem> items = [];
+
+  /// Upstream blocks for the current page; empty when none were recognised.
+  List<HomeCell> cells = [];
+
+  /// 追加页的书：区块管线渲染 `cells`，而分页响应不再带区块结构，新拉的
+  /// 书若只进 [items] 就永远进不了网格。这里按去重顺序攒着，发布 state
+  /// 时拼进流区块（见 [_streamCellsFor]）。
+  final List<MediaItem> appendedStreamItems = [];
+
+  /// 服务端下发的顶栏分类，跟区块一起按整页替换（分页响应里只有第一页
+  /// 带 `tab_item`，跟其他光标字段一样不能在追加时被空值冲掉）。
+  List<HomeTabItem> tabs = [];
   int offset = 0;
   String? sessionId;
   int searchPage = 0;
@@ -80,6 +143,8 @@ class _TabFeed {
 
   void reset() {
     items = [];
+    cells = [];
+    appendedStreamItems.clear();
     offset = 0;
     sessionId = null;
     searchPage = 0;
@@ -95,10 +160,56 @@ class _TabFeed {
     // deliberately kept — it tracks the card on screen across refreshes.
     resumedVid = null;
   }
+
+  /// 发布给 UI 的区块：流区块（384/385 家族）的卡片后面接上追加页的书。
+  ///
+  /// 只补「无限流」那一个区块——追加页的书本来就是它的续页；其他区块
+  /// （排行榜等）保持上游原样。快照缓存存的也是这份拼好的（恢复后网格
+  /// 与滚动位置所见一致）。
+  List<HomeCell> cellsForView() {
+    if (appendedStreamItems.isEmpty) return cells;
+    return [
+      for (final cell in cells)
+        switch (cell.showType) {
+          384 => HomeCell(
+            showType: cell.showType,
+            name: cell.name,
+            id: cell.id,
+            style: cell.style,
+            items: cell.items,
+            children: [
+              for (final child in cell.children)
+                child.showType == 385
+                    ? HomeCell(
+                        showType: child.showType,
+                        name: child.name,
+                        id: child.id,
+                        style: child.style,
+                        items: [...child.items, ...appendedStreamItems],
+                        children: child.children,
+                        url: child.url,
+                        extra: child.extra,
+                      )
+                    : child,
+            ],
+            url: cell.url,
+            extra: cell.extra,
+          ),
+          _ => cell,
+        },
+    ];
+  }
 }
 
 class _FetchedFeed {
   final List<MediaItem> items;
+
+  /// Upstream blocks, when this page came from the bookstore tab feed.
+  /// Empty for search/other sources, which have no block structure.
+  final List<HomeCell> cells;
+
+  /// 服务端下发的顶栏分类；空表示这页没带 `tab_item`。
+  final List<HomeTabItem> tabs;
   final int? nextOffset;
   final String? sessionId;
   final int searchPage;
@@ -112,6 +223,8 @@ class _FetchedFeed {
 
   const _FetchedFeed({
     required this.items,
+    this.cells = const [],
+    this.tabs = const [],
     required this.nextOffset,
     required this.sessionId,
     required this.searchPage,
@@ -151,6 +264,16 @@ typedef _AllManjuGroup = ({
   bool hasMore,
 });
 
+/// The manju group once the previous page already exhausted its search cursor:
+/// empty, with no page left to advance to.
+const _AllManjuGroup _emptyManjuGroup = (
+  items: <MediaItem>[],
+  searchOffset: null,
+  searchCanAdvance: false,
+  searchExhausted: true,
+  hasMore: false,
+);
+
 /// Loads and pages the homepage feeds. Each async operation captures its tab
 /// and feed before the first await, so switching tabs can never redirect a
 /// late response into a different tab's cache.
@@ -167,30 +290,139 @@ class HomeNotifier extends Notifier<HomeState> {
     // shows the same feed under 「推荐」 (用户截图与 ap3.xml 的兜底名都如此).
     '视频': 'video',
   };
-  static const tabTypes = {
-    '小说': 2,
-    '短剧': 8,
-    '漫剧': 24,
-    '听书': 5,
-    '视频': 16,
+  static const tabTypes = {'小说': 2, '短剧': 8, '漫剧': 24, '听书': 5, '视频': 16};
+
+  /// 服务端 `tab_type`（官方 `BookstoreTabType`）→ 卡片种类。
+  ///
+  /// 服务端下发的 `data.tab_item` 有 11 项（推荐/小说/经典/知识/听书/看剧/
+  /// 视频/短篇/漫画/新书/商城），与本地 7 项兜底表既不同长也不同序。若用本地
+  /// 表按服务端下标取名字，点「经典」（服务端下标 2）会去拉 `tab_type=8`
+  /// （短剧）——串台。所以索引落在服务端表内时，种类与 `tab_type` 都从那一项
+  /// 自己的类型推。
+  static const _kindByTabType = <int, String>{
+    2: 'book', // recommend
+    3: 'book', // new_book
+    5: 'audio', // audio
+    8: 'video', // video_episode（看剧）
+    9: 'manga', // comic
+    11: 'book', // classic
+    12: 'book', // knowledge2
+    15: 'book', // ecom_book
+    16: 'video', // video_feed
+    24: 'manju', // dynamic_comic
+    25: 'book', // novel
+    31: 'book', // latest_published_book
+    103: 'book', // ugc_story（短篇）
   };
 
-  final HomepageLoader _homepageLoader;
+  /// 一个顶栏分类的身份：显示名、卡片种类、要请求的 `tab_type`。
+  ///
+  /// [tabType] 为 null 表示这一项没有可请求的书城流（官方 `female`/`male`
+  /// 这类性别入口），只能走搜索兜底。
+  ///
+  /// 索引口径由 [usesLocalTabs] 决定，**不能靠 state.tabs 是否为空来猜**：
+  /// 短剧页（`dramaProvider`）用本地表下标驱动自己的频道条，它的 state.tabs
+  /// 同样会被服务端那 11 项填满，若跟着服务端下标解析，它的「短剧」（本地 2）
+  /// 就会变成服务端的「经典」。
+  ({String name, String kind, int? tabType}) identityOf(int tabIndex) {
+    final server = state.tabs;
+    if (!usesLocalTabs && tabIndex >= 0 && tabIndex < server.length) {
+      final tab = server[tabIndex];
+      final type = tab.type;
+      return (
+        name: tab.title,
+        kind: _kindByTabType[type] ?? 'book',
+        // 0/1 是官方 female/male 性别入口，没有对应的书城流。
+        tabType: type <= 1 ? null : type,
+      );
+    }
+    final name = tabIndex >= 0 && tabIndex < tabs.length
+        ? tabs[tabIndex]
+        : tabs.first;
+    return (
+      name: name,
+      kind: tabKinds[name] ?? 'book',
+      tabType: tabTypes[name],
+    );
+  }
+
+  final HomepageLoaderWithIndex _indexedHomepageLoader;
   final SearchTabsLoader _searchLoader;
   final CategorySearchLoader _mangaSearchLoader;
   final CategorySearchLoader _manjuSearchLoader;
+
+  /// 拉一页首页流，带上顶栏选中下标——上游按 `tab_index` 决定回哪个分类
+  /// 的区块。测试注入的加载器在构造期已适配成同一形状（多余参数被忽略）。
+  ///
+  /// [tabIndex] 缺省取当前顶栏选中项，而不是传进来的 `tabType` 对应的位置：
+  /// 「全部」在内部是以小说（`tab_type=2`）去拉的，顶栏上却停在第 0 项，
+  /// 拿 `tabType` 反推会把 2 报成 1。
+  Future<HomepagePage> _fetchHomepage({
+    required int tabType,
+    int? tabIndex,
+    int offset = 0,
+    String? sessionId,
+  }) => _indexedHomepageLoader(
+    tabType: tabType,
+    offset: offset,
+    sessionId: sessionId,
+    tabIndex: tabIndex ?? state.tabIndex,
+    lastTabIndex: _lastTabIndex,
+  );
+
+  /// 这一页能不能当成本分类的载荷（判定与日志都在 [homePageAffinity]）。
+  ///
+  /// 上游的回答不可信时（回答别的分类、或区块族与分类轴不匹配）整页拒绝：
+  /// 拿它当自己这份，就是真机上「听书」里画出推荐/小说的排行榜与猜你喜欢，
+  /// 再经 `_forceKind` 把小说变成「听书」。
+  bool _answersTab(HomepagePage page, int tabType, String kind) =>
+      homePageAffinity(page, tabType: tabType, kind: kind) ==
+      HomePageAffinity.ours;
+
   final HomeFeedCache? _feedCache;
   final int initialTabIndex;
 
+  /// 顶栏下标的口径：`true` 表示这一页的分类条由本地 [tabs] 表驱动。
+  ///
+  /// 短剧页（[dramaProvider]）的频道条是本地表下标拼的
+  /// （`drama_page.dart` 的 `dramaChannels` 全用 `HomeNotifier.tabs.indexOf`），
+  /// 而它的 `state.tabs` 同样会被服务端那 11 项填满。若跟着服务端下标解析，
+  /// 它的「短剧」（本地下标 2）就会变成服务端的「经典」——所以这一页必须
+  /// 固定走本地表，不能靠 `state.tabs` 空不空来猜。
+  final bool usesLocalTabs;
+
   HomeNotifier({
+    /// 只关心 `tabType` 的加载器（测试注入点）。给了它就不再看下标，所以
+    /// 这里在构造期直接把它适配成带下标的形状。
     HomepageLoader? homepageLoader,
+
+    /// 需要顶栏下标的加载器；缺省走 [ApiClient.homepagePage]。
+    HomepageLoaderWithIndex? indexedHomepageLoader,
     SearchTabsLoader? searchLoader,
     CategorySearchLoader? mangaSearchLoader,
     CategorySearchLoader? manjuSearchLoader,
     HomeFeedCache? feedCache,
     this.initialTabIndex = 0,
+    this.usesLocalTabs = false,
   }) : _feedCache = feedCache ?? HomeFeedCache.instance,
-       _homepageLoader = homepageLoader ?? ApiClient.instance.homepagePage,
+       // 注入的 loader 只认 `tabType`；生产路径要额外带上顶栏下标，所以
+       // 缺省时直接用带下标的那个（见 [HomepageLoaderWithIndex]）；注入的
+       // 测试加载器只认 `tabType`，这里补一层适配，多余的下标参数丢弃。
+       _indexedHomepageLoader =
+           indexedHomepageLoader ??
+           (homepageLoader == null
+               ? ApiClient.instance.homepagePage
+               : ({
+                   int tabType = 2,
+                   int offset = 0,
+                   String? sessionId,
+                   int? tabIndex,
+                   int? lastTabIndex,
+                 }) => homepageLoader(
+                   tabType: tabType,
+                   offset: offset,
+                   sessionId: sessionId,
+                 )),
        _searchLoader = searchLoader ?? ApiClient.instance.searchTabs,
        _mangaSearchLoader =
            mangaSearchLoader ??
@@ -229,14 +461,30 @@ class HomeNotifier extends Notifier<HomeState> {
   /// work instead of only ignoring its result.
   BackendRequest? _activeRequest;
 
+  /// Tabs whose appends are waiting on the debounced snapshot write; see
+  /// [_scheduleSave].
+  final Set<int> _dirtySaveTabs = {};
+  Timer? _saveDebounce;
+
+  /// 上一次选中的顶栏下标，随请求发给上游（官方 `lastTabIndex`）。
+  ///
+  /// 上游按 `tab_index` 决定回哪个 tab 的 `cell_data`，只带 `tab_type` 时
+  /// 拿回的是推荐流的区块——「听书」里显示推荐榜就是这么来的。这里记住
+  /// 切换前的位置，切走后第一次加载就能把「从哪来」一起告诉上游。
+  int? _lastTabIndex;
+
   /// The category this feed opens on. The home page starts on 全部; a page that
   /// is locked to one channel starts on that channel and never shows the strip.
   @override
   HomeState build() {
     ++_generation;
     // Leaving the page (or rebuilding the provider) stops whatever is in
-    // flight instead of only ignoring its result.
-    ref.onDispose(() => _activeRequest?.cancel());
+    // flight instead of only ignoring its result. The pending snapshot write
+    // dies with it: _feeds is cleared below, so there is nothing left to save.
+    ref.onDispose(() {
+      _activeRequest?.cancel();
+      _saveDebounce?.cancel();
+    });
     _activeRequest?.cancel();
     _feeds.clear();
     return HomeState(tabIndex: initialTabIndex);
@@ -290,9 +538,19 @@ class HomeNotifier extends Notifier<HomeState> {
           if (item.id.isNotEmpty) feed.seen.add('${item.kind}:${item.id}');
         }
       }
+      if (snapshot.cells.isNotEmpty) {
+        // Seed the block structure too, so the first frame renders the
+        // shelf (rank block + book grid). Without it the page can only draw
+        // the flat `items` grid and flips to blocks once the network answers
+        // — a flash of a different layout on every cold start. Older
+        // snapshots have no cells and keep that previous behaviour.
+        feed.cells = snapshot.cells;
+      }
     }
     state = state.copyWith(
       items: feed.items,
+      cells: feed.cellsForView(),
+      cellsTabIndex: tabIndex,
       isLoading: true,
       isLoadMore: false,
       hasMore: true,
@@ -312,26 +570,29 @@ class HomeNotifier extends Notifier<HomeState> {
           state.tabIndex != tabIndex) {
         return;
       }
-        final resume = feed.resumedVid != null;
+      final resume = feed.resumedVid != null;
       feed.resumedVid = null;
       _applyFetched(feed, fetched, replace: !resume);
       state = state.copyWith(
         items: feed.items,
+        cells: feed.cellsForView(),
+        cellsTabIndex: tabIndex,
+        tabs: feed.tabs,
         isLoading: false,
         isLoadMore: false,
         hasMore: feed.hasMore,
       );
       // 上报只在翻页时发生：看第一张卡没滑动就没有 lastVid——兜底用
       // 当前列表首卡（它就是本次会话实际展示的第一张），让续接链在
-      // 下一次冷启动成立。
-      final savedVid = feed.lastVid ?? (feed.items.isEmpty ? null : feed.items.first.id);
-      unawaited(
-        _feedCache?.save(
-          tabIndex,
-          feed.items,
-          hasMore: feed.hasMore,
-          lastVid: savedVid,
-        ),
+      // 下一次冷启动成立。整页替换立即落盘，并清掉翻页留下的待写防抖。
+      _saveDebounce?.cancel();
+      _dirtySaveTabs.clear();
+      _writeSnapshot(tabIndex);
+      AppLog.d(
+        'home',
+        '整页落地 tab=$tabIndex resume=$resume items=${feed.items.length} '
+            'cells=${describeHomeCells(feed.cells)} '
+            'kinds=${_kindCounts(feed.items)}',
       );
     } catch (error) {
       if (!ref.mounted ||
@@ -354,13 +615,30 @@ class HomeNotifier extends Notifier<HomeState> {
   /// Restores a cached tab immediately. Incrementing the generation happens
   /// even on a cache hit, which invalidates requests started by the old tab.
   void selectTab(int index) {
-    if (index == state.tabIndex || index < 0 || index >= tabs.length) return;
+    // 上限跟着下标口径走：走服务端表时是它下发的分类数（首页 11 个），走本地
+    // 表时是本地那 7 个。用错口径会把短剧页的「短剧」（本地下标 2）拦掉或
+    // 放进越界下标。
+    final limit = usesLocalTabs || state.tabs.isEmpty
+        ? tabs.length
+        : state.tabs.length;
+    if (index == state.tabIndex || index < 0 || index >= limit) return;
+    // 记住切换前的位置：下一次加载要把它当 `last_tab_index` 交给上游，
+    // 上游据此知道用户是从哪个分类过来的。
+    _lastTabIndex = state.tabIndex;
     ++_generation;
     _activeRequest?.cancel();
     final cached = _feeds[index];
     state = state.copyWith(
       tabIndex: index,
       items: cached?.items ?? const [],
+      // cells / tabs 必须跟着换：切到新 tab 时沿用上一个 tab 的区块会让
+      // 首页显示别的 tab 的内容；而回到首页时旧的 cells 已随 feed 重建，
+      // 不显式清空就会渲染出上一页的块。
+      cells: cached?.cellsForView() ?? const [],
+      // 区块的归属跟着换到新分类：缓存里那份就是这个分类的。
+      cellsTabIndex: cached == null ? null : index,
+      clearCellsTabIndex: cached == null,
+      tabs: state.tabs,
       isLoading: false,
       isLoadMore: false,
       hasMore: cached?.hasMore ?? true,
@@ -393,29 +671,89 @@ class HomeNotifier extends Notifier<HomeState> {
       _applyFetched(feed, fetched, replace: false);
       state = state.copyWith(
         items: feed.items,
+        cells: feed.cellsForView(),
+        cellsTabIndex: tabIndex,
         isLoadMore: false,
         hasMore: feed.hasMore,
       );
-      final savedVid = feed.lastVid ?? (feed.items.isEmpty ? null : feed.items.first.id);
-      unawaited(
-        _feedCache?.save(
-          tabIndex,
-          feed.items,
-          hasMore: feed.hasMore,
-          lastVid: savedVid,
-        ),
+      AppLog.d(
+        'home',
+        '追加落地 tab=$tabIndex items=${feed.items.length} '
+            'cells=${describeHomeCells(feed.cells)} '
+            'kinds=${_kindCounts(feed.items)}',
       );
-    } catch (_) {
+      _scheduleSave(tabIndex);
+    } catch (error) {
       if (!ref.mounted ||
           generation != _generation ||
           state.tabIndex != tabIndex) {
         return;
       }
-      // Stop automatic bottom-of-grid retry loops. Pull-to-refresh gives the
-      // user an explicit retry path and resets this flag.
+      // Stop automatic bottom-of-grid retry loops; the error reaches the
+      // stream footer's retry state (hasMore alone would read as 「已显示全部
+      // 内容」, which lies about a failed page). Pull-to-refresh resets both.
       feed.hasMore = false;
-      state = state.copyWith(isLoadMore: false, hasMore: false);
+      state = state.copyWith(
+        error: userFacingError(error),
+        isLoadMore: false,
+        hasMore: false,
+      );
     }
+  }
+
+  /// 重试上一页失败的追加。
+  ///
+  /// [loadMore] 失败时会把 `feed.hasMore` 与 `state.hasMore` 一起置 false（免得
+  /// 滚动到底反复自动重试）。流尾的「加载失败，点击重试」是用户的显式动作，
+  /// 必须先把游标恢复，否则 [loadMore] 会以「没有下一页」直接返回，按钮成了
+  /// 摆设。
+  Future<void> retryLoadMore() async {
+    if (state.isLoading || state.isLoadMore) return;
+    _feedFor(state.tabIndex).hasMore = true;
+    state = state.copyWith(hasMore: true, clearError: true);
+    await loadMore();
+  }
+
+  /// Writes one tab's current feed to the snapshot store, fire-and-forget.
+  ///
+  /// 上报只在翻页时发生：看第一张卡没滑动就没有 lastVid——兜底用当前列表
+  /// 首卡（它就是本次会话实际展示的第一张），让续接链在下一次冷启动成立。
+  void _writeSnapshot(int tabIndex) {
+    final feed = _feeds[tabIndex];
+    final cache = _feedCache;
+    if (feed == null || cache == null || feed.items.isEmpty) return;
+    final savedVid = feed.lastVid ?? feed.items.first.id;
+    unawaited(
+      cache.save(
+        tabIndex,
+        feed.items,
+        hasMore: feed.hasMore,
+        lastVid: savedVid,
+        cells: feed.cellsForView(),
+      ),
+    );
+  }
+
+  /// Debounced [_writeSnapshot] for pagination.
+  ///
+  /// A snapshot write encodes up to [HomeFeedCache.maxItems] cards plus the
+  /// whole block tree on the UI isolate; firing one per appended page lands
+  /// exactly on the frame the new cards render. Debouncing coalesces a paging
+  /// burst into one write per tab of its final state. `load()` keeps writing
+  /// immediately: it replaces page one (pull-to-refresh, tab entry) and is not
+  /// a burst.
+  void _scheduleSave(int tabIndex) {
+    _dirtySaveTabs.add(tabIndex);
+    _saveDebounce?.cancel();
+    _saveDebounce = Timer(const Duration(seconds: 2), () {
+      _saveDebounce = null;
+      if (!ref.mounted) return;
+      final tabs = _dirtySaveTabs.toSet();
+      _dirtySaveTabs.clear();
+      for (final tab in tabs) {
+        _writeSnapshot(tab);
+      }
+    });
   }
 
   /// Records the card currently on screen so the next snapshot save can store
@@ -426,44 +764,78 @@ class HomeNotifier extends Notifier<HomeState> {
   }
 
   Future<_FetchedFeed> _loadInitial(int tabIndex) async {
-    final name = tabs[tabIndex];
+    final identity = identityOf(tabIndex);
+    final name = identity.name;
     if (name == '全部') return _loadAllInitial();
 
-    final kind = tabKinds[name]!;
-    final tabType = tabTypes[name];
+    final kind = identity.kind;
+    final tabType = identity.tabType;
+    // 搜索兜底的关键词：推荐流（`tab_type=2`）本身就是小说推荐，拿「推荐」
+    // 去搜既不是有效书名也匹配不到搜索结果的 tab；用「小说」才能命中。
+    final searchName = tabType == 2 ? '小说' : name;
+    Object? loaderFailure;
     if (tabType != null) {
       try {
-        final page = await _homepageLoader(tabType: tabType);
-        final items = _forceKind(page.items, kind);
-        final nextOffset = page.nextOffset;
-        final canAdvance = nextOffset != null && nextOffset > 0;
-        if (items.isNotEmpty || canAdvance) {
-          return _FetchedFeed(
-            items: items,
-            nextOffset: canAdvance ? nextOffset : null,
-            sessionId: page.sessionId,
-            searchPage: 0,
-            recommendExhausted: !canAdvance,
-            // Search remains available after recommendations are exhausted.
-            hasMore: true,
-          );
+        final page = await _fetchHomepage(tabType: tabType);
+        if (!_answersTab(page, tabType, kind)) {
+          // 上游回答的是别的分类：这份 cells/items 不是这一页的内容。宁可退回
+          // 搜索，也不要画别人的榜和书（再经 `_forceKind` 重标成本分类）。
+          loaderFailure = StateError('响应不属于 tab_type=$tabType');
+        } else {
+          final items = _forceKind(page.items, kind);
+          final nextOffset = page.nextOffset;
+          final canAdvance = nextOffset != null && nextOffset > 0;
+          // 准入条件必须包含 cells：官方书城区块（`tab_type=2`）的书全嵌在
+          // `cell_data` 里，`parseMediaItems` 不一定能拉平出 items。只看 items
+          // 会把一整页区块当成「空响应」丢掉，然后退回搜索路径，cells 全丢——
+          // 这正是真机上区块一个都不出现、首页退回旧网格的原因。
+          if (items.isNotEmpty || page.cells.isNotEmpty || canAdvance) {
+            return _FetchedFeed(
+              items: items,
+              cells: page.cells,
+              tabs: page.tabs,
+              nextOffset: canAdvance ? nextOffset : null,
+              sessionId: page.sessionId,
+              searchPage: 0,
+              recommendExhausted: !canAdvance,
+              // Search remains available after recommendations are exhausted.
+              hasMore: true,
+            );
+          }
         }
-      } catch (_) {
+      } catch (loaderError) {
         // Older backends may not expose recommendations; search below keeps the
-        // tab usable.
+        // tab usable — but only when it actually produces something. An empty
+        // fallback is a dead page and must surface the original error (the
+        // stream footer's retry state depends on it).
+        loaderFailure = loaderError;
       }
     }
+    return _initialFromSearch(searchName, kind, loaderFailure);
+  }
 
-    final search = await _searchByType(name);
-    final items = _searchItems(search, name, kind);
-    final progress = _searchProgress(search, name, items, offset: 0);
+  /// 分类首页的搜索兜底（流不可用 / 回答的是别的分类时走这里）。
+  ///
+  /// [loaderFailure] 是流那边失败的原因；搜索也拿不出东西时把错误透传出去，
+  /// 而不是给一张谎报「暂无内容」的空页（流尾重试态靠它）。
+  Future<_FetchedFeed> _initialFromSearch(
+    String searchName,
+    String kind,
+    Object? loaderFailure,
+  ) async {
+    final search = await _searchByType(searchName);
+    final items = _searchItems(search, searchName, kind);
+    if (items.isEmpty && loaderFailure != null) {
+      throw loaderFailure;
+    }
+    final progress = _searchProgress(search, searchName, items, offset: 0);
     return _FetchedFeed(
       items: items,
       nextOffset: null,
       sessionId: null,
       searchPage: 1,
       searchOffsets: {
-        if (progress.nextOffset != null) name: progress.nextOffset!,
+        if (progress.nextOffset != null) searchName: progress.nextOffset!,
       },
       searchCanAdvance: progress.hasCursor,
       recommendExhausted: true,
@@ -473,13 +845,65 @@ class HomeNotifier extends Notifier<HomeState> {
 
   /// "全部" combines the novel recommendation stream with first pages for
   /// the other supported categories.
+  /// Loads the "全部" tab.
+  ///
+  /// The official bookstore tab (`tab_type=2`) shows its own blocks and nothing
+  /// else, so once the recommendation stream answers we stop there: the former
+  /// cross-media interleave — mixing short drama, manju, manga and audio search
+  /// results into the same card list — is gone. Those sources keep their own
+  /// tabs.
+  ///
+  /// The interleave survives as a degraded path only: when the recommendation
+  /// stream fails outright, mixing the other sources keeps the tab usable
+  /// instead of blanking it.
   Future<_FetchedFeed> _loadAllInitial() async {
-    final recommendationFuture = _attempt(_loadInitial(1));
-    final videoFuture = _attempt(_searchLoader('短剧'));
-    final manjuFuture = _attempt(_loadAllManju());
-    final mangaFuture = _attempt(_mangaSearchLoader());
-    final audioFuture = _attempt(_searchLoader('听书'));
+    final recommendation = await _attempt(_loadInitial(1));
+    final page = recommendation.value;
+    if (page != null && (page.items.isNotEmpty || page.cells.isNotEmpty)) {
+      return _FetchedFeed(
+        items: page.items,
+        cells: page.cells,
+        tabs: page.tabs,
+        nextOffset: page.nextOffset,
+        sessionId: page.sessionId,
+        searchPage: page.searchPage,
+        searchPages: {'小说': page.searchPage},
+        recommendExhausted: page.recommendExhausted,
+        hasMore: page.items.isNotEmpty || page.nextOffset != null,
+      );
+    }
+    return _loadAllInterleaved(recommendation);
+  }
 
+  /// Degraded path for [loadAll]: the recommendation stream is unavailable, so
+  /// mix whatever the other sources returned.
+  Future<_FetchedFeed> _loadAllInterleaved(
+    _Attempt<_FetchedFeed> recommendation,
+  ) => _assembleAllSources(
+    recommendationFuture: Future.value(recommendation),
+    videoFuture: _attempt(_searchLoader('短剧')),
+    manjuFuture: _attempt(_loadAllManju()),
+    mangaFuture: _attempt(_mangaSearchLoader()),
+    audioFuture: _attempt(_searchLoader('听书')),
+    previous: null,
+  );
+
+  /// 「全部」多源兜底页的公共组装。
+  ///
+  /// 首次页（[previous] 为 null）与翻页只在来源的请求参数和上一页游标上
+  /// 不同：等待、全失败时的错误透传、各来源的分组顺序与交错、结果游标的
+  /// 组装都走这一份实现。
+  Future<_FetchedFeed> _assembleAllSources({
+    required Future<_Attempt<_FetchedFeed>> recommendationFuture,
+    required Future<_Attempt<List<SearchTab>>> videoFuture,
+    required Future<_Attempt<_AllManjuGroup>> manjuFuture,
+    required Future<_Attempt<List<SearchTab>>> mangaFuture,
+    required Future<_Attempt<List<SearchTab>>> audioFuture,
+    required _TabFeed? previous,
+  }) async {
+    final initial = previous == null;
+    final videoPage = (previous?.searchPages['短剧'] ?? 0) + 1;
+    final audioPage = (previous?.searchPages['听书'] ?? 0) + 1;
     final recommendation = await recommendationFuture;
     final video = await videoFuture;
     final manju = await manjuFuture;
@@ -495,17 +919,21 @@ class HomeNotifier extends Notifier<HomeState> {
           manju.error ??
           manga.error ??
           audio.error ??
-          StateError('首页加载失败');
+          StateError(initial ? '首页加载失败' : '首页分页失败');
     }
 
     final manjuGroup = manju.value;
     final manjuItems = manjuGroup?.items ?? const <MediaItem>[];
-    final mangaItems = _searchItems(manga.value ?? [], '漫画', 'manga');
+    final mangaItems = _searchItems(
+      manga.value ?? const <SearchTab>[],
+      '漫画',
+      'manga',
+    );
     final mangaProgress = _searchProgress(
-      manga.value ?? [],
+      manga.value ?? const <SearchTab>[],
       '漫画',
       mangaItems,
-      offset: 0,
+      offset: previous?.searchOffsets['漫画'] ?? 0,
     );
     final groups = <List<MediaItem>>[
       if (recommendation.value != null) recommendation.value!.items,
@@ -514,30 +942,44 @@ class HomeNotifier extends Notifier<HomeState> {
       mangaItems,
       if (audio.value != null) _searchItems(audio.value!, '听书', 'audio'),
     ];
-    final page = recommendation.value;
+    final recommendationPage = recommendation.value;
     final items = _interleave(groups);
+    // 翻页时推荐源失败、其余兜底源也没产出，不能当成一页空「成功」——否则
+    // loadMore 的成功状态会让流尾把加载失败谎报成「已显示全部内容」。
+    if (!initial && items.isEmpty && recommendationPage == null) {
+      throw recommendation.error ?? StateError('翻页失败');
+    }
+    final novelPage = recommendationPage?.searchPage ?? (initial ? 0 : null);
     return _FetchedFeed(
       items: items,
-      nextOffset: page?.nextOffset,
-      sessionId: page?.sessionId,
-      searchPage: 1,
+      nextOffset: recommendationPage?.nextOffset,
+      sessionId: recommendationPage?.sessionId ?? previous?.sessionId,
+      searchPage: (previous?.searchPage ?? 0) + 1,
       searchPages: {
-        '小说': page?.searchPage ?? 0,
-        if (video.value != null) '短剧': 1,
-        if (audio.value != null) '听书': 1,
+        ...?previous?.searchPages,
+        '小说': ?novelPage,
+        if (video.value != null) '短剧': videoPage,
+        if (audio.value != null) '听书': audioPage,
       },
       searchOffsets: {
+        ...?previous?.searchOffsets,
         if (manjuGroup?.searchOffset != null) '漫剧': manjuGroup!.searchOffset!,
         if (mangaProgress.nextOffset != null) '漫画': mangaProgress.nextOffset!,
       },
       searchCanAdvance:
           (manjuGroup?.searchCanAdvance ?? false) || mangaProgress.hasCursor,
-      manjuSearchExhausted: manjuGroup?.searchExhausted ?? false,
-      mangaSearchExhausted: manga.value != null && !mangaProgress.hasMore,
-      recommendExhausted: page?.recommendExhausted ?? true,
+      manjuSearchExhausted:
+          (previous?.manjuSearchExhausted ?? false) ||
+          (manjuGroup?.searchExhausted ?? false),
+      mangaSearchExhausted:
+          (previous?.mangaSearchExhausted ?? false) ||
+          (manga.value != null && !mangaProgress.hasMore),
+      recommendExhausted:
+          recommendationPage?.recommendExhausted ??
+          (previous?.recommendExhausted ?? true),
       hasMore:
           items.isNotEmpty ||
-          page?.nextOffset != null ||
+          recommendationPage?.nextOffset != null ||
           (manjuGroup?.hasMore ?? false) ||
           mangaProgress.hasMore,
     );
@@ -552,7 +994,7 @@ class HomeNotifier extends Notifier<HomeState> {
   /// after the first.
   Future<_AllManjuGroup> _loadAllManju() async {
     try {
-      final page = await _homepageLoader(tabType: tabTypes['漫剧']!);
+      final page = await _fetchHomepage(tabType: tabTypes['漫剧']!);
       final items = _forceKind(page.items, 'manju');
       if (items.isNotEmpty) {
         return (
@@ -568,9 +1010,15 @@ class HomeNotifier extends Notifier<HomeState> {
     } catch (_) {
       // Older backends may not expose the stream; fall through to search.
     }
-    final tabs = await _manjuSearchLoader();
+    return _loadManjuSearch();
+  }
+
+  /// The manju group served by search alone: the pagination path, and the
+  /// fallback when the dedicated stream has no cards.
+  Future<_AllManjuGroup> _loadManjuSearch({int offset = 0}) async {
+    final tabs = await _manjuSearchLoader(offset: offset);
     final items = _searchItems(tabs, '漫剧', 'manju');
-    final progress = _searchProgress(tabs, '漫剧', items, offset: 0);
+    final progress = _searchProgress(tabs, '漫剧', items, offset: offset);
     return (
       items: items,
       searchOffset: progress.nextOffset,
@@ -580,19 +1028,42 @@ class HomeNotifier extends Notifier<HomeState> {
     );
   }
 
+  /// 卡片种类的紧凑统计，给日志用（`book:12,audio:1`）。
+  ///
+  /// `_forceKind` 会把流转下来的卡片统一重标成本分类的种类，所以这一行是
+  /// 「最终会被当成本分类画出来多少张、各是什么」——听书里冒出小说时，这里
+  /// 能直接看到是不是搜索兜底追加进来的。
+  static String _kindCounts(List<MediaItem> items) {
+    if (items.isEmpty) return '-';
+    final counts = <String, int>{};
+    for (final item in items) {
+      counts.update(item.kind, (n) => n + 1, ifAbsent: () => 1);
+    }
+    return counts.entries.map((e) => '${e.key}:${e.value}').join(',');
+  }
+
   Future<_FetchedFeed> _loadNext(int tabIndex, _TabFeed feed) async {
-    final name = tabs[tabIndex];
+    final identity = identityOf(tabIndex);
+    final name = identity.name;
     if (name == '全部') return _loadAllNext(feed);
 
-    final kind = tabKinds[name]!;
-    final tabType = tabTypes[name];
+    final kind = identity.kind;
+    final searchName = identity.tabType == 2 ? '小说' : name;
+    final tabType = identity.tabType;
+    Object? loaderFailure;
     if (tabType != null && !feed.recommendExhausted) {
       try {
-        final page = await _homepageLoader(
+        final page = await _fetchHomepage(
           tabType: tabType,
+
           offset: feed.offset,
           sessionId: feed.sessionId,
         );
+        // 追加页同样要认领归属：拿回别的分类的下一页并追加进来，就是
+        // 「听书」翻页后冒出一堆推荐/小说卡片的直接渠道。
+        if (!_answersTab(page, tabType, kind)) {
+          throw StateError('响应不属于 tab_type=$tabType');
+        }
         final items = _forceKind(page.items, kind);
         final nextOffset = page.nextOffset;
         final canAdvance = nextOffset != null && nextOffset > feed.offset;
@@ -608,23 +1079,38 @@ class HomeNotifier extends Notifier<HomeState> {
             hasMore: true,
           );
         }
-      } catch (_) {
+      } catch (loaderError) {
         // Fall through to search. A recommendation outage should not make the
-        // whole category stop paginating.
+        // whole category stop paginating — unless the fallback is empty too,
+        // in which case the original error surfaces (see below).
+        AppLog.w(
+          'home',
+          'tab_type=$tabType 流翻页失败（offset=${feed.offset}），'
+              '改走搜索兜底: $loaderError',
+        );
+        loaderFailure = loaderError;
       }
     }
 
     final pageNumber = feed.searchPage + 1;
-    final searchOffset = feed.searchOffsets[name] ?? 0;
+    final searchOffset = feed.searchOffsets[searchName] ?? 0;
     final searchTabs = await _searchByType(
-      name,
+      searchName,
       page: pageNumber,
       offset: searchOffset,
     );
-    final items = _searchItems(searchTabs, name, kind);
+    final items = _searchItems(searchTabs, searchName, kind);
+    AppLog.d(
+      'home',
+      'tab=$tabIndex 搜索兜底 query=$searchName page=$pageNumber '
+          'buckets=${_searchBuckets(searchTabs)} 取到=${items.length}',
+    );
+    if (items.isEmpty && loaderFailure != null) {
+      throw loaderFailure;
+    }
     final progress = _searchProgress(
       searchTabs,
-      name,
+      searchName,
       items,
       offset: searchOffset,
     );
@@ -635,7 +1121,7 @@ class HomeNotifier extends Notifier<HomeState> {
       searchPage: pageNumber,
       searchOffsets: {
         ...feed.searchOffsets,
-        if (progress.nextOffset != null) name: progress.nextOffset!,
+        if (progress.nextOffset != null) searchName: progress.nextOffset!,
       },
       searchCanAdvance: progress.hasCursor,
       recommendExhausted: true,
@@ -643,8 +1129,7 @@ class HomeNotifier extends Notifier<HomeState> {
     );
   }
 
-  Future<_FetchedFeed> _loadAllNext(_TabFeed feed) async {
-    final pageNumber = feed.searchPage + 1;
+  Future<_FetchedFeed> _loadAllNext(_TabFeed feed) {
     // Novel recommendations and search have their own cursor. In particular,
     // the first fallback search must start at page one even if the other
     // categories have already loaded several pages.
@@ -654,92 +1139,21 @@ class HomeNotifier extends Notifier<HomeState> {
       ..searchPage = feed.searchPages['小说'] ?? 0
       ..recommendExhausted = feed.recommendExhausted;
     bookFeed.seen.addAll(feed.seen);
-    final recommendationFuture = _attempt(_loadNext(1, bookFeed));
     final videoPage = (feed.searchPages['短剧'] ?? 0) + 1;
     final audioPage = (feed.searchPages['听书'] ?? 0) + 1;
-    final videoFuture = _attempt(_searchLoader('短剧', page: videoPage));
     final manjuOffset = feed.searchOffsets['漫剧'] ?? 0;
-    final manjuFuture = feed.manjuSearchExhausted
-        ? Future.value(const _Attempt<List<SearchTab>>.value([]))
-        : _attempt(_manjuSearchLoader(offset: manjuOffset));
     final mangaOffset = feed.searchOffsets['漫画'] ?? 0;
-    final mangaFuture = feed.mangaSearchExhausted
-        ? Future.value(const _Attempt<List<SearchTab>>.value([]))
-        : _attempt(_mangaSearchLoader(offset: mangaOffset));
-    final audioFuture = _attempt(_searchLoader('听书', page: audioPage));
-
-    final recommendation = await recommendationFuture;
-    final video = await videoFuture;
-    final manju = await manjuFuture;
-    final manga = await mangaFuture;
-    final audio = await audioFuture;
-    if (recommendation.value == null &&
-        video.value == null &&
-        manju.value == null &&
-        manga.value == null &&
-        audio.value == null) {
-      throw recommendation.error ??
-          video.error ??
-          manju.error ??
-          manga.error ??
-          audio.error ??
-          StateError('首页分页失败');
-    }
-
-    final manjuItems = _searchItems(manju.value ?? [], '漫剧', 'manju');
-    final manjuProgress = _searchProgress(
-      manju.value ?? [],
-      '漫剧',
-      manjuItems,
-      offset: manjuOffset,
-    );
-    final mangaItems = _searchItems(manga.value ?? [], '漫画', 'manga');
-    final mangaProgress = _searchProgress(
-      manga.value ?? [],
-      '漫画',
-      mangaItems,
-      offset: mangaOffset,
-    );
-    final groups = <List<MediaItem>>[
-      if (recommendation.value != null) recommendation.value!.items,
-      if (video.value != null) _searchItems(video.value!, '短剧', 'video'),
-      manjuItems,
-      mangaItems,
-      if (audio.value != null) _searchItems(audio.value!, '听书', 'audio'),
-    ];
-    final recommendationPage = recommendation.value;
-    final items = _interleave(groups);
-    return _FetchedFeed(
-      items: items,
-      nextOffset: recommendationPage?.nextOffset,
-      sessionId: recommendationPage?.sessionId ?? feed.sessionId,
-      searchPage: pageNumber,
-      searchPages: {
-        ...feed.searchPages,
-        if (recommendationPage != null) '小说': recommendationPage.searchPage,
-        if (video.value != null) '短剧': videoPage,
-        if (audio.value != null) '听书': audioPage,
-      },
-      searchOffsets: {
-        ...feed.searchOffsets,
-        if (manjuProgress.nextOffset != null) '漫剧': manjuProgress.nextOffset!,
-        if (mangaProgress.nextOffset != null) '漫画': mangaProgress.nextOffset!,
-      },
-      searchCanAdvance: manjuProgress.hasCursor || mangaProgress.hasCursor,
-      manjuSearchExhausted:
-          feed.manjuSearchExhausted ||
-          (manju.value != null && !manjuProgress.hasMore),
-      mangaSearchExhausted:
-          feed.mangaSearchExhausted ||
-          (manga.value != null && !mangaProgress.hasMore),
-      recommendExhausted:
-          recommendationPage?.recommendExhausted ?? feed.recommendExhausted,
-      hasMore:
-          items.isNotEmpty ||
-          (recommendationPage != null &&
-              recommendationPage.nextOffset != null) ||
-          manjuProgress.hasMore ||
-          mangaProgress.hasMore,
+    return _assembleAllSources(
+      recommendationFuture: _attempt(_loadNext(1, bookFeed)),
+      videoFuture: _attempt(_searchLoader('短剧', page: videoPage)),
+      manjuFuture: feed.manjuSearchExhausted
+          ? Future.value(const _Attempt<_AllManjuGroup>.value(_emptyManjuGroup))
+          : _attempt(_loadManjuSearch(offset: manjuOffset)),
+      mangaFuture: feed.mangaSearchExhausted
+          ? Future.value(const _Attempt<List<SearchTab>>.value([]))
+          : _attempt(_mangaSearchLoader(offset: mangaOffset)),
+      audioFuture: _attempt(_searchLoader('听书', page: audioPage)),
+      previous: feed,
     );
   }
 
@@ -755,6 +1169,24 @@ class HomeNotifier extends Notifier<HomeState> {
     }
     feed
       ..items = replace ? fresh : [...feed.items, ...fresh]
+      // 区块只在整页替换时跟着换：追加一页时上游给的是同一批块的续页，
+      // 把新块接在后面会让标题重复出现。
+      //
+      // 但「续播」路径（replace=false）不一样：它保的是 items 不清空，区块
+      // 本来就没有旧值可保——从落地缓存恢复时 feed.cells 是空的，若也跳过
+      // 赋值，首页就永远拿不到区块，只能退回旧网格。真机冷启动必命中落地
+      // 缓存，所以这条路径就是「真机上区块一个都不出现」的根因。
+      ..cells = (replace || feed.cells.isEmpty) ? fetched.cells : feed.cells
+      // 追加页的书拼进流区块（见 cellsForView）——续播路径的第一页例外：
+      // 它本来就是整页区块，只是 items 保留了缓存，别把首页书重复拼一遍。
+      ..appendedStreamItems.addAll(
+        (!replace &&
+                feed.cells.where((c) => c.showType == 384).isNotEmpty &&
+                feed.resumedVid == null)
+            ? fresh
+            : const <MediaItem>[],
+      )
+      ..tabs = fetched.tabs.isNotEmpty ? fetched.tabs : feed.tabs
       ..offset = fetched.nextOffset ?? feed.offset
       ..sessionId = fetched.sessionId ?? feed.sessionId
       ..searchPage = fetched.searchPage
@@ -776,6 +1208,11 @@ class HomeNotifier extends Notifier<HomeState> {
     }
   }
 
+  /// 搜索兜底的桶摘要，给日志用（`听书:0,综合:10`）。
+  static String _searchBuckets(List<SearchTab> tabs) => tabs.isEmpty
+      ? '-'
+      : tabs.map((tab) => '${tab.title}:${tab.items.length}').join(',');
+
   bool _isUnseen(_TabFeed feed, MediaItem item) =>
       item.id.isNotEmpty && !feed.seen.contains('${item.kind}:${item.id}');
 
@@ -790,11 +1227,45 @@ class HomeNotifier extends Notifier<HomeState> {
           tab.title.isNotEmpty &&
           (tab.title.contains(label) || label.contains(tab.title)),
     );
-    final selected = matching.isEmpty ? searchTabs : matching;
+    // 搜索结果是按「哪一条 tab」分桶的，而桶名就是分类身份。点名了本分类就
+    // 只认那一条；一条都没点名时只能借**没有分类身份**的桶，而且只有书类
+    // （小说/推荐）可以借「综合」这种混合桶——它装的就是一般小说。
+    //
+    // 之前「没点名就借所有桶」正是分类页冒出别人的内容的渠道：搜索第 2 页
+    // 起只回综合/听书等固定几条，听书那条是空的，于是综合桶里的推荐/小说
+    // 卡片被当成了听书的内容（再经 `_forceKind` 重标成听书）。
+    final selected = matching.isNotEmpty
+        ? matching
+        : searchTabs
+              .where((tab) {
+                final namespace = _searchTabKind(tab.title);
+                // 没点名分类的混合桶（综合…）只给书籍类：它装的就是一般小说。
+                // 同一条内容轴上的桶可以互借（小说 ← 书籍），别的轴不借。
+                return namespace == null ? kind == 'book' : namespace == kind;
+              })
+              .take(1);
     return selected
         .expand((tab) => tab.items)
         .where((item) => item.kind == kind)
         .toList(growable: false);
+  }
+
+  /// 搜索桶（tab）名字点名的分类。`null` = 混合桶（综合、搜索、无标题…）。
+  static String? _searchTabKind(String title) {
+    if (title.isEmpty) return null;
+    for (final entry in const {
+      '有声': 'audio',
+      '听书': 'audio',
+      '短剧': 'video',
+      '看剧': 'video',
+      '漫剧': 'manju',
+      '漫画': 'manga',
+      '书籍': 'book',
+      '小说': 'book',
+    }.entries) {
+      if (title.contains(entry.key)) return entry.value;
+    }
+    return null;
   }
 
   // Note: 首页漫画与漫剧都保留 v1 搜索游标，重复页不等于结束；见
@@ -833,8 +1304,14 @@ class HomeNotifier extends Notifier<HomeState> {
   List<MediaItem> _forceKind(List<MediaItem> items, String kind) {
     // copyWith rather than a hand-written rebuild: rebuilding by hand dropped
     // the cover badge (and would drop any future field) on every home tab.
+    //
+    // 书类分类（推荐/小说/经典…）只看书：上游的小说流里混着短剧、漫画和
+    // 听书卡，过去这里把它们统统改标成「小说」再画出来，首页因此以混排为主。
+    // 现在以书为主，别的媒介留在自己的分类，这里直接滤掉；过滤必须发生在
+    // 重标之前，否则卡片一旦被改成 book，页面就再也分不出来了。
     return items
         .where((item) => item.kind != 'manju' || kind == 'manju')
+        .where((item) => kind != 'book' || item.kind == 'book')
         .map((item) => item.copyWith(kind: kind))
         .toList(growable: false);
   }
@@ -857,7 +1334,11 @@ class HomeNotifier extends Notifier<HomeState> {
 }
 
 final homeProvider = NotifierProvider<HomeNotifier, HomeState>(
-  HomeNotifier.new,
+  // 2026-10-24 用户决定：首页顶栏回到本地六分类（推荐/小说/短剧/漫剧/
+  // 漫画/听书），不用服务端下发的 11 项——服务端表里没有「短剧/漫剧」，
+  // 过滤不出这套组合，所以身份口径整条走本地表（同 dramaProvider 的
+  // usesLocalTabs 机制）。
+  () => HomeNotifier(usesLocalTabs: true),
 );
 
 // Note: 底部导航的短剧目的地用第二个 HomeNotifier 实例而不是复用 homeProvider，
@@ -873,5 +1354,5 @@ final dramaTabIndex = HomeNotifier.tabs.indexOf('短剧');
 /// [homeProvider]: two tabs watching one provider would move together, so
 /// switching the home page to 听书 would replace the 短剧 tab's feed as well.
 final dramaProvider = NotifierProvider<HomeNotifier, HomeState>(
-  () => HomeNotifier(initialTabIndex: dramaTabIndex),
+  () => HomeNotifier(initialTabIndex: dramaTabIndex, usesLocalTabs: true),
 );

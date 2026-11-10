@@ -2,15 +2,19 @@ import 'dart:async';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:fqapp/models/audio_extra.dart';
 import 'package:fqapp/models/chapter_media.dart';
 import 'package:fqapp/models/media_item.dart';
 import 'package:fqapp/pages/audio_page.dart';
+import 'package:fqapp/pages/reader_page.dart';
 import 'package:fqapp/services/audio_preferences.dart';
 import 'package:fqapp/services/listening_session.dart';
 import 'package:fqapp/services/native_player.dart';
+import 'package:fqapp/services/reader_device.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'support/controlled_player.dart';
+import 'support/fakes.dart';
 
 void main() {
   setUp(() {
@@ -18,6 +22,33 @@ void main() {
     AudioPreferences.instance.resetForTest();
     ListeningSession.instance.clear();
   });
+
+  testWidgets(
+    'reader capsule controls the retained audio session and yields to menus',
+    (tester) async {
+      final app = await _mount(tester);
+      app.open();
+      await _flush(tester);
+      final player = app.players.single;
+      app.navigator.currentState!.pop();
+      await _flush(tester);
+      app.openReader();
+      await _flush(tester);
+      final pill = find.byKey(const ValueKey('reader_player_pill'));
+      expect(pill, findsOneWidget);
+      await tester.tap(pill);
+      await _flush(tester);
+      expect(player.isPlaying, isFalse);
+      expect(find.text('继续播放'), findsOneWidget);
+      await tester.tap(pill);
+      await _flush(tester);
+      expect(player.isPlaying, isTrue);
+      final surface = find.byKey(const ValueKey('reader-page-surface'));
+      await tester.tapAt(tester.getCenter(surface));
+      await _flush(tester);
+      expect(pill, findsNothing);
+    },
+  );
 
   testWidgets(
     'popping the audio page preserves playback and reopening reuses it',
@@ -34,21 +65,13 @@ void main() {
       expect(player.disposed, isFalse);
       expect(player.isPlaying, isTrue);
       expect(ListeningSession.instance.playing, isTrue);
-      expect(find.byKey(const ValueKey('audio-mini-open')), findsOneWidget);
+      // 官方没有迷你播放条：离开听书页后只保活，不另挂控制条。
+      expect(find.byKey(const ValueKey('audio-mini-open')), findsNothing);
 
-      await tester.tap(find.byKey(const ValueKey('audio-mini-open')));
+      app.open();
       await _flush(tester);
       expect(app.players, hasLength(1));
       expect(player.position, const Duration(seconds: 37));
-      expect(find.byKey(const ValueKey('audio-mini-open')), findsNothing);
-
-      app.navigator.currentState!.pop();
-      await _flush(tester);
-      await tester.tap(find.byKey(const ValueKey('audio-mini-close')));
-      await _flush(tester);
-      expect(player.disposed, isTrue);
-      expect(ListeningSession.instance.bookId, isNull);
-      expect(find.byKey(const ValueKey('audio-mini-open')), findsNothing);
     },
   );
 
@@ -102,11 +125,8 @@ void main() {
         ),
       );
       await _flush(tester);
+      // 换路由不影响播放；迷你栏已移除，这里只验证播放状态本身。
       expect(app.players.last.isPlaying, isTrue);
-      expect(find.byKey(const ValueKey('audio-mini-toggle')), findsOneWidget);
-      await tester.tap(find.byKey(const ValueKey('audio-mini-toggle')));
-      await _flush(tester);
-      expect(app.players.last.isPlaying, isFalse);
     },
   );
 
@@ -129,7 +149,41 @@ void main() {
       await video.dispose();
     },
   );
+
+  testWidgets('a manual page turn keeps playback running', (tester) async {
+    final app = await _mount(tester);
+    app.open();
+    await _flush(tester);
+    final player = app.players.single;
+    expect(player.isPlaying, isTrue);
+
+    app.navigator.currentState!.pop();
+    await _flush(tester);
+    // 这一章撑到多页，右侧点按才真的换页而不是换章。
+    app.openReader(text: _multiPageChapter);
+    await _flush(tester);
+    expect(ListeningSession.instance.playing, isTrue);
+
+    final rect = tester.getRect(
+      find.byKey(const ValueKey('reader-page-surface')),
+    );
+    await tester.tapAt(Offset(rect.right - 16, rect.center.dy));
+    await _flush(tester);
+
+    // 用户偏好覆盖官方 handlePlayWhenPageChange 的 pausePlayer()：同章翻页
+    // 只退出跟随、亮出同步胶囊，播放继续 —— 边翻边听不打断。
+    expect(player.isPlaying, isTrue, reason: '手动翻页不打断播放');
+    expect(ListeningSession.instance.playing, isTrue);
+    expect(ListeningSession.instance.followArmed, isFalse, reason: '翻页退出跟随');
+    expect(find.byKey(const ValueKey('reader_sync_pill')), findsOneWidget);
+  });
 }
+
+/// 多页正文：每段都足够长，430×932 的阅读页至少排出两页。
+final String _multiPageChapter = List.generate(
+  40,
+  (i) => '第${i + 1}段，山风从窗边吹进来，把桌上的纸页翻得沙沙作响。',
+).join('\n');
 
 Future<_Harness> _mount(WidgetTester tester) async {
   final app = _Harness();
@@ -172,6 +226,34 @@ class _Harness {
   final players = <ControlledNativePlayer>[];
   Completer<AudioSource>? sourceGate;
 
+  /// 打开同一本书的阅读页：迷你栏留在原地，阅读页在 initState 里注册
+  /// 「跳到播放位置」。
+  void openReader({
+    String bookId = 'book',
+    String text = '第一段。\n第二段。',
+  }) {
+    unawaited(
+      navigator.currentState!.push<void>(
+        MaterialPageRoute(
+          builder: (_) => ReaderPage(
+            bookId: bookId,
+            title: bookId,
+            chapters: [
+              for (var i = 1; i <= 2; i++)
+                Chapter(itemId: '$bookId-$i', title: '第 $i 章', volumeName: ''),
+            ],
+            startIndex: 0,
+            localOnly: true,
+            readerStore: store,
+            chapterCache: MemoryChapterCache(),
+            chapterLoader: (_) async => text,
+            readerDevice: _NullDevice(),
+          ),
+        ),
+      ),
+    );
+  }
+
   void open({
     String bookId = 'book',
     int startIndex = 0,
@@ -198,6 +280,11 @@ class _Harness {
                     toneId: toneId ?? '0',
                   ),
             voicesLoader: () async => const [],
+            // The reader only shows the play/pause capsule while the spoken
+            // sentence is on screen; give this session a cue that exists in
+            // the reader's text.
+            subtitleLoader: (id, toneId) async =>
+                SubtitleTrack([SubtitleCue(startMs: 0, text: '第一段。')]),
             playerFactory: () {
               final player = ControlledNativePlayer();
               players.add(player);
@@ -208,4 +295,22 @@ class _Harness {
       ),
     );
   }
+}
+
+class _NullDevice extends ReaderDevice {
+  @override
+  Stream<ReaderDeviceStatus> get changes => const Stream.empty();
+  @override
+  Future<ReaderDeviceStatus?> start({
+    required bool followSystem,
+    required double brightness,
+  }) async => ReaderDeviceStatus(
+    time: DateTime(2026, 9, 10, 21, 16),
+    battery: 64,
+    systemBrightness: .45,
+  );
+  @override
+  Future<void> suspend() async {}
+  @override
+  Future<void> close() async {}
 }

@@ -1,6 +1,18 @@
-import 'package:flutter/material.dart';
+// Restyled with the shared Wenku8_Flutter (revision ebcd7f1) glass controls.
+// Upstream has no tap-zone editor, so this is not counted as a ported upstream
+// screen: the 3x3 editor, presets and action picker keep fqapp's own behaviour,
+// geometry and result contract, while the header uses `GlassIconButton`, the
+// presets use `GlassTextButton`, cells use `JellyTapSurface` and the confirm
+// action uses the same glass button.
 
+import 'package:flutter/cupertino.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter_lucide/flutter_lucide.dart';
+
+import '../../services/reader_preferences.dart';
 import '../../services/reader_tap_zones.dart';
+import '../wenku/wenku_ui.dart';
+import 'reader_theme.dart';
 
 /// 点击区域设置编辑器：全屏半透明弹窗里的 3x3 九宫格，布局参考 Legado 的
 /// “点击区域设置”（每格显示当前动作，点格换动作），实现为 fqapp 自己的代码。
@@ -9,21 +21,38 @@ import '../../services/reader_tap_zones.dart';
 Future<List<ReaderTapZoneAction>?> showReaderTapZoneEditor({
   required BuildContext context,
   required List<ReaderTapZoneAction> initialZones,
+  ReaderThemePreset preset = ReaderThemePreset.light,
 }) {
   return showDialog<List<ReaderTapZoneAction>>(
     context: context,
     barrierColor: Colors.black54,
     barrierDismissible: true,
-    builder: (context) => _ReaderTapZoneEditor(
-      initialZones: initialZones,
-    ),
+    builder: (context) {
+      final editor = _ReaderTapZoneEditor(
+        initialZones: initialZones,
+        preset: preset,
+      );
+      // 墨水屏：弹窗在独立路由里，必须自己声明轻量作用域，否则面板里的
+      // 玻璃按钮仍会走实时折射并留残影。
+      return preset.isEink
+          ? PerformanceScope(
+              preferences: const PerformancePreferences(enabled: true),
+              explicitReduceMotion: true,
+              child: editor,
+            )
+          : editor;
+    },
   );
 }
 
 class _ReaderTapZoneEditor extends StatefulWidget {
-  const _ReaderTapZoneEditor({required this.initialZones});
+  const _ReaderTapZoneEditor({
+    required this.initialZones,
+    required this.preset,
+  });
 
   final List<ReaderTapZoneAction> initialZones;
+  final ReaderThemePreset preset;
 
   @override
   State<_ReaderTapZoneEditor> createState() => _ReaderTapZoneEditorState();
@@ -35,25 +64,27 @@ class _ReaderTapZoneEditorState extends State<_ReaderTapZoneEditor> {
   );
 
   Future<void> _pickAction(int index) async {
+    final preset = widget.preset;
     final selected = await showModalBottomSheet<ReaderTapZoneAction>(
       context: context,
-      builder: (context) => SafeArea(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            const ListTile(
-              title: Text('选择动作'),
-              enabled: false,
-            ),
-            for (final action in ReaderTapZoneAction.values)
-              ListTile(
-                title: Text(action.label),
-                trailing: action == _zones[index]
-                    ? const Icon(Icons.check)
-                    : null,
-                onTap: () => Navigator.pop(context, action),
-              ),
-          ],
+      backgroundColor: preset.panelColor,
+      builder: (context) => Theme(
+        data: preset.theme(Theme.of(context)),
+        child: SafeArea(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const ListTile(title: Text('选择动作'), enabled: false),
+              for (final action in ReaderTapZoneAction.values)
+                ListTile(
+                  title: Text(action.label),
+                  trailing: action == _zones[index]
+                      ? Icon(LucideIcons.check, color: preset.accentColor)
+                      : null,
+                  onTap: () => Navigator.pop(context, action),
+                ),
+            ],
+          ),
         ),
       ),
     );
@@ -68,123 +99,140 @@ class _ReaderTapZoneEditorState extends State<_ReaderTapZoneEditor> {
 
   @override
   Widget build(BuildContext context) {
+    final preset = widget.preset;
     final hasMenu = _zones.contains(ReaderTapZoneAction.menu);
     return Dialog(
-      backgroundColor: Colors.transparent,
+      backgroundColor: preset.sheetColor,
       insetPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 48),
-      child: Column(
-        children: [
-          Row(
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+      child: Theme(
+        data: preset.theme(Theme.of(context)),
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(16, 12, 16, 16),
+          child: Column(
             children: [
-              const Expanded(
-                child: Text(
-                  '点击区域设置',
-                  style: TextStyle(
-                    color: Colors.white,
-                    fontSize: 20,
-                    fontWeight: FontWeight.w600,
-                  ),
-                ),
-              ),
-              IconButton(
-                tooltip: '关闭',
-                icon: const Icon(Icons.close, color: Colors.white),
-                onPressed: () => Navigator.pop(context),
-              ),
-            ],
-          ),
-          const SizedBox(height: 8),
-          Expanded(
-            child: Column(
-              children: [
-                for (var row = 0; row < 3; row++)
+              Row(
+                children: [
+                  const SizedBox(width: 4),
                   Expanded(
-                    child: Row(
-                      children: [
-                        for (var column = 0; column < 3; column++)
-                          Expanded(
-                            child: _ZoneCell(
-                              label: _zones[row * 3 + column].label,
-                              onTap: () => _pickAction(row * 3 + column),
-                            ),
-                          ),
-                      ],
+                    child: Text(
+                      '点击区域设置',
+                      style: TextStyle(
+                        color: preset.textColor,
+                        fontSize: 18,
+                        fontWeight: FontWeight.w600,
+                      ),
                     ),
                   ),
-              ],
-            ),
-          ),
-          const SizedBox(height: 12),
-          Row(
-            children: [
-              Expanded(
-                child: OutlinedButton(
-                  style: OutlinedButton.styleFrom(
-                    foregroundColor: Colors.white,
-                    side: const BorderSide(color: Colors.white54),
+                  GlassIconButton(
+                    icon: CupertinoIcons.xmark,
+                    label: '关闭',
+                    onPressed: () => Navigator.pop(context),
                   ),
-                  onPressed: () =>
-                      _applyPreset(defaultReaderTapZones),
-                  child: const Text('默认'),
+                ],
+              ),
+              const SizedBox(height: 8),
+              Expanded(
+                child: Column(
+                  children: [
+                    for (var row = 0; row < 3; row++)
+                      Expanded(
+                        child: Row(
+                          children: [
+                            for (var column = 0; column < 3; column++)
+                              Expanded(
+                                child: _ZoneCell(
+                                  label: _zones[row * 3 + column].label,
+                                  preset: preset,
+                                  onTap: () => _pickAction(row * 3 + column),
+                                ),
+                              ),
+                          ],
+                        ),
+                      ),
+                  ],
                 ),
               ),
-              const SizedBox(width: 12),
-              Expanded(
-                child: OutlinedButton(
-                  style: OutlinedButton.styleFrom(
-                    foregroundColor: Colors.white,
-                    side: const BorderSide(color: Colors.white54),
+              const SizedBox(height: 12),
+              _PresetButtons(onApplyPreset: _applyPreset),
+              const SizedBox(height: 8),
+              Text(
+                hasMenu ? '点九宫格换动作；至少保留一个菜单区域' : '没有菜单区域，完成时中间自动恢复为菜单',
+                style: TextStyle(color: preset.mutedTextColor, fontSize: 13),
+              ),
+              const SizedBox(height: 12),
+              SizedBox(
+                width: double.infinity,
+                child: GlassTextButton(
+                  onPressed: () => Navigator.pop(
+                    context,
+                    ensureReaderTapZonesHaveMenu(_zones),
                   ),
-                  onPressed: () =>
-                      _applyPreset(oneHandReaderTapZones),
-                  child: const Text('单手模式'),
+                  child: const Text('完成'),
                 ),
               ),
             ],
           ),
-          const SizedBox(height: 8),
-          Text(
-            hasMenu
-                ? '点九宫格换动作；至少保留一个菜单区域'
-                : '没有菜单区域，完成时中间自动恢复为菜单',
-            style: const TextStyle(color: Colors.white70, fontSize: 13),
-          ),
-          const SizedBox(height: 12),
-          SizedBox(
-            width: double.infinity,
-            child: FilledButton(
-              onPressed: () => Navigator.pop(
-                context,
-                ensureReaderTapZonesHaveMenu(_zones),
-              ),
-              child: const Text('完成'),
-            ),
-          ),
-        ],
+        ),
       ),
     );
   }
 }
 
-class _ZoneCell extends StatelessWidget {
-  const _ZoneCell({required this.label, required this.onTap});
+/// 预设按钮行：默认 / 单手模式 / 全屏翻页，一键套用整套九宫格。
+class _PresetButtons extends StatelessWidget {
+  const _PresetButtons({required this.onApplyPreset});
 
-  final String label;
-  final VoidCallback onTap;
+  final ValueChanged<List<ReaderTapZoneAction>> onApplyPreset;
+
+  Widget _button(String label, List<ReaderTapZoneAction> zones) {
+    return Expanded(
+      child: GlassTextButton(
+        compact: true,
+        onPressed: () => onApplyPreset(zones),
+        child: Text(label, style: const TextStyle(fontSize: 12)),
+      ),
+    );
+  }
 
   @override
   Widget build(BuildContext context) {
-    return GestureDetector(
+    return Row(
+      children: [
+        _button('默认', defaultReaderTapZones),
+        const SizedBox(width: 12),
+        _button('单手模式', oneHandReaderTapZones),
+        const SizedBox(width: 12),
+        _button('全屏翻页', fullscreenReaderTapZones),
+      ],
+    );
+  }
+}
+
+class _ZoneCell extends StatelessWidget {
+  const _ZoneCell({
+    required this.label,
+    required this.onTap,
+    required this.preset,
+  });
+
+  final String label;
+  final VoidCallback onTap;
+  final ReaderThemePreset preset;
+
+  @override
+  Widget build(BuildContext context) {
+    return JellyTapSurface(
       onTap: onTap,
       child: Container(
         alignment: Alignment.center,
         decoration: BoxDecoration(
-          color: Colors.white.withValues(alpha: 0.06),
-          border: Border.all(color: Colors.white24),
+          color: preset.fieldColor,
+          border: Border.all(color: preset.borderColor),
         ),
         child: Text(
           label,
-          style: const TextStyle(color: Colors.white, fontSize: 18),
+          style: TextStyle(color: preset.textColor, fontSize: 18),
         ),
       ),
     );

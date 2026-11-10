@@ -4,11 +4,15 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import 'package:fqapp/models/book_comment.dart';
 import 'package:fqapp/models/chapter_ideas.dart';
+import 'package:fqapp/models/comment_reply.dart';
 import 'package:fqapp/models/media_item.dart';
 import 'package:fqapp/pages/reader_page.dart';
+import 'package:fqapp/services/app_theme.dart';
 import 'package:fqapp/services/chapter_text_formatter.dart';
+import 'package:fqapp/services/eink_refresh.dart';
 import 'package:fqapp/services/reader_preferences.dart';
 import 'package:fqapp/widgets/reader/reader_ideas_sheet.dart';
+import 'package:fqapp/widgets/reader/reader_illustration.dart';
 
 import 'support/fakes.dart';
 
@@ -98,6 +102,7 @@ void main() {
     Future<void> pumpSheet(
       WidgetTester tester, {
       required Future<BookCommentPage> Function(ParagraphIdeas, String?) load,
+      Future<CommentReplyPage> Function(String commentId)? replyLoader,
     }) async {
       await tester.pumpWidget(
         MaterialApp(
@@ -106,12 +111,48 @@ void main() {
               ideas: _ideas(),
               preset: ReaderThemePreset.light,
               loadComments: load,
+              replyLoader: replyLoader,
             ),
           ),
         ),
       );
       await tester.pumpAndSettle();
     }
+
+    testWidgets('shows paragraph images and opens the zoomable viewer', (
+      tester,
+    ) async {
+      final page = parseParagraphComments({
+        'data': {
+          'data_list': [
+            {
+              'comment': {
+                'common': {
+                  'content': {
+                    'text': '带图评论',
+                    'image_data_list': {
+                      'image_data': [
+                        {'web_url': 'https://example.test/comment.jpg'},
+                      ],
+                    },
+                  },
+                },
+              },
+            },
+          ],
+        },
+      });
+      await pumpSheet(tester, load: (_, _) async => page);
+      expect(find.text('带图评论'), findsOneWidget);
+      expect(find.byType(ReaderIllustration), findsOneWidget);
+      await tester.tap(find.byType(ReaderIllustration));
+      await tester.pumpAndSettle();
+      expect(find.byType(InteractiveViewer), findsOneWidget);
+      await tester.tap(find.byTooltip('关闭插图'));
+      await tester.pumpAndSettle();
+      expect(find.text('带图评论'), findsOneWidget);
+      expect(tester.takeException(), isNull);
+    });
 
     testWidgets('shows the selected count above a direct comment list', (
       tester,
@@ -141,6 +182,7 @@ void main() {
                 text: '这段太真实了',
                 userName: '读者甲',
                 diggCount: 4,
+                replyCount: 2,
                 createdAt: DateTime(2024, 2, 29),
               ),
             ],
@@ -153,7 +195,7 @@ void main() {
       expect(find.text('这段太真实了'), findsOneWidget);
       expect(find.text('读者甲'), findsOneWidget);
       expect(find.text('4'), findsOneWidget);
-      expect(find.text('回复'), findsOneWidget);
+      expect(find.text('回复 2'), findsOneWidget);
       expect(find.text('2024-02-29'), findsOneWidget);
       // The date belongs below the body, aligned with the reply affordance.
       expect(
@@ -162,8 +204,183 @@ void main() {
       );
       expect(
         tester.getTopLeft(find.text('2024-02-29')).dy,
-        tester.getTopLeft(find.text('回复')).dy,
+        tester.getTopLeft(find.text('回复 2')).dy,
       );
+    });
+
+    testWidgets('点「回复 N」就地展开回复，再点收起（issue #95）', (tester) async {
+      var loads = 0;
+      final page = CommentReplyPage(
+        totalCount: 2,
+        replies: [
+          CommentReply(
+            id: 'r1',
+            text: '同感',
+            userName: '读者乙',
+            createdAt: DateTime(2024, 3, 1),
+          ),
+          CommentReply(
+            id: 'r2',
+            text: '我也这么想',
+            userName: '读者丙',
+            createdAt: DateTime(2024, 3, 2),
+          ),
+        ],
+      );
+      await pumpSheet(
+        tester,
+        load: (_, _) async => BookCommentPage(
+          comments: [
+            BookComment(
+              id: 'a1',
+              text: '这段太真实了',
+              userName: '读者甲',
+              replyCount: 2,
+              createdAt: DateTime(2024, 2, 29),
+            ),
+          ],
+        ),
+        replyLoader: (_) async {
+          loads++;
+          return page;
+        },
+      );
+
+      // 展开前：官方 b9g「展开%d条回复」，只有计数没有正文。
+      expect(find.text('展开 2 条回复'), findsOneWidget);
+      expect(find.text('同感'), findsNothing);
+
+      await tester.tap(find.text('展开 2 条回复'));
+      await tester.pumpAndSettle();
+      expect(loads, 1);
+      expect(find.textContaining('同感', findRichText: true), findsOneWidget);
+      expect(find.textContaining('我也这么想', findRichText: true), findsOneWidget);
+      // 展开后：官方 b9i「收起」。
+      expect(find.text('收起'), findsOneWidget);
+      expect(find.text('展开 2 条回复'), findsNothing);
+
+      // 再点收起，回到可展开态且不重复请求。
+      await tester.tap(find.text('收起'));
+      await tester.pumpAndSettle();
+      expect(loads, 1);
+      expect(find.text('展开 2 条回复'), findsOneWidget);
+      expect(find.textContaining('同感', findRichText: true), findsNothing);
+      expect(tester.takeException(), isNull);
+    });
+
+    testWidgets('没有 replyLoader 时回复计数只读，不出现可点控件', (tester) async {
+      await pumpSheet(
+        tester,
+        load: (_, _) async => BookCommentPage(
+          comments: [
+            BookComment(
+              id: 'a1',
+              text: '只读',
+              userName: '读者甲',
+              replyCount: 2,
+              createdAt: DateTime(2024, 2, 29),
+            ),
+          ],
+        ),
+      );
+      expect(find.text('回复 2'), findsOneWidget);
+      // 离线调用方拿不到只有失败可能的控件。
+      expect(find.byKey(const ValueKey('reader_reply_toggle_a1')), findsNothing);
+      expect(tester.takeException(), isNull);
+    });
+
+    testWidgets('无二级评论时不出现回复入口，也不显示暂无回复（issue #173）', (tester) async {
+      var loads = 0;
+      await pumpSheet(
+        tester,
+        load: (_, _) async => BookCommentPage(
+          comments: [
+            BookComment(
+              id: 'a1',
+              text: '没有回复的评论',
+              userName: '读者甲',
+              createdAt: DateTime(2024, 2, 29),
+            ),
+          ],
+        ),
+        replyLoader: (_) async {
+          loads++;
+          return CommentReplyPage.empty;
+        },
+      );
+
+      expect(find.text('没有回复的评论'), findsOneWidget);
+      expect(find.text('展开 0 条回复'), findsNothing);
+      expect(find.text('回复'), findsNothing);
+      expect(
+        find.byKey(const ValueKey('reader_reply_toggle_a1')),
+        findsNothing,
+      );
+      expect(find.text('暂无回复'), findsNothing);
+      // 没有可点的 0 回复入口，自然也没有发出请求。
+      expect(loads, 0);
+      expect(tester.takeException(), isNull);
+    });
+
+    testWidgets('展开的回复显示头像与配图（issue #179）', (tester) async {
+      await pumpSheet(
+        tester,
+        load: (_, _) async => BookCommentPage(
+          comments: [BookComment(id: 'a1', text: '这段太真实了', replyCount: 2)],
+        ),
+        replyLoader: (_) async => const CommentReplyPage(
+          replies: [
+            CommentReply(
+              id: 'r1',
+              text: '配图回复',
+              userName: '读者乙',
+              imageUrls: ['https://example.test/reply.jpg'],
+            ),
+            // 纯图回复：没有正文也要显示配图，且不多出空行。
+            CommentReply(
+              id: 'r2',
+              userName: '读者丙',
+              imageUrls: ['https://example.test/only.jpg'],
+            ),
+          ],
+          totalCount: 2,
+        ),
+      );
+      // 父评论本身无配图。
+      expect(find.byType(ReaderIllustration), findsNothing);
+
+      await tester.tap(find.byKey(const ValueKey('reader_reply_toggle_a1')));
+      await tester.pumpAndSettle();
+
+      expect(find.textContaining('配图回复', findRichText: true), findsOneWidget);
+      expect(find.byType(ReaderIllustration), findsNWidgets(2));
+      for (final id in ['r1', 'r2']) {
+        final avatar = find.byKey(ValueKey('reader_reply_avatar_$id'));
+        expect(avatar, findsOneWidget);
+        // 无头像地址时退回占位图标。
+        expect(
+          find.descendant(of: avatar, matching: find.byType(Icon)),
+          findsOneWidget,
+        );
+      }
+      // 名字要显示，且后面不能跟着空行。
+      expect(find.textContaining('读者丙', findRichText: true), findsOneWidget);
+      expect(find.textContaining('读者丙\n', findRichText: true), findsNothing);
+      expect(tester.takeException(), isNull);
+    });
+
+    testWidgets('评论正文里的表情令牌渲染成图片（issue #173）', (tester) async {
+      await pumpSheet(
+        tester,
+        load: (_, _) async => BookCommentPage(
+          comments: [BookComment(id: 'a1', text: '这段[微笑]太真实了')],
+        ),
+      );
+
+      expect(find.text('[微笑]'), findsNothing);
+      expect(find.text('这段[微笑]太真实了'), findsNothing);
+      expect(find.byType(Image), findsOneWidget);
+      expect(tester.takeException(), isNull);
     });
 
     testWidgets('opens on the tapped paragraph', (tester) async {
@@ -399,9 +616,6 @@ void main() {
     Future<void> openControls(WidgetTester tester) async {
       await tester.tapAt(const Offset(200, 400));
       await tester.pumpAndSettle();
-      // Secondary actions (缓存/排版) live inside 设置.
-      await tester.tap(find.byKey(const ValueKey('reader-settings')));
-      await tester.pumpAndSettle();
     }
 
     testWidgets('opens the sheet from the in-text bubble', (tester) async {
@@ -436,13 +650,39 @@ void main() {
       expect(find.byType(ReaderPage), findsOneWidget);
     });
 
+    testWidgets('closing the sheet in e-ink mode does not blank the page',
+        (tester) async {
+      // #172: on devices without the vendor EPD channel the sheet-close
+      // refresh used to fall back to the software white flash, blanking the
+      // body behind the closing sheet. E-ink sheet close must never flash.
+      einkModeNotifier.value = true;
+      addTearDown(() => einkModeNotifier.value = false);
+      final flash = EinkRefreshService.instance.flashRequest;
+      final before = flash.value;
+      await pumpReader(
+        tester,
+        ideasLoader: (_) async => _ideas(),
+        commentResolver: (_, _, _) async => const BookCommentPage(),
+      );
+      await tester.tap(find.text('12'));
+      await tester.pumpAndSettle();
+      expect(find.text('12条评论'), findsOneWidget);
+      await tester.tap(find.byKey(const Key('reader-ideas-close')));
+      await tester.pumpAndSettle();
+      expect(find.byType(ReaderIdeasSheet), findsNothing);
+      expect(flash.value, before);
+    });
+
     testWidgets('the control menu has no ideas entry any more', (tester) async {
       await pumpReader(tester, ideasLoader: (_) async => ChapterIdeas.empty);
       await openControls(tester);
-      // Bubbles replaced the menu row; the four primary actions remain.
+      // Bubbles replaced the menu row; the primary actions remain.
       expect(find.text('段评'), findsNothing);
       expect(find.text('目录'), findsOneWidget);
-      expect(find.text('缓存'), findsOneWidget);
+      // 缓存挪进了顶栏「更多阅读操作」菜单。
+      await tester.tap(find.byKey(const ValueKey('reader-header-more')));
+      await tester.pumpAndSettle();
+      expect(find.byKey(const ValueKey('reader-cache')), findsOneWidget);
     });
 
     testWidgets('a failed idea load leaves the reader usable', (tester) async {
@@ -453,9 +693,11 @@ void main() {
       await openControls(tester);
       expect(find.text('段评'), findsNothing);
       expect(tester.takeException(), isNull);
-      // The four primary actions stay available.
+      // The primary actions stay available.
       expect(find.text('目录'), findsOneWidget);
-      expect(find.text('缓存'), findsOneWidget);
+      await tester.tap(find.byKey(const ValueKey('reader-header-more')));
+      await tester.pumpAndSettle();
+      expect(find.byKey(const ValueKey('reader-cache')), findsOneWidget);
     });
 
     testWidgets('refetches ideas for the next chapter', (tester) async {

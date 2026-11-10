@@ -1,147 +1,191 @@
+// Ported from Wenku8_Flutter@ebcd7f1, lib/pages.dart:_readerBottomControls /
+// _readerAction and lib/reader_chrome.dart. Six reader actions and an optional
+// AI action use the upstream dock; progress scrubs within the current chapter.
+// fqapp's listening/video controls remain separate, above this dock.
+import 'package:flutter/cupertino.dart';
 import 'package:flutter/material.dart';
-import 'package:flutter_lucide/flutter_lucide.dart';
 
 import '../../services/reader_preferences.dart';
+import '../wenku/wenku_ui.dart';
+import 'reader_chapter_progress.dart';
+import 'reader_chrome.dart';
 import 'reader_theme.dart';
 
-/// Official-shape reading menu. Local-only books omit online listening and
-/// chapter-cache actions; brightness, seek and secondary actions stay concise.
-class ReaderControls extends StatefulWidget {
-  final ReaderPreferences preferences;
-  final int chapterIndex;
-  final int chapterCount;
-  final String chapterTitle;
-  final double seekValue;
-  final bool deviceAvailable;
-  final double? systemBrightness;
-  final VoidCallback? onPrevious;
-  final VoidCallback? onNext;
-  final ValueChanged<double> onSeek;
-  final ValueChanged<double> onSeekEnd;
-  final ValueChanged<double> onBrightness;
-  final VoidCallback onBrightnessEnd;
-  final VoidCallback onFollowSystem;
-  final VoidCallback onDirectory;
-  final VoidCallback onNight;
-  final VoidCallback onAppearance;
-  final VoidCallback onCache;
-
-  /// 听书: opens the listening page for this book.
-  final VoidCallback onListen;
-  final bool showListening;
-  final bool showCache;
-
-  final bool autoTurnActive;
-  final VoidCallback onAutoTurn;
-
+class ReaderControls extends StatelessWidget {
   const ReaderControls({
     super.key,
     required this.preferences,
     required this.chapterIndex,
-    required this.chapterCount,
     required this.chapterTitle,
-    required this.seekValue,
-    required this.deviceAvailable,
-    required this.systemBrightness,
+    required this.fraction,
+    required this.animation,
+    required this.previewing,
     required this.onPrevious,
     required this.onNext,
-    required this.onSeek,
-    required this.onSeekEnd,
-    required this.onBrightness,
-    required this.onBrightnessEnd,
-    required this.onFollowSystem,
+    required this.onPreview,
+    required this.onCommitted,
+    required this.onPreviewChanged,
     required this.onDirectory,
-    required this.onNight,
+    required this.onBookmarks,
     required this.onAppearance,
-    required this.onCache,
-    required this.onListen,
-    this.showListening = true,
-    this.showCache = true,
-    this.autoTurnActive = false,
-    required this.onAutoTurn,
+    required this.onOperations,
+    required this.onFind,
+    required this.onNight,
+    this.onAi,
+    this.aiLabel = 'AI 校对',
   });
 
-  @override
-  State<ReaderControls> createState() => _ReaderControlsState();
-}
-
-class _ReaderControlsState extends State<ReaderControls> {
-  bool _settingsOpen = false;
+  final ReaderPreferences preferences;
+  final int chapterIndex;
+  final String chapterTitle;
+  final double? fraction;
+  final Animation<double> animation;
+  final bool previewing;
+  final VoidCallback? onPrevious;
+  final VoidCallback? onNext;
+  final ValueChanged<double> onPreview;
+  final ValueChanged<double> onCommitted;
+  final ValueChanged<bool> onPreviewChanged;
+  final VoidCallback onDirectory;
+  final VoidCallback onBookmarks;
+  final VoidCallback onAppearance;
+  final VoidCallback onOperations;
+  final VoidCallback? onFind;
+  final VoidCallback onNight;
+  final VoidCallback? onAi;
+  final String aiLabel;
 
   @override
   Widget build(BuildContext context) {
-    final preset = widget.preferences.themePreset;
-    final level = widget.preferences.followSystemBrightness
-        ? widget.systemBrightness ?? widget.preferences.brightness
-        : widget.preferences.brightness;
+    final preset = preferences.themePreset;
+    final dockAnimation = animation.drive(
+      CurveTween(curve: const Interval(0, .90)),
+    );
+    final progressAnimation = animation.drive(
+      CurveTween(curve: const Interval(.10, 1)),
+    );
     return Theme(
       data: preset.theme(Theme.of(context)),
-      child: Material(
-        color: preset.panelColor,
-        elevation: 16,
-        shadowColor: Colors.black38,
-        borderRadius: const BorderRadius.vertical(top: Radius.circular(22)),
-        clipBehavior: Clip.antiAlias,
-        child: Container(
-          decoration: BoxDecoration(
-            border: Border(
-              top: BorderSide(
-                color: preset.isDark
-                    ? Colors.white.withValues(alpha: 0.08)
-                    : Colors.black.withValues(alpha: 0.06),
-                width: 0.8,
-              ),
-            ),
-          ),
+      child: Align(
+        alignment: Alignment.bottomCenter,
+        child: SafeArea(
+          top: false,
+          minimum: const EdgeInsets.only(bottom: 6),
           child: ConstrainedBox(
-            constraints: BoxConstraints(
-              maxHeight: MediaQuery.sizeOf(context).height * 0.62,
-            ),
-            child: SingleChildScrollView(
-              child: SafeArea(
-                top: false,
-                minimum: const EdgeInsets.fromLTRB(10, 10, 10, 8),
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    if (_settingsOpen) ...[
-                      _chapterSeek(preset),
-                      if (widget.deviceAvailable) _brightness(preset, level),
-                      _extraActions(preset),
-                      const SizedBox(height: 6),
-                    ],
-                    Row(
-                      children: [
-                        _Action(
-                          icon: LucideIcons.book_open,
-                          label: '目录',
-                          onTap: widget.onDirectory,
-                        ),
-                        _Action(
-                          icon: preset.isDark
-                              ? LucideIcons.sun
-                              : LucideIcons.moon,
-                          label: preset.isDark ? '日间' : '夜间',
-                          onTap: widget.onNight,
-                        ),
-                        if (widget.showListening)
-                          _Action(
-                            icon: LucideIcons.headphones,
-                            label: '听书',
-                            onTap: widget.onListen,
-                          ),
-                        _Action(
-                          key: const ValueKey('reader-settings'),
-                          icon: LucideIcons.sliders_horizontal,
-                          label: '设置',
-                          selected: _settingsOpen,
-                          onTap: () =>
-                              setState(() => _settingsOpen = !_settingsOpen),
-                        ),
-                      ],
+            constraints: const BoxConstraints(maxWidth: 620),
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(12, 0, 12, 6),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  ReaderChromeLayer(
+                    animation: progressAnimation,
+                    interactionThreshold: 0,
+                    maintainSize: true,
+                    slide: const Offset(0, 1.28),
+                    curve: WenkuMotion.settle,
+                    scaleFrom: .90,
+                    clip: false,
+                    child: ConstrainedBox(
+                      constraints: BoxConstraints(
+                        maxWidth: DockLayout.widthFor(5) - 32,
+                      ),
+                      child: ReaderChapterProgress(
+                        key: ValueKey((
+                          'reader-chapter-progress',
+                          chapterIndex,
+                        )),
+                        preset: preset,
+                        fraction: fraction,
+                        chapterLabel: chapterTitle,
+                        onPreview: onPreview,
+                        onCommitted: onCommitted,
+                        onPreviewChanged: onPreviewChanged,
+                        onPrevious: onPrevious,
+                        onNext: onNext,
+                      ),
                     ),
-                  ],
-                ),
+                  ),
+                  const SizedBox(height: 10),
+                  Visibility(
+                    visible: !previewing,
+                    maintainSize: true,
+                    maintainAnimation: true,
+                    maintainState: true,
+                    child: ReaderChromeLayer(
+                      animation: dockAnimation,
+                      interactionThreshold: 0,
+                      maintainSize: true,
+                      slide: const Offset(0, 1),
+                      curve: WenkuMotion.settle,
+                      scaleFrom: .96,
+                      clip: false,
+                      child: ConstrainedBox(
+                        constraints: BoxConstraints(
+                          maxWidth: DockLayout.widthFor(onAi == null ? 6 : 7),
+                        ),
+                        child: LiquidGlass(
+                          key: const ValueKey('reader-liquid-dock'),
+                          radius: DockLayout.heightOf(context) / 2,
+                          thickness: 16,
+                          tintColor: preset.panelColor,
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: DockLayout.horizontalInset,
+                          ),
+                          child: Row(
+                            children: [
+                              _DockAction(
+                                key: const ValueKey('reader-catalogue-entry'),
+                                icon: CupertinoIcons.list_bullet,
+                                label: '目录',
+                                onPressed: onDirectory,
+                              ),
+                              _DockAction(
+                                key: const ValueKey('reader-bookmarks-entry'),
+                                icon: CupertinoIcons.bookmark,
+                                label: '书签',
+                                onPressed: onBookmarks,
+                              ),
+                              _DockAction(
+                                key: const ValueKey('reader-settings'),
+                                icon: CupertinoIcons.textformat,
+                                label: '外观',
+                                onPressed: onAppearance,
+                              ),
+                              _DockAction(
+                                key: const ValueKey('reader-operations-entry'),
+                                icon: CupertinoIcons.slider_horizontal_3,
+                                label: '操作',
+                                onPressed: onOperations,
+                              ),
+                              _DockAction(
+                                key: const ValueKey('reader-find-entry'),
+                                icon: CupertinoIcons.search,
+                                label: '查找',
+                                onPressed: onFind,
+                              ),
+                              if (onAi != null)
+                                _DockAction(
+                                  key: const ValueKey('reader-ai'),
+                                  icon: CupertinoIcons.sparkles,
+                                  label: aiLabel,
+                                  onPressed: onAi,
+                                ),
+                              _DockAction(
+                                key: const ValueKey('reader-night-entry'),
+                                icon: preset.isDark
+                                    ? CupertinoIcons.sun_max
+                                    : CupertinoIcons.moon,
+                                label: preset.isDark ? '日间' : '夜读',
+                                onPressed: onNight,
+                              ),
+                            ],
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                ],
               ),
             ),
           ),
@@ -149,200 +193,81 @@ class _ReaderControlsState extends State<ReaderControls> {
       ),
     );
   }
-
-  Widget _chapterSeek(ReaderThemePreset preset) {
-    final max = (widget.chapterCount - 1).toDouble();
-    final upper = max < 0 ? 0.0 : max;
-    return Padding(
-      padding: const EdgeInsets.fromLTRB(8, 4, 8, 0),
-      child: Column(
-        children: [
-          Row(
-            children: [
-              Expanded(
-                child: Text(
-                  widget.chapterTitle,
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: TextStyle(color: preset.textColor, fontSize: 13),
-                ),
-              ),
-              const SizedBox(width: 8),
-              Text(
-                '${widget.chapterIndex + 1} / ${widget.chapterCount}',
-                style: TextStyle(color: preset.mutedTextColor, fontSize: 12),
-              ),
-            ],
-          ),
-          Row(
-            children: [
-              IconButton(
-                tooltip: '上一章',
-                onPressed: widget.onPrevious,
-                icon: const Icon(LucideIcons.skip_back, size: 20),
-              ),
-              Expanded(
-                child: Slider(
-                  key: const ValueKey('reader-chapter-seek'),
-                  min: 0,
-                  max: upper,
-                  value: widget.seekValue.clamp(0, upper),
-                  onChanged: widget.chapterCount > 1 ? widget.onSeek : null,
-                  onChangeEnd: widget.chapterCount > 1
-                      ? widget.onSeekEnd
-                      : null,
-                  semanticFormatterCallback: (value) =>
-                      '第 ${value.round() + 1} 章',
-                ),
-              ),
-              IconButton(
-                tooltip: '下一章',
-                onPressed: widget.onNext,
-                icon: const Icon(LucideIcons.skip_forward, size: 20),
-              ),
-            ],
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _brightness(ReaderThemePreset preset, double level) {
-    return Padding(
-      padding: const EdgeInsets.fromLTRB(4, 0, 4, 4),
-      child: Row(
-        children: [
-          Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 12),
-            child: Icon(
-              LucideIcons.sun_medium,
-              size: 20,
-              color: preset.mutedTextColor,
-            ),
-          ),
-          Expanded(
-            child: Slider(
-              key: const ValueKey('reader-brightness'),
-              value: level.clamp(0.02, 1),
-              min: 0.02,
-              max: 1,
-              onChanged: widget.onBrightness,
-              onChangeEnd: (_) => widget.onBrightnessEnd(),
-              semanticFormatterCallback: (value) =>
-                  '亮度 ${(value * 100).round()}%',
-            ),
-          ),
-          Semantics(
-            toggled: widget.preferences.followSystemBrightness,
-            child: TextButton(
-              key: const ValueKey('reader-follow-system'),
-              style: TextButton.styleFrom(
-                foregroundColor: widget.preferences.followSystemBrightness
-                    ? preset.accentColor
-                    : preset.mutedTextColor,
-                backgroundColor: widget.preferences.followSystemBrightness
-                    ? preset.accentColor.withValues(alpha: 0.09)
-                    : null,
-                padding: const EdgeInsets.symmetric(horizontal: 10),
-              ),
-              onPressed: widget.onFollowSystem,
-              child: const Text('跟随系统', style: TextStyle(fontSize: 12)),
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _extraActions(ReaderThemePreset preset) {
-    return Padding(
-      padding: const EdgeInsets.fromLTRB(4, 0, 4, 4),
-      child: Column(
-        children: [
-          Row(
-            children: [
-              Expanded(
-                child: TextButton.icon(
-                  key: const ValueKey('reader-auto-turn'),
-                  style: TextButton.styleFrom(
-                    foregroundColor: widget.autoTurnActive
-                        ? preset.accentColor
-                        : preset.textColor,
-                  ),
-                  onPressed: widget.onAutoTurn,
-                  icon: Icon(
-                    widget.autoTurnActive
-                        ? LucideIcons.circle_pause
-                        : LucideIcons.circle_play,
-                    size: 18,
-                  ),
-                  label: Text(
-                    widget.autoTurnActive ? '停止自动翻页' : '自动翻页',
-                    style: const TextStyle(fontSize: 13),
-                  ),
-                ),
-              ),
-            ],
-          ),
-          Row(
-            children: [
-              if (widget.showCache)
-                _Action(
-                  icon: LucideIcons.download,
-                  label: '缓存',
-                  onTap: widget.onCache,
-                ),
-              _Action(
-                icon: LucideIcons.type,
-                label: '排版',
-                onTap: widget.onAppearance,
-              ),
-            ],
-          ),
-        ],
-      ),
-    );
-  }
 }
 
-class _Action extends StatelessWidget {
-  final IconData icon;
-  final String label;
-  final VoidCallback onTap;
-  final bool selected;
-
-  const _Action({
+class _DockAction extends StatelessWidget {
+  const _DockAction({
     super.key,
     required this.icon,
     required this.label,
-    required this.onTap,
-    this.selected = false,
+    required this.onPressed,
   });
 
+  final IconData icon;
+  final String label;
+  final VoidCallback? onPressed;
+
   @override
-  Widget build(BuildContext context) {
-    final color = selected
-        ? Theme.of(context).colorScheme.primary
-        : Theme.of(context).colorScheme.onSurface;
-    return Expanded(
-      child: TextButton(
-        style: TextButton.styleFrom(
-          foregroundColor: color,
-          padding: const EdgeInsets.symmetric(horizontal: 2, vertical: 8),
-          shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(14),
+  Widget build(BuildContext context) => Expanded(
+    child: Semantics(
+      button: true,
+      enabled: onPressed != null,
+      label: label,
+      child: JellyTapSurface(
+        onTap: onPressed,
+        child: SizedBox(
+          height: DockLayout.heightOf(context),
+          child: Center(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                ArchiveIcon(
+                  icon,
+                  size: DockLayout.iconSize,
+                  color: onPressed == null
+                      ? Theme.of(context).disabledColor
+                      : null,
+                ),
+                const SizedBox(height: DockLayout.labelGap),
+                Flexible(
+                  child: FittedBox(
+                    fit: BoxFit.scaleDown,
+                    child: Text(
+                      label,
+                      maxLines: 1,
+                      style: TextStyle(
+                        fontSize: DockLayout.labelFontSize,
+                        color: onPressed == null
+                            ? Theme.of(context).disabledColor
+                            : null,
+                      ),
+                    ),
+                  ),
+                ),
+              ],
+            ),
           ),
         ),
-        onPressed: onTap,
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Icon(icon, size: 22),
-            const SizedBox(height: 4),
-            Text(label, style: const TextStyle(fontSize: 11)),
-          ],
-        ),
       ),
-    );
-  }
+    ),
+  );
+}
+
+class ReaderCacheButton extends StatelessWidget {
+  const ReaderCacheButton({
+    super.key,
+    required this.preset,
+    required this.onTap,
+  });
+  final ReaderThemePreset preset;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) => GlassIconButton(
+    key: const ValueKey('reader-cache'),
+    icon: CupertinoIcons.tray_arrow_down,
+    label: '缓存',
+    color: preset.textColor,
+    onPressed: onTap,
+  );
 }

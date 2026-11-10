@@ -3,9 +3,11 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:fqapp/models/audio_extra.dart';
+import 'package:fqapp/models/audio_time_track.dart';
 import 'package:fqapp/models/chapter_media.dart';
 import 'package:fqapp/models/media_item.dart';
 import 'package:fqapp/pages/audio_page.dart';
+import 'package:fqapp/services/app_theme.dart';
 import 'package:fqapp/services/audio_preferences.dart';
 import 'package:fqapp/services/native_player.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -29,13 +31,13 @@ void main() {
       expect(find.byType(Texture), findsNothing);
       player.emitPosition(const Duration(seconds: 25));
       await tester.pump();
-      await tester.tap(find.byTooltip('后退15秒'));
+      await tester.tap(find.text('-15 s'));
       await _flush(tester);
       expect(player.position, const Duration(seconds: 10));
-      await tester.tap(find.byTooltip('后退15秒'));
+      await tester.tap(find.text('-15 s'));
       await _flush(tester);
       expect(player.position, Duration.zero);
-      await tester.tap(find.byTooltip('前进15秒'));
+      await tester.tap(find.text('+15 s'));
       await _flush(tester);
       expect(player.position, const Duration(seconds: 15));
       final slider = tester.widget<Slider>(
@@ -178,25 +180,53 @@ void main() {
   ) async {
     final session = _Session();
     await _mount(tester, session);
+    // 官方 `te`「%s后播放下一集」：播完先进倒计时窗口，不再立刻跳章。
     session.players.first.emitCompleted();
+    await _flush(tester);
+    expect(find.byKey(const Key('audio_advance_banner')), findsOneWidget);
+    expect(session.players, hasLength(1));
+    await tester.pump(const Duration(seconds: 3));
     await _flush(tester);
     expect(session.players, hasLength(2));
     expect(session.store.entry?['chapterId'], '2');
     expect(session.players.last.isPlaying, true);
     session.players.last.emitCompleted();
     await _flush(tester);
+    await tester.pump(const Duration(seconds: 3));
+    await _flush(tester);
     expect(session.players, hasLength(3));
+    // 末章播完：不再连播，改为官方 `v7` 的书末提示。
     session.players.last.emitCompleted();
     await _flush(tester);
     expect(session.players, hasLength(3));
     expect(session.players.last.isPlaying, false);
     expect(session.store.entry?['completed'], true);
     expect(session.store.entry?['position'], 120);
-    expect(find.text('本章已播完'), findsOneWidget);
+    expect(find.text('已播完最新章节，去听听其它内容吧'), findsOneWidget);
     await tester.tap(find.byTooltip('播放'));
     await _flush(tester);
     expect(session.players.last.position, Duration.zero);
     expect(session.players.last.isPlaying, true);
+  });
+
+  testWidgets('cancelling the advance countdown stays on the chapter', (
+    tester,
+  ) async {
+    final session = _Session();
+    await _mount(tester, session);
+    session.players.first.emitCompleted();
+    await _flush(tester);
+    expect(find.byKey(const Key('audio_advance_banner')), findsOneWidget);
+
+    await tester.tap(find.byKey(const Key('audio_advance_cancel')));
+    await _flush(tester);
+    expect(find.byKey(const Key('audio_advance_banner')), findsNothing);
+
+    // 取消之后即使等过倒计时窗口，也不能自己跳章。
+    await tester.pump(const Duration(seconds: 5));
+    await _flush(tester);
+    expect(session.players, hasLength(1));
+    expect(find.text('本章已播完'), findsOneWidget);
   });
 
   testWidgets(
@@ -224,6 +254,33 @@ void main() {
     },
   );
 
+  testWidgets('the playback settings sheet separates itself from the page', (
+    tester,
+  ) async {
+    themeModeNotifier.value = ThemeMode.dark;
+    oledModeNotifier.value = true;
+    addTearDown(() {
+      oledModeNotifier.value = false;
+      themeModeNotifier.value = ThemeMode.system;
+    });
+    final session = _Session();
+    await _mount(
+      tester,
+      session,
+      theme: AppTheme.createTheme(Brightness.dark, oledMode: true),
+    );
+    await tester.tap(find.byTooltip('更多'));
+    await tester.pumpAndSettle();
+
+    final sheet = tester.widget<BottomSheet>(find.byType(BottomSheet));
+    // 听书页是纯黑画布，barrier 叠在上面不会变暗；弹层必须比画布高一档，
+    // 再加一圈发丝线，才能看出设置和听书页的分界。
+    expect(sheet.backgroundColor, const Color(0xFF0C0C0E));
+    final shape = sheet.shape! as RoundedRectangleBorder;
+    expect(shape.side.width, 0.8);
+    expect(shape.side.color.a, closeTo(0.8, 0.01));
+  });
+
   testWidgets(
     'completed history stays paused and replays only when requested',
     (tester) async {
@@ -248,6 +305,139 @@ void main() {
       expect(session.players.single.isPlaying, true);
     },
   );
+
+  // 从本段听 on a plain-text chapter (no `<span start_time>`): the reader
+  // hands over the paragraph, the player resolves the spoken start from the
+  // chapter's own /timepoints timeline. Wins over a completed history entry.
+  testWidgets('a paragraph anchor resolves its spoken start from timepoints', (
+    tester,
+  ) async {
+    final session = _Session(
+      startPosition: Duration.zero,
+      startParagraph: (paraIndex: null, ordinal: 2),
+      timePoints: const AudioTimeTrack([
+        AudioSyncPoint(
+          startTime: 0,
+          startPara: 0,
+          startParaOff: 0,
+          endPara: 0,
+          endParaOff: 9,
+        ),
+        AudioSyncPoint(
+          startTime: 3000,
+          startPara: 1,
+          startParaOff: 0,
+          endPara: 1,
+          endParaOff: 9,
+        ),
+        AudioSyncPoint(
+          startTime: 8000,
+          startPara: 2,
+          startParaOff: 0,
+          endPara: 2,
+          endParaOff: 9,
+        ),
+      ]),
+      store: ControlledReaderStore(
+        entry: {
+          'id': 'book',
+          'kind': 'audio',
+          'chapterId': '1',
+          'position': 120,
+          'duration': 120,
+          'completed': true,
+        },
+      ),
+    );
+    await _mount(tester, session);
+    await _flush(tester);
+    expect(session.players.single.position, const Duration(milliseconds: 8000));
+    expect(tester.takeException(), isNull);
+  });
+
+  // A paragraph the timeline cannot match falls back to the explicit zero the
+  // reader hands in — never to saved history, which would be a place nobody
+  // asked for.
+  testWidgets(
+    'an unresolvable paragraph anchor starts at the chapter opening',
+    (tester) async {
+      final session = _Session(
+        startPosition: Duration.zero,
+        startParagraph: (paraIndex: null, ordinal: 9),
+        timePoints: const AudioTimeTrack([
+          AudioSyncPoint(
+            startTime: 0,
+            startPara: 0,
+            startParaOff: 0,
+            endPara: 0,
+            endParaOff: 9,
+          ),
+        ]),
+        store: ControlledReaderStore(
+          entry: {
+            'id': 'book',
+            'kind': 'audio',
+            'chapterId': '1',
+            'position': 100,
+            'duration': 120,
+          },
+        ),
+      );
+      await _mount(tester, session);
+      await _flush(tester);
+      expect(session.players.single.position, Duration.zero);
+      expect(tester.takeException(), isNull);
+    },
+  );
+
+  // 阅读页还会递上「这一段在正文里的比例」。时间轴查不到时按比例折算时长：
+  // 折算不精确，但锚定请求落到章首是用户看到的最坏结果。
+  testWidgets('an unresolvable anchor falls back to the read fraction', (
+    tester,
+  ) async {
+    final session = _Session(
+      startPosition: Duration.zero,
+      startParagraph: (paraIndex: null, ordinal: 9),
+      startFraction: 0.5,
+      timePoints: const AudioTimeTrack([]),
+      store: ControlledReaderStore(
+        entry: {
+          'id': 'book',
+          'kind': 'audio',
+          'chapterId': '1',
+          'position': 100,
+          'duration': 120,
+        },
+      ),
+    );
+    await _mount(tester, session);
+    await _flush(tester);
+    // 假片长 2 分钟，读到一半 ⇒ 1 分钟。
+    expect(session.players.single.position, const Duration(minutes: 1));
+    expect(tester.takeException(), isNull);
+  });
+
+  // 时间轴命中时比例不得抢先：精确锚点永远优先于折算。
+  testWidgets('a resolved anchor ignores the read fraction', (tester) async {
+    final session = _Session(
+      startPosition: Duration.zero,
+      startParagraph: (paraIndex: 2, ordinal: 2),
+      startFraction: 0.5,
+      timePoints: const AudioTimeTrack([
+        AudioSyncPoint(
+          startTime: 8000,
+          startPara: 2,
+          startParaOff: 0,
+          endPara: 2,
+          endParaOff: 9,
+        ),
+      ]),
+    );
+    await _mount(tester, session);
+    await _flush(tester);
+    expect(session.players.single.position, const Duration(seconds: 8));
+    expect(tester.takeException(), isNull);
+  });
 
   // 从本段听 hands in a paragraph's timeline position. It is a deliberate
   // start point, so a chapter already marked as played-to-the-end must neither
@@ -337,7 +527,9 @@ void main() {
       await tester.pumpAndSettle();
       // Only voices playinfo can actually serve are offered: the synthetic
       // 默认音色 row (tone 0) is not a choice.
-      expect(find.text('默认音色'), findsNothing);
+      expect(find.byKey(const ValueKey('voice_option_0')), findsNothing);
+      // The compact page row still describes the currently active tone.
+      expect(find.text('默认音色'), findsOneWidget);
       await tester.tap(find.text('清亮男声'));
       await _flush(tester);
       await tester.pumpAndSettle();
@@ -407,6 +599,9 @@ void main() {
         ),
       );
       await _mount(tester, session);
+      await tester.ensureVisible(find.byKey(const ValueKey('audio-voice')));
+      await tester.tap(find.byKey(const ValueKey('audio-voice')));
+      await tester.pumpAndSettle();
       expect(find.text('多角色对话升级版'), findsOneWidget);
     },
   );
@@ -439,9 +634,11 @@ void main() {
     await tester.ensureVisible(find.byKey(const ValueKey('audio-speed')));
     await tester.tap(find.byKey(const ValueKey('audio-speed')));
     await tester.pumpAndSettle();
-    final speed = find.text('1.5×');
-    await tester.ensureVisible(speed);
-    await tester.tap(speed);
+    // 语速面板是可拖的滑条（0.1 一档），没有固定档位按钮可点：直接把 1.5
+    // 交给 onChanged，等价于把滑块拖到 1.5。
+    tester
+        .widget<Slider>(find.byKey(const ValueKey('audio-speed-slider')))
+        .onChanged!(1.5);
     await _flush(tester);
     await tester.pumpAndSettle();
     expect(session.players.single.rate, 1.5);
@@ -515,20 +712,23 @@ void main() {
     AppLifecycleState.hidden,
     AppLifecycleState.paused,
   ]) {
-    testWidgets('$lifecycle keeps playing in background and saves before the timer', (
-      tester,
-    ) async {
-      final session = _Session();
-      await _mount(tester, session);
-      session.players.single.emitPosition(const Duration(seconds: 37));
-      tester.binding.handleAppLifecycleStateChanged(lifecycle);
-      await _flush(tester);
-      expect(session.players.single.isPlaying, true);
-      expect(session.store.entry?['position'], 37);
-      tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
-      await _flush(tester);
-      expect(session.players.single.isPlaying, true);
-    });
+    testWidgets(
+      '$lifecycle keeps playing in background and saves before the timer',
+      (tester) async {
+        final session = _Session();
+        await _mount(tester, session);
+        session.players.single.emitPosition(const Duration(seconds: 37));
+        tester.binding.handleAppLifecycleStateChanged(lifecycle);
+        await _flush(tester);
+        expect(session.players.single.isPlaying, true);
+        expect(session.store.entry?['position'], 37);
+        tester.binding.handleAppLifecycleStateChanged(
+          AppLifecycleState.resumed,
+        );
+        await _flush(tester);
+        expect(session.players.single.isPlaying, true);
+      },
+    );
 
     testWidgets('$lifecycle pauses when background playback is disabled', (
       tester,
@@ -570,9 +770,7 @@ void main() {
     expect(session.players.single.isPlaying, true);
   });
 
-  testWidgets('becoming noisy pauses playback immediately', (
-    tester,
-  ) async {
+  testWidgets('becoming noisy pauses playback immediately', (tester) async {
     final session = _Session();
     await _mount(tester, session);
     expect(session.players.single.isPlaying, true);
@@ -592,9 +790,13 @@ void main() {
       await tester.ensureVisible(find.byKey(const ValueKey('audio-speed')));
       await tester.tap(find.byKey(const ValueKey('audio-speed')));
       await tester.pumpAndSettle();
-      final speed = find.text('1.5×');
-      await tester.ensureVisible(speed);
-      await tester.tap(speed);
+      tester
+          .widget<Slider>(find.byKey(const ValueKey('audio-speed-slider')))
+          .onChanged!(1.5);
+      await tester.pumpAndSettle();
+      // 新面板是即时生效的滑条，选完不会自动关；先关掉再点「下一章」，
+      // 否则点击会落在面板的遮罩上。
+      await tester.tapAt(const Offset(20, 20));
       await tester.pumpAndSettle();
       await tester.ensureVisible(find.byTooltip('下一章'));
       await tester.tap(find.byTooltip('下一章'));
@@ -821,7 +1023,7 @@ void main() {
     await _mount(tester, session);
     final player = session.players.single;
     expect(player.isPlaying, true);
-    await tester.tap(find.byTooltip('定时'));
+    await tester.tap(find.byKey(const Key('audio_sleep')));
     await tester.pumpAndSettle();
     await tester.tap(find.text('15 分钟后'));
     await tester.pumpAndSettle();
@@ -867,7 +1069,11 @@ Future<void> _unmount(WidgetTester tester) async {
   await _flush(tester);
 }
 
-Future<void> _mount(WidgetTester tester, _Session session) async {
+Future<void> _mount(
+  WidgetTester tester,
+  _Session session, {
+  ThemeData? theme,
+}) async {
   await tester.binding.setSurfaceSize(const Size(430, 932));
   tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
   addTearDown(() async {
@@ -875,7 +1081,7 @@ Future<void> _mount(WidgetTester tester, _Session session) async {
     tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
     await tester.binding.setSurfaceSize(null);
   });
-  await tester.pumpWidget(session.app());
+  await tester.pumpWidget(session.app(theme: theme));
   await _flush(tester);
 }
 
@@ -885,9 +1091,9 @@ class _AudioPlayer extends ControlledNativePlayer {
   _AudioPlayer({super.createGate, super.releaseGate});
 
   @override
-  Future<int> create(String cdnUrl, String keyHex) {
+  Future<int> create(String cdnUrl, String keyHex, {int? startMs}) {
     keys.add(keyHex);
-    return super.create(cdnUrl, keyHex);
+    return super.create(cdnUrl, keyHex, startMs: startMs);
   }
 }
 
@@ -919,6 +1125,9 @@ class _Session {
   final _AudioPlayer Function()? factory;
   final List<Chapter> chapters;
   final Duration? startPosition;
+  final ({int? paraIndex, int ordinal})? startParagraph;
+  final double? startFraction;
+  final AudioTimeTrack? timePoints;
   final players = <_AudioPlayer>[];
   final requests = <String>[];
   _Session({
@@ -928,6 +1137,9 @@ class _Session {
     this.extras,
     this.factory,
     this.startPosition,
+    this.startParagraph,
+    this.startFraction,
+    this.timePoints,
     List<Chapter>? chapters,
   }) : store = store ?? ControlledReaderStore(),
        chapters =
@@ -937,13 +1149,19 @@ class _Session {
                Chapter(itemId: '$index', title: '第$index章', volumeName: '第一卷'),
            ];
 
-  Widget app() => MaterialApp(
+  Widget app({ThemeData? theme}) => MaterialApp(
+    theme: theme,
     home: AudioPage(
       bookId: 'book',
       title: '测试听书',
       chapters: chapters,
       startPosition: startPosition,
+      startParagraph: startParagraph,
+      startFraction: startFraction,
       historyStore: store,
+      timePointLoader: timePoints == null
+          ? null
+          : (id, toneId) async => timePoints!,
       sourceLoader: (id, {toneId}) {
         requests.add('$id:$toneId');
         return loader?.call(id, toneId: toneId) ??

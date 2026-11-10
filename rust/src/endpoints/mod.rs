@@ -1,10 +1,13 @@
 //! Endpoint registry and request context.
 //!
-//! One `Server` owns the route table; the FFI bridge, the loopback HTTP
-//! adapter and the built-in Web UI all dispatch through it. Endpoint names and
-//! path matching are identical across all three dispatch paths.
+//! One `Server` owns the route table; the FFI bridge and the loopback HTTP
+//! adapter both dispatch through it. Endpoint names and path matching are
+//! identical across both dispatch paths.
 
+pub mod account_history;
+pub mod account_library;
 pub mod audio;
+pub mod audio_text;
 pub mod author;
 pub mod base;
 pub mod book;
@@ -15,14 +18,14 @@ pub mod dhcontent;
 pub mod full;
 pub mod home;
 pub mod manga;
-pub mod pages;
+pub mod reader_video;
 pub mod router;
 pub mod search;
 pub mod session;
+pub mod shuqi;
 pub mod toutiao;
 pub mod util;
 pub mod video;
-pub mod webui;
 pub mod wkcontent;
 
 use std::collections::HashMap;
@@ -117,7 +120,6 @@ pub struct Ctx {
     pub pool: Arc<DevicePool>,
     pub cfg: Arc<Config>,
     pub src_dir: String,
-    pub web_dir: String,
     pub filters: Arc<FilterManager>,
 }
 
@@ -134,6 +136,7 @@ pub type RawHandler = for<'a> fn(&'a Ctx, &'a Params) -> BoxFuture<'a, ApiResult
 
 pub struct Server {
     pub ctx: Arc<Ctx>,
+    pub(crate) lifetime: tokio_util::sync::CancellationToken,
     routes: HashMap<&'static str, Handler>,
     raw: HashMap<&'static str, RawHandler>,
 }
@@ -142,6 +145,7 @@ impl Server {
     pub fn new(ctx: Arc<Ctx>) -> Self {
         let mut s = Server {
             ctx,
+            lifetime: tokio_util::sync::CancellationToken::new(),
             routes: HashMap::new(),
             raw: HashMap::new(),
         };
@@ -172,6 +176,7 @@ pub mod server {
 
     pub fn register_all(s: &mut Server) {
         search::register(s);
+        shuqi::register(s);
         home::register(s);
         book::register(s);
         content::register(s);
@@ -182,7 +187,7 @@ pub mod server {
         author::register(s);
         audio::register(s);
         video::register(s);
+        reader_video::register(s);
         manga::register(s);
-        pages::register(s);
     }
 }

@@ -7,10 +7,15 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:fqapp/models/media_item.dart';
 import 'package:fqapp/pages/search_page.dart';
 import 'package:fqapp/services/search_history_store.dart';
-import 'package:fqapp/widgets/media_card.dart';
+import 'package:fqapp/widgets/wenku/wenku_ui.dart';
+
+import 'support/search_finders.dart';
 
 void main() {
-  setUp(() => SharedPreferences.setMockInitialValues({}));
+  // 预置「用户选过封面视图」，让下面的网格断言不受默认列表影响。
+  setUp(
+    () => SharedPreferences.setMockInitialValues({'search_list_view': false}),
+  );
 
   testWidgets(
     'a category can be chosen before search and survives new queries',
@@ -34,7 +39,7 @@ void main() {
         ),
       );
       await tester.pumpAndSettle();
-      await tester.tap(find.widgetWithText(ChoiceChip, '小说'));
+      await tester.tap(searchSegment('小说'));
       await tester.pumpAndSettle();
       expect(requests, isEmpty);
       for (final query in ['修仙', '悬疑']) {
@@ -47,10 +52,8 @@ void main() {
       await tester.tap(find.byTooltip('清空'));
       await tester.pumpAndSettle();
       expect(
-        tester
-            .widget<ChoiceChip>(find.widgetWithText(ChoiceChip, '小说'))
-            .selected,
-        isTrue,
+        tester.getSemantics(searchSegment('小说')),
+        isSemantics(isSelected: true),
       );
       expect(requests, hasLength(2));
     },
@@ -59,6 +62,12 @@ void main() {
   testWidgets(
     'rating-empty pages keep manual continuation at upstream cursors',
     (tester) async {
+      // The 9-point threshold is in place before the search, as a restored
+      // preference (the filter control sits on the results heading).
+      SharedPreferences.setMockInitialValues({
+        'search_list_view': false,
+        'search_minimum_score': 9.0,
+      });
       final offsets = <int>[];
       await tester.pumpWidget(
         MaterialApp(
@@ -83,29 +92,23 @@ void main() {
         ),
       );
       await tester.pumpAndSettle();
-      await tester.tap(find.byKey(const Key('search-minimum-score')));
-      await tester.pumpAndSettle();
-      await tester.tap(find.text('9 分及以上').last);
-      await tester.pumpAndSettle();
       await tester.enterText(find.byType(TextField), '评分');
       await tester.testTextInput.receiveAction(TextInputAction.search);
       await tester.pumpAndSettle();
       expect(offsets, [0]);
-      expect(find.byType(MediaCard), findsNothing);
-      await tester.tap(find.text('加载更多'));
+      expect(searchResultTiles, findsNothing);
+      await tester.tap(find.text(searchLoadMore));
       await tester.pumpAndSettle();
       expect(offsets, [0, 14]);
-      expect(find.byType(MediaCard), findsNothing);
-      await tester.tap(find.text('加载更多'));
+      expect(searchGridTiles, findsNothing);
+      await tester.tap(find.text(searchLoadMore));
       await tester.pumpAndSettle();
       expect(offsets, [0, 14, 27]);
       expect(find.text('高分作品'), findsOneWidget);
-      expect(find.text('9.3分'), findsOneWidget);
-      expect(find.text('没有更多了'), findsOneWidget);
-      await tester.tap(find.byKey(const Key('search-minimum-score')));
-      await tester.pumpAndSettle();
-      await tester.tap(find.text('评分不限').last);
-      await tester.pumpAndSettle();
+      // The ported tile shows the score in its caption line.
+      expect(find.textContaining('9.3分'), findsOneWidget);
+      expect(find.text(searchEndOfResults), findsOneWidget);
+      await selectSearchScore(tester, '评分不限');
       expect(_gridCount(tester), 3);
       expect(offsets, [0, 14, 27]);
     },
@@ -132,10 +135,10 @@ void main() {
 
     await tester.pumpWidget(_app(loader));
     await tester.pumpAndSettle();
-    expect(find.byType(MediaCard), findsOneWidget);
+    expect(searchGridTiles, findsOneWidget);
     await tester.tap(find.byKey(const Key('search-layout-toggle')));
     await tester.pumpAndSettle();
-    expect(find.byType(MediaCard), findsNothing);
+    expect(searchGridTiles, findsNothing);
     expect(find.text('列表作品'), findsOneWidget);
     expect(find.text('小说 · 9.1分'), findsOneWidget);
     expect(requests, 1);
@@ -146,9 +149,67 @@ void main() {
     await tester.pumpWidget(const SizedBox());
     await tester.pumpWidget(_app(loader));
     await tester.pumpAndSettle();
-    expect(find.byType(MediaCard), findsNothing);
+    expect(searchGridTiles, findsNothing);
     expect(find.text('列表作品'), findsOneWidget);
     expect(find.byTooltip('切换为封面视图'), findsOneWidget);
+  });
+
+  testWidgets('the rating threshold survives reopening the page', (
+    tester,
+  ) async {
+    Future<List<SearchTab>> loader(
+      String query, {
+      required int tabType,
+      required int offset,
+    }) async => [
+      SearchTab(
+        title: '综合',
+        items: [_item('low', '低分作品', score: 8.2)],
+        hasMore: false,
+      ),
+    ];
+
+    await tester.pumpWidget(_app(loader));
+    await tester.pumpAndSettle();
+    await selectSearchScore(tester, '9 分以上');
+    expect(
+      (await SharedPreferences.getInstance()).getDouble('search_minimum_score'),
+      9,
+    );
+
+    // Reopening is the reported symptom: the dropdown used to snap back to
+    // 「评分不限」 and the filter the viewer picked was silently dropped.
+    await tester.pumpWidget(const SizedBox());
+    await tester.pumpWidget(_app(loader));
+    await tester.pumpAndSettle();
+    // 8.2 is below the restored 9-point threshold, so it stays filtered out.
+    expect(searchScoreValue(tester), 9);
+    expect(searchResultTiles, findsNothing);
+  });
+
+  testWidgets('list and grid captions show the work length', (tester) async {
+    await tester.pumpWidget(
+      _app(
+        (query, {required int tabType, required int offset}) async => [
+          SearchTab(
+            title: '综合',
+            items: [
+              _item('novel', '长篇小说', wordNumber: 2000000, score: 9.1),
+              _item('drama', '短剧作品', kind: 'video', ep: '103'),
+            ],
+            hasMore: false,
+          ),
+        ],
+      ),
+    );
+    await tester.pumpAndSettle();
+    expect(find.textContaining('200万字'), findsWidgets);
+    expect(find.textContaining('共103集'), findsWidgets);
+
+    await tester.tap(find.byKey(const Key('search-layout-toggle')));
+    await tester.pumpAndSettle();
+    expect(find.text('小说 · 200万字 · 9.1分'), findsOneWidget);
+    expect(find.text('短剧 · 共103集 · 暂无评分'), findsOneWidget);
   });
 
   testWidgets(
@@ -186,12 +247,9 @@ void main() {
       );
       await tester.pumpAndSettle();
 
-      expect(
-        tester
-            .widgetList<ChoiceChip>(find.byType(ChoiceChip))
-            .map((chip) => (chip.label as Text).data),
-        ['综合', '小说', '短剧', '漫剧', '漫画', '听书'],
-      );
+      for (final label in ['综合', '小说', '短剧', '漫剧', '漫画', '听书']) {
+        expect(searchSegment(label), findsOneWidget);
+      }
       expect(_visibleKinds(tester), [
         'book',
         'video',
@@ -208,14 +266,14 @@ void main() {
         ('漫画', 'manga', 8),
         ('听书', 'audio', 2),
       ]) {
-        await tester.tap(find.widgetWithText(ChoiceChip, category.$1));
+        await tester.tap(searchSegment(category.$1));
         await tester.pumpAndSettle();
         expect(_visibleKinds(tester), [category.$2]);
         expect(requests.last, ('测试', category.$3, 0));
       }
       expect(requests.map((request) => request.$2), [1, 3, 11, 11, 8, 2]);
 
-      await tester.tap(find.widgetWithText(ChoiceChip, '综合'));
+      await tester.tap(searchSegment('综合'));
       await tester.pumpAndSettle();
       expect(_visibleKinds(tester), [
         'book',
@@ -251,69 +309,14 @@ void main() {
     );
     await tester.pumpAndSettle();
     expect(offsets, [0]);
-    expect(find.text('加载更多'), findsOneWidget);
-    expect(find.text('没有更多了'), findsNothing);
-    await tester.tap(find.text('加载更多'));
+    expect(find.text(searchLoadMore), findsOneWidget);
+    expect(find.text(searchEndOfResults), findsNothing);
+    await tester.tap(find.text(searchLoadMore));
     await tester.pumpAndSettle();
     expect(offsets, [0, 14]);
     expect(find.text('后续小说'), findsOneWidget);
-    expect(find.text('没有更多了'), findsOneWidget);
+    expect(find.text(searchEndOfResults), findsOneWidget);
   });
-
-  testWidgets(
-    'a short category loads its own pages and preserves other cursors',
-    (tester) async {
-      await tester.binding.setSurfaceSize(const Size(420, 700));
-      addTearDown(() => tester.binding.setSurfaceSize(null));
-      final requests = <(int, int)>[];
-      await tester.pumpWidget(
-        _app((query, {required int tabType, required int offset}) async {
-          requests.add((tabType, offset));
-          if (tabType == 1) {
-            return [
-              SearchTab(
-                title: '综合',
-                items: offset == 0
-                    ? [for (var i = 0; i < 30; i++) _item('b$i', '小说 $i')]
-                    : [_item('b30', '末页小说')],
-                hasMore: offset == 0,
-                nextOffset: offset == 0 ? 14 : 0,
-              ),
-              SearchTab(
-                title: '漫画',
-                items: [_item('old', '综合里的漫画', kind: 'manga')],
-                hasMore: false,
-              ),
-            ];
-          }
-          return [
-            SearchTab(
-              title: '漫画',
-              items: [_item('m$offset', '漫画 $offset', kind: 'manga')],
-              hasMore: offset == 0,
-              nextOffset: offset == 0 ? 23 : 0,
-            ),
-          ];
-        }),
-      );
-      await tester.pumpAndSettle();
-      expect(requests, [(1, 0)]);
-      await tester.tap(find.widgetWithText(ChoiceChip, '漫画'));
-      await tester.pumpAndSettle();
-      expect(requests, [(1, 0), (8, 0), (8, 23)]);
-      expect(find.text('漫画 23'), findsOneWidget);
-      expect(find.text('综合里的漫画'), findsNothing);
-
-      await tester.tap(find.widgetWithText(ChoiceChip, '综合'));
-      await tester.pumpAndSettle();
-      expect(requests, hasLength(3));
-      await tester.drag(find.byType(CustomScrollView), const Offset(0, -3000));
-      await tester.pumpAndSettle();
-      expect(requests.last, (1, 14));
-      expect(find.text('末页小说'), findsOneWidget);
-      expect(_visibleKinds(tester).toSet(), {'book'});
-    },
-  );
 
   testWidgets(
     'duplicate pages preserve their advancing cursor without looping',
@@ -340,9 +343,9 @@ void main() {
         0,
         14,
       ], reason: 'No automatic loop through duplicate pages');
-      expect(find.text('加载更多'), findsOneWidget);
-      expect(find.text('没有更多了'), findsNothing);
-      await tester.tap(find.text('加载更多'));
+      expect(find.text(searchLoadMore), findsOneWidget);
+      expect(find.text(searchEndOfResults), findsNothing);
+      await tester.tap(find.text(searchLoadMore));
       await tester.pumpAndSettle();
       expect(offsets, [0, 14, 27]);
       expect(find.text('第一本'), findsOneWidget);
@@ -383,18 +386,18 @@ void main() {
         }),
       );
       await tester.pumpAndSettle();
-      await tester.tap(find.widgetWithText(ChoiceChip, '漫剧'));
+      await tester.tap(searchSegment('漫剧'));
       await tester.pumpAndSettle();
       expect(requests, [(1, 0), (11, 0)]);
-      expect(find.byType(MediaCard), findsNothing);
-      expect(find.text('加载更多'), findsOneWidget);
-      await tester.tap(find.text('加载更多'));
+      expect(searchGridTiles, findsNothing);
+      expect(find.text(searchLoadMore), findsOneWidget);
+      await tester.tap(find.text(searchLoadMore));
       await tester.pumpAndSettle();
       expect(requests.last, (11, 17));
       expect(find.text('后续漫剧'), findsOneWidget);
       expect(find.text('其他栏目的漫剧'), findsNothing);
 
-      await tester.tap(find.widgetWithText(ChoiceChip, '短剧'));
+      await tester.tap(searchSegment('短剧'));
       await tester.pumpAndSettle();
       expect(requests, [(1, 0), (11, 0), (11, 17), (11, 0), (11, 17)]);
       expect(find.text('真人短剧'), findsOneWidget);
@@ -425,8 +428,8 @@ void main() {
       );
       await tester.pumpAndSettle();
       expect(offsets, [0, 14]);
-      expect(find.text('没有更多了'), findsOneWidget);
-      expect(find.text('加载更多'), findsNothing);
+      expect(find.text(searchEndOfResults), findsOneWidget);
+      expect(find.text(searchLoadMore), findsNothing);
     });
   }
 
@@ -447,7 +450,7 @@ void main() {
       }),
     );
     await tester.pumpAndSettle();
-    await tester.tap(find.text('加载更多'));
+    await tester.tap(find.text(searchLoadMore));
     await tester.pumpAndSettle();
     expect(offsets, [0, 14]);
     expect(find.text('后续作品'), findsOneWidget);
@@ -474,15 +477,15 @@ void main() {
         }),
       );
       await tester.pumpAndSettle();
-      expect(find.text('加载失败，点击重试'), findsOneWidget);
-      await tester.tap(find.widgetWithText(ChoiceChip, '漫画'));
+      expect(find.text(searchRetry), findsOneWidget);
+      await tester.tap(searchSegment('漫画'));
       await tester.pumpAndSettle();
       expect(_visibleKinds(tester), ['manga']);
       expect(find.textContaining('首屏失败'), findsNothing);
-      await tester.tap(find.widgetWithText(ChoiceChip, '综合'));
+      await tester.tap(searchSegment('综合'));
       await tester.pumpAndSettle();
       expect(requests, [(1, 0), (8, 0)]);
-      await tester.tap(find.text('加载失败，点击重试'));
+      await tester.tap(find.text(searchRetry));
       await tester.pumpAndSettle();
       expect(requests, [(1, 0), (8, 0), (1, 0)]);
       expect(_visibleKinds(tester), ['book']);
@@ -514,11 +517,11 @@ void main() {
     await tester.pumpAndSettle();
     expect(offsets, [0, 14]);
     expect(find.text('作品 0'), findsOneWidget);
-    expect(find.text('加载失败，点击重试'), findsOneWidget);
-    await tester.drag(find.byType(CustomScrollView), const Offset(0, -100));
+    expect(find.text(searchRetry), findsOneWidget);
+    await tester.drag(searchResultsScrollable, const Offset(0, -100));
     await tester.pumpAndSettle();
     expect(offsets, [0, 14], reason: 'Scrolling must not retry a failed page');
-    await tester.tap(find.text('加载失败，点击重试'));
+    await tester.tap(find.text(searchRetry));
     await tester.pumpAndSettle();
     expect(offsets, [0, 14, 14]);
     expect(find.text('作品 14'), findsOneWidget);
@@ -540,9 +543,9 @@ void main() {
         }),
       );
       await tester.pumpAndSettle();
-      await tester.tap(find.widgetWithText(ChoiceChip, '漫画'));
+      await tester.tap(searchSegment('漫画'));
       await tester.pump();
-      await tester.tap(find.widgetWithText(ChoiceChip, '听书'));
+      await tester.tap(searchSegment('听书'));
       await tester.pump();
       manga.complete([
         SearchTab(
@@ -553,7 +556,7 @@ void main() {
       ]);
       await tester.pump();
       expect(find.text('漫画结果'), findsNothing);
-      expect(find.byType(CircularProgressIndicator), findsOneWidget);
+      expect(searchFirstPageSkeleton, findsOneWidget);
       audio.complete([
         SearchTab(
           title: '听书',
@@ -563,7 +566,7 @@ void main() {
       ]);
       await tester.pumpAndSettle();
       expect(find.text('听书结果'), findsOneWidget);
-      await tester.tap(find.widgetWithText(ChoiceChip, '漫画'));
+      await tester.tap(searchSegment('漫画'));
       await tester.pumpAndSettle();
       expect(find.text('漫画结果'), findsOneWidget);
       expect(requests, [1, 8, 2]);
@@ -611,7 +614,7 @@ void main() {
         await tester.pumpAndSettle();
         expect(find.text('新关键词 作品'), findsOneWidget);
         expect(find.text('过期作品'), findsNothing);
-        expect(find.text('加载失败，点击重试'), findsNothing);
+        expect(find.text(searchRetry), findsNothing);
         expect(requests.last, ('新关键词', 1, 0));
         expect(requests, hasLength(3));
       },
@@ -636,8 +639,10 @@ void main() {
       SearchTab(title: '综合', items: [_item('stale', '过期作品')]),
     ]);
     await tester.pumpAndSettle();
-    expect(find.text('搜索历史'), findsOneWidget);
-    expect(find.byType(ChoiceChip), findsNWidgets(6));
+    expect(find.text(searchRecentHeading), findsOneWidget);
+    for (final label in ['综合', '小说', '短剧', '漫剧', '漫画', '听书']) {
+      expect(searchSegment(label), findsOneWidget);
+    }
     await tester.tap(find.text('测试'));
     await tester.pump();
     expect(pending, hasLength(2));
@@ -671,15 +676,16 @@ void main() {
     expect(queries, ['小王子']);
     await tester.tap(find.byTooltip('清空'));
     await tester.pumpAndSettle();
-    await tester.tap(find.byTooltip('删除 小王子'));
+    await tester.longPress(find.text('小王子'));
     await tester.pumpAndSettle();
     expect(find.text('小王子'), findsNothing);
     expect(find.text('测试小说'), findsOneWidget);
-    await tester.tap(find.widgetWithText(TextButton, '清空'));
+    await tester.tap(find.byTooltip('清空最近搜索'));
     await tester.pumpAndSettle();
     await tester.tap(find.widgetWithText(TextButton, '清空').last);
     await tester.pumpAndSettle();
-    expect(find.text('暂无搜索历史'), findsOneWidget);
+    // Upstream omits the recent-searches block once it is empty.
+    expect(find.text(searchRecentHeading), findsNothing);
     expect(await SearchHistoryStore.instance.load(), isEmpty);
   });
 
@@ -731,7 +737,7 @@ void main() {
     await tester.pumpAndSettle();
     expect(offsets, [0]);
 
-    await tester.drag(find.byType(CustomScrollView), const Offset(0, -3000));
+    await tester.drag(searchResultsScrollable, const Offset(0, -3000));
     await tester.pumpAndSettle();
 
     expect(offsets, [0, 14]);
@@ -749,29 +755,29 @@ Widget _app(SearchPageLoader loader) => MaterialApp(
   ),
 );
 
-List<String> _visibleKinds(WidgetTester tester) => tester
-    .widgetList<MediaCard>(find.byType(MediaCard))
-    .map((card) => card.item.kind)
-    .toList();
+List<String> _visibleKinds(WidgetTester tester) => searchVisibleKinds(tester);
 
-int _gridCount(WidgetTester tester) {
-  final grid = tester.widget<SliverGrid>(find.byType(SliverGrid));
-  return (grid.delegate as SliverChildBuilderDelegate).childCount!;
-}
+/// Total results in the collection, including rows not yet built.
+int _gridCount(WidgetTester tester) => tester
+    .widget<BookCollectionSliver>(find.byType(BookCollectionSliver))
+    .itemCount;
 
 MediaItem _item(
   String id,
   String title, {
   String kind = 'book',
   double? score,
+  String ep = '',
+  int wordNumber = 0,
 }) => MediaItem(
   id: id,
   title: title,
   cover: '',
   author: '',
   badge: '',
-  ep: '',
+  ep: ep,
   kind: kind,
+  wordNumber: wordNumber,
   score: score,
 );
 

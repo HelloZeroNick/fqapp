@@ -27,10 +27,20 @@ class EpisodeSource {
   /// only offered one stream — the quality row is hidden then.
   final List<EpisodeVariant> variants;
 
-  const EpisodeSource(this.url, [this.keyHex = '', this.variants = const []]);
+  /// 服务端分集方向（官方 `VideoInfo.vertical`），随取流响应下发。
+  /// `null` = 该响应没有这个字段（旧后端、离线缓存）；播放页把 null 与
+  /// false 一样当作「不竖屏」，保留「全屏观看」。
+  final bool? vertical;
+
+  const EpisodeSource(
+    this.url, [
+    this.keyHex = '',
+    this.variants = const [],
+    this.vertical,
+  ]);
 
   EpisodeSource withVariant(EpisodeVariant variant) =>
-      EpisodeSource(variant.url, variant.keyHex, variants);
+      EpisodeSource(variant.url, variant.keyHex, variants, vertical);
 
   factory EpisodeSource.fromResponse(Map<String, dynamic> response) {
     final data = response['data'] is Map
@@ -74,8 +84,41 @@ class EpisodeSource {
         );
       }
     }
-    return EpisodeSource(url, (data['key_hex'] ?? '').toString().trim(), variants);
+    return EpisodeSource(
+      url,
+      (data['key_hex'] ?? '').toString().trim(),
+      variants,
+      _verticalOf(data['vertical'] ?? response['vertical']),
+    );
   }
+}
+
+/// The rendition to try after [failed] could not start: the next lower one
+/// with a different stream, else the next higher one. Null when [failed] is
+/// not listed or no other stream exists.
+EpisodeVariant? fallbackVariant(List<EpisodeVariant> variants, String failed) {
+  final index = variants.indexWhere((variant) => variant.name == failed);
+  if (index < 0) return null;
+  final url = variants[index].url;
+  for (final variant in variants.skip(index + 1)) {
+    if (variant.url != url) return variant;
+  }
+  for (final variant in variants.take(index).toList().reversed) {
+    if (variant.url != url) return variant;
+  }
+  return null;
+}
+
+/// Lenient `vertical` decoding for the backend response.
+bool? _verticalOf(dynamic value) {
+  if (value is bool) return value;
+  if (value is num) return value != 0;
+  if (value is String) {
+    final text = value.trim().toLowerCase();
+    if (text == 'true' || text == '1') return true;
+    if (text == 'false' || text == '0') return false;
+  }
+  return null;
 }
 
 enum EpisodeSourceOrigin {

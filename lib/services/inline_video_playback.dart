@@ -8,7 +8,9 @@ import 'dart:ui' show Size;
 import 'package:flutter/foundation.dart';
 
 import '../models/media_item.dart';
+import '../widgets/player/player_video_layout.dart';
 import 'api_client.dart';
+import 'connectivity_status.dart';
 import 'drama_download_store.dart';
 import 'drama_mute_preferences.dart';
 import 'episode_source_cache.dart';
@@ -19,7 +21,9 @@ import 'player_history.dart';
 import 'player_panel_preferences.dart';
 import 'player_preferences.dart';
 import 'player_pool.dart';
+import 'quality_memory.dart';
 import 'user_facing_error.dart';
+import 'video_catalogue.dart';
 
 /// The inline playback session of one 短剧 feed page.
 ///
@@ -137,6 +141,15 @@ class InlineVideoPlayback {
   /// box; `PlayerVideoLayout` turns an unknown (0×0) size into that fallback.
   final ValueNotifier<Size> videoSize = ValueNotifier<Size>(Size.zero);
 
+  /// 本集是否为横版片源，`null` 表示还没判出来。
+  ///
+  /// 官方那颗横屏钮的显隐看数据层的 `saasVideoData.isVertical()`
+  /// （`vk3/a.java:32`），换集后立刻成立。本地源数据没有这个字段，只能等
+  /// 解码器报尺寸；但一旦报过就是确定的，不能因为换集时 [videoSize] 被重置
+  /// 成 `Size.zero` 就退回「未知」——那正是「上划一集后钮就再也不出现」的
+  /// 成因。所以结论在这里单独记一份，随集切换一起清空。
+  final ValueNotifier<bool?> landscapeSource = ValueNotifier<bool?>(null);
+
   bool _muted = false;
   bool _coldStartMuteApplied = false;
   bool _coldStartRateApplied = false;
@@ -163,12 +176,30 @@ class InlineVideoPlayback {
   int? _activeIndex;
   int _generation = 0;
   bool _hasDisplayed = false;
+  bool _progressDirty = false;
   bool _wantsPlay = true;
+  bool _playIssued = false;
   bool _disposed = false;
   bool _reusedFromPool = false;
 
   /// True while a player instance exists (playing or paused).
   bool get hasPlayer => _player != null;
+
+  /// Whether the session intends to play once the current activation or
+  /// resume finishes. A manual [pause] clears it; [resume] sets it again.
+  bool get wantsPlay => _wantsPlay;
+
+  /// True while an activation still intends to play but has not issued `play`
+  /// yet: the player does not exist, is still being created, or exists but the
+  /// activation has not reached its play step.
+  ///
+  /// A viewer who pauses the created player directly (the desktop chrome does
+  /// exactly that) leaves [wantsPlay] true but has already been past the play
+  /// step, so this is false for them.
+  bool get awaitingPlayback => _wantsPlay && !_playIssued;
+
+  /// Shared desktop transport; ownership remains with this session.
+  NativePlayer? get player => _player;
 
   /// The drama this session targets, null before the first activation. The
   /// title/cover follow the feed item that started it（听书页与下载弹窗的
@@ -227,23 +258,14 @@ class InlineVideoPlayback {
     final cached = _directories[key];
     if (cached != null) return cached;
     final loader = directoryLoader;
-    final volumes = loader != null
-        ? await loader(contentId, tab)
-        : await ApiClient.instance.directoryChapters(contentId, tab: tab);
-    final List<List<Chapter>> resolved =
-        volumes.isEmpty && series.episodeId != null
-        ? [
-            [
-              Chapter(
-                itemId: series.episodeId!,
-                title: series.title,
-                volumeName: '剧集',
-              ),
-            ],
-          ]
-        : volumes;
-    final episodes = <Chapter>[for (final volume in resolved) ...volume];
-    if (episodes.isNotEmpty) _directories[key] = episodes;
+    final episodes = await loadVideoCatalogue(
+      seriesId: contentId,
+      tab: tab,
+      episodeId: series.episodeId,
+      title: series.title,
+      loader: loader == null ? null : () => loader(contentId, tab),
+    );
+    if (hasCompleteEpisodeCatalogue(episodes)) _directories[key] = episodes;
     return episodes;
   }
 
@@ -281,7 +303,9 @@ class InlineVideoPlayback {
     _tab = tab;
     _active = series;
     _hasDisplayed = false;
+    _progressDirty = false;
     _wantsPlay = true;
+    _playIssued = false;
     _reusedFromPool = false;
     activeId.value = series.id;
     firstFrame.value = false;
@@ -295,8 +319,16 @@ class InlineVideoPlayback {
     if (previous != null && previousId != null && previousId != contentId) {
       _parkWithState(previousId, previous);
     } else if (previous != null && previousId == contentId) {
-      // Same drama re-activated (a retry): the old decoder is stale.
-      unawaited(previous.dispose());
+      // Same drama re-activated (next episode / retry): the old decoder is
+      // stale and is not parked. Its destruction has to join the [_releases]
+      // chain — [switchVariant] and [_teardown] both do that, because "only
+      // one native player alive at a time" is the contract [release]
+      // documents. Disposing it on the side let the new decoder be created
+      // while the old one was still tearing down: two native players briefly
+      // coexisted, which surfaces as "playback failed" on the next episode
+      // (MediaCodec slot contention on Android, an unclosed media session on
+      // the desktop side).
+      _retire(previous);
     }
 
     // Reuse path: the pool still holds this drama's paused decoder.
@@ -337,6 +369,8 @@ class InlineVideoPlayback {
     _activeIndex = null;
     rotation.value = 0;
     videoSize.value = Size.zero;
+    // 换剧即换片源，横竖结论跟着作废（同一部剧内换集不会走到这里）。
+    landscapeSource.value = null;
     // The progress bar belongs to one episode, so it restarts empty.
     position.value = Duration.zero;
     duration.value = Duration.zero;
@@ -357,29 +391,58 @@ class InlineVideoPlayback {
         // Local storage is optional for starting a video.
       }
       if (!_current(generation)) return;
-      final index =
-          (startEpisodeIndex ?? resumeEpisodeIndex(saved, episodes) ?? 0).clamp(
-            0,
-            episodes.length - 1,
-          );
+      final savedIndex = resumeEpisodeIndex(saved, episodes);
+      final index = (startEpisodeIndex ?? savedIndex ?? 0).clamp(
+        0,
+        episodes.length - 1,
+      );
+      final rawPosition = saved?['position'];
+      final rawDuration = saved?['duration'];
+      final savedDuration = savedIndex == index && rawDuration is num
+          ? rawDuration.toDouble()
+          : 0.0;
+      final requestedMs =
+          startPosition?.inMilliseconds.toDouble() ??
+          (savedIndex == index && rawPosition is num ? rawPosition * 1000 : 0);
+      final startMs =
+          requestedMs.isFinite &&
+              requestedMs > 0 &&
+              requestedMs < 0x7fffffffffffffff &&
+              (startPosition != null ||
+                  !savedDuration.isFinite ||
+                  savedDuration <= 0 ||
+                  requestedMs < savedDuration * 1000)
+          ? requestedMs.round()
+          : null;
       _episodes = episodes;
       _activeIndex = index;
-      // 听书回传的位置先挂上进度条再等首帧；弹幕调度器读 [position] 做
-      // 首批起始毫秒，方向才会对。
-      if (startPosition != null && startPosition > Duration.zero) {
-        position.value = startPosition;
+      // Seed both native preparation and danmaku from the same episode's
+      // resume point; restoring only the episode would overwrite it with zero.
+      if (startMs != null) {
+        position.value = Duration(milliseconds: startMs);
       }
       activeVid.value = episodes[index].itemId;
-      var source = await _sources.request(episodes[index]).future;
-      // 会话内记住的画质选择（官方=引擎当前档）：同一集再次激活时沿用。
-      final chosen = _chosen[episodes[index].itemId];
-      if (chosen != null) source = source.withVariant(chosen);
+      var source = await _sourceFor(episodes[index]);
+      // 会话内记住的画质选择（官方=引擎当前档）：按画质名在本集自己
+      // 的 variants 里找，找到就用，找不到回默认。记忆由
+      // [QualityMemory] 在 Feed 与播放页之间共享；只记名、不搬
+      // variant 对象——variant 的 URL 属于它自己的集。
+      final chosenName = QualityMemory.nameFor(contentId);
+      if (chosenName != null) {
+        for (final variant in source.variants) {
+          if (variant.name == chosenName) {
+            source = source.withVariant(variant);
+            break;
+          }
+        }
+      }
       _currentSource = source;
       if (!_current(generation)) return;
       final uri = Uri.tryParse(source.url);
       if (uri == null ||
-          (uri.scheme != 'http' && uri.scheme != 'https') ||
-          uri.host.isEmpty) {
+          (uri.scheme != 'file' &&
+              ((uri.scheme != 'http' && uri.scheme != 'https') ||
+                  uri.host.isEmpty))) {
         throw const ApiException('获取播放地址失败');
       }
       // A parked player is only torn down here, and only its own release is
@@ -388,14 +451,14 @@ class InlineVideoPlayback {
       if (!_current(generation)) return;
       final player = candidate = playerFactory?.call() ?? NativePlayer();
       _player = player;
-      await player.create(source.url, source.keyHex);
+      await player.create(source.url, source.keyHex, startMs: startMs);
       if (!_current(generation, player)) {
         if (identical(_player, player)) _player = null;
         await player.dispose();
         return;
       }
       if (player.lastError case final Object failure) throw failure;
-      _subscribe(player, generation);
+      _subscribe(player, generation, startMs: startMs);
       textureId.value = player.textureId;
       _adoptVideoSize(player);
       rotation.value = player.videoRotationCorrection ~/ 90;
@@ -403,16 +466,16 @@ class InlineVideoPlayback {
       // to be pushed back on it before the first frame shows.
       await _applyPlaybackPrefs(player);
       if (!_current(generation, player)) return;
-      if (startPosition != null && startPosition > Duration.zero) {
-        // 越界（听完一整集）就从头起播；时长未知时信任调用方。
-        final total = player.duration;
-        if (total <= Duration.zero || startPosition < total) {
-          await player.seek(startPosition);
-          if (!_current(generation, player)) return;
-        }
+      if (startMs != null &&
+          player.duration > Duration.zero &&
+          startMs >= player.duration.inMilliseconds) {
+        await player.seek(Duration.zero);
+        if (!_current(generation, player)) return;
       }
       if (player.firstFrameRendered) _onFirstFrame(player, generation);
       if (_wantsPlay) {
+        _playIssued = true;
+        _progressDirty = true;
         await player.play();
         if (!_current(generation, player)) return;
         playing.value = _playbackRequested(player);
@@ -435,11 +498,6 @@ class InlineVideoPlayback {
   /// The source the current player was created from, including the rendition
   /// list. Null while nothing plays.
   EpisodeSource? _currentSource;
-
-  /// Session-level quality choice per episode id. The official client keeps
-  /// the resolution on the engine instance for the session only; there is no
-  /// cross-launch preference evidence, so none is stored here either.
-  final Map<String, EpisodeVariant> _chosen = {};
 
   /// Renditions of the playing episode, best-quality first. Empty while
   /// nothing plays or the upstream offered a single stream (the panel hides
@@ -474,11 +532,12 @@ class InlineVideoPlayback {
     _detachSubscriptions();
     if (identical(_player, player)) _player = null;
     _currentSource = source.withVariant(variant);
-    _chosen[series.id] = variant;
+    QualityMemory.remember(_poolKey(series), variant.name);
     // A replacement texture must not inherit the previous rendition's frame,
     // size, or rotation. The layer keeps its cover until the new stream is ready.
     textureId.value = null;
     firstFrame.value = false;
+    _hasDisplayed = false;
     videoSize.value = Size.zero;
     rotation.value = 0;
     var release = _releases;
@@ -509,6 +568,7 @@ class InlineVideoPlayback {
       seeked.value = resume;
       if (!_current(generation, fresh)) return;
       if (resumeWantsPlay || _wantsPlay) {
+        _progressDirty = true;
         await fresh.play();
         if (!_current(generation, fresh)) return;
       }
@@ -557,6 +617,8 @@ class InlineVideoPlayback {
     await _applyPlaybackPrefs(player);
     if (!_current(generation, player)) return;
     if (!_wantsPlay) return;
+    _playIssued = true;
+    _progressDirty = true;
     try {
       await player.play();
     } catch (failure) {
@@ -601,6 +663,8 @@ class InlineVideoPlayback {
     final player = _player;
     if (player == null || !player.isCreated || error.value != null) return;
     final generation = _generation;
+    _playIssued = true;
+    _progressDirty = true;
     try {
       await player.play();
     } catch (failure) {
@@ -617,6 +681,17 @@ class InlineVideoPlayback {
   /// 官方的静音会话态是**全局单例**（`tm3.b`），feed 药丸写 `a()/m()` 后
   /// 全屏播放页经广播跟随；这里同步到 [PlayerPanelPreferences] 单例，
   /// 让同一会话内打开的全屏播放页与 feed 保持一致（官方广播语义的等价物）。
+  Future<void> setVolume(double value) async {
+    value = value.clamp(0, 1);
+    _muted = value == 0;
+    muted.value = _muted;
+    PlayerPanelPreferences.setDefaultMute(_muted);
+    final player = _player;
+    if (player != null && player.isCreated) {
+      await player.setVolume(value);
+    }
+  }
+
   Future<void> toggleMute() async {
     _muted = !_muted;
     muted.value = _muted;
@@ -659,6 +734,7 @@ class InlineVideoPlayback {
   Future<void> seek(Duration target) async {
     final player = _player;
     if (player == null || !player.isCreated) return;
+    final generation = _generation;
     final total = player.duration;
     final clamped = target < Duration.zero
         ? Duration.zero
@@ -666,12 +742,15 @@ class InlineVideoPlayback {
     position.value = clamped;
     seeked.value = clamped;
     await player.seek(clamped);
+    if (!_current(generation, player)) return;
+    _progressDirty = true;
+    if (!_wantsPlay) await _persistProgress();
   }
 
   /// 听书页的取流入口：离线优先，在线走会话的取流
   /// 缓存——与全页播放页 `_resolveSource` 同构。失败返回 null，由听书页
   /// 呈现错误态，不抛穿。
-  Future<EpisodeSource?> resolveListenSource(Chapter episode) async {
+  Future<EpisodeSource> _sourceFor(Chapter episode) async {
     final store = HiveDramaDownloadStore.instance;
     if (store.isReady) {
       try {
@@ -683,8 +762,15 @@ class InlineVideoPlayback {
         // 离线索引读不出来就当没有缓存。
       }
     }
+    if (contentLoader == null && !(await currentConnectivity()).online) {
+      throw const OfflineEpisodeUnavailable();
+    }
+    return _sources.request(episode).future;
+  }
+
+  Future<EpisodeSource?> resolveListenSource(Chapter episode) async {
     try {
-      return await _sources.request(episode).future;
+      return await _sourceFor(episode);
     } catch (_) {
       return null;
     }
@@ -713,7 +799,7 @@ class InlineVideoPlayback {
       'seriesId': contentId,
       'episodeId': episodes[index].itemId,
       'chapterId': episodes[index].itemId,
-      'episode': index,
+      if (episodes[index].hasKnownIndex) 'episode': index,
       // 听书页只回传集内进度，总长未知：progress 置 0，续看按 position。
       'progress': 0.0,
       'position': positionMs / 1000,
@@ -862,13 +948,14 @@ class InlineVideoPlayback {
     pool.park(key, player);
   }
 
-  void _subscribe(NativePlayer player, int generation) {
+  void _subscribe(NativePlayer player, int generation, {int? startMs}) {
     _subs.addAll([
       player.firstFrameStream.listen((_) {
         if (_current(generation, player)) _onFirstFrame(player, generation);
       }),
-      player.playWhenReadyStream.listen((_) {
+      player.playWhenReadyStream.listen((requested) {
         if (_current(generation, player)) {
+          if (requested) _progressDirty = true;
           playing.value = _playbackRequested(player);
         }
       }),
@@ -887,16 +974,31 @@ class InlineVideoPlayback {
         // applied to auto-advance (`_appliedVideoSize`).
         if (size.width <= 0 || size.height <= 0) return;
         videoSize.value = size;
+        // 横竖判据必须跟着真实尺寸走。新建/复用播放器那两处
+        // `_adoptVideoSize` 读的是创建当下的大小，此时通常还是 0×0，
+        // 真正尺寸只在这里到达——漏了这一步 `landscapeSource` 会一直是
+        // null，feed 的横屏钮就永远不出现（用户实测回归）。
+        landscapeSource.value =
+            size.width / size.height >= PlayerVideoLayout.landscapeRatio;
       }),
       player.textureIdStream.listen((id) {
         if (_current(generation, player)) textureId.value = id;
       }),
       // The card's progress bar reads these two (`cjt.xml`).
       player.positionStream.listen((value) {
-        if (_current(generation, player)) position.value = value;
+        if (!_current(generation, player)) return;
+        // Desktop controls seek the native player directly while the visible
+        // session retains play intent, even when the decoder is paused.
+        if (_wantsPlay && value != position.value) _progressDirty = true;
+        position.value = value;
       }),
       player.durationStream.listen((value) {
-        if (_current(generation, player)) duration.value = value;
+        if (!_current(generation, player)) return;
+        if (startMs != null && startMs! >= value.inMilliseconds) {
+          startMs = null;
+          unawaited(player.seek(Duration.zero));
+        }
+        duration.value = value;
       }),
     ]);
   }
@@ -944,6 +1046,9 @@ class InlineVideoPlayback {
     final height = player.videoHeight;
     if (width <= 0 || height <= 0) return;
     videoSize.value = Size(width.toDouble(), height.toDouble());
+    // 与 `PlayerVideoLayout.fillsFrame` 同一道门槛：宽高比达到
+    // `landscapeRatio` 才算横版片源。判出来就不再回退成未知。
+    landscapeSource.value = width / height >= PlayerVideoLayout.landscapeRatio;
   }
 
   void _onFirstFrame(NativePlayer player, int generation) {
@@ -975,6 +1080,7 @@ class InlineVideoPlayback {
     _activeIndex = null;
     activeVid.value = null;
     _hasDisplayed = false;
+    _progressDirty = false;
     if (!_disposed) textureId.value = null;
     final cancellations = [
       for (final subscription in _subs) subscription.cancel(),
@@ -995,6 +1101,28 @@ class InlineVideoPlayback {
       release,
     ]).then<void>((_) {}).catchError((Object _) {});
     return _releases;
+  }
+
+  /// Queue [player]'s **destructive** release behind every earlier one, keeping
+  /// the chain in [_releases] so the next `create` waits for it.
+  ///
+  /// Same contract as [_teardown], minus the session-state reset: the caller is
+  /// mid-`activate` and is about to install its own state, so only the native
+  /// side is touched here. Pausing first keeps a decoder that still holds an
+  /// audio track from being audible until the release lands.
+  void _retire(NativePlayer player) {
+    final release = () async {
+      try {
+        if (player.isCreated) await player.pause();
+      } catch (_) {
+        // A decoder that refuses to pause still has to be released.
+      }
+      await player.dispose();
+    }();
+    _releases = Future.wait([
+      _releases,
+      release,
+    ]).then<void>((_) {}).catchError((Object _) {});
   }
 
   Map<String, dynamic> _historyEntry(
@@ -1020,7 +1148,7 @@ class InlineVideoPlayback {
       'seriesId': contentId,
       'episodeId': _episodes[index].itemId,
       'chapterId': _episodes[index].itemId,
-      'episode': index,
+      if (_episodes[index].hasKnownIndex) 'episode': index,
       'progress': durationMs > 0 ? positionMs / durationMs : 0.0,
       'position': positionMs / 1000,
       'duration': durationMs / 1000,
@@ -1041,10 +1169,15 @@ class InlineVideoPlayback {
         index == null ||
         series == null ||
         index >= _episodes.length ||
-        !_hasDisplayed) {
+        !_hasDisplayed ||
+        !_progressDirty) {
       return Future<void>.value();
     }
     final contentId = series.seriesId ?? series.id;
+    // A hidden, already-paused decoder must not re-save its stale position
+    // when a picker backgrounds the app after another player saved progress.
+    // Playback or an explicit seek makes this session writable again.
+    _progressDirty = false;
     return _history.save(_historyEntry(series, contentId, index, player));
   }
 }

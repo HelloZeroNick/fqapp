@@ -10,10 +10,14 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import 'package:fqapp/models/media_item.dart';
 import 'package:fqapp/models/playlet_comment.dart';
+import 'package:fqapp/pages/drama_download_sheet.dart';
 import 'package:fqapp/pages/drama_page.dart';
 import 'package:fqapp/pages/home_provider.dart';
+import 'package:fqapp/pages/player_page.dart';
 import 'package:fqapp/services/api_client.dart';
+import 'package:fqapp/services/app_theme.dart';
 import 'package:fqapp/services/digg_store.dart';
+import 'package:fqapp/services/drama_channel_preferences.dart';
 import 'package:fqapp/services/drama_mute_preferences.dart';
 import 'package:fqapp/services/player_preferences.dart';
 import 'package:fqapp/services/shelf_store.dart';
@@ -65,8 +69,14 @@ class _Session {
   /// 条目简介文案（官方信息槽的「第1集丨…」回落行）。
   String itemIntro = '';
 
+  /// 应用主题（深色适配用例显式传入；缺省走 MaterialApp 默认浅色）。
+  ThemeData? theme;
+
   /// 内容回包附带的多档流名（官方清晰度行的数据源；空 = 单流，行隐藏）。
   List<String> variantNames = [];
+
+  /// 每部剧的目录集数（缺省单集）。续播到第 N 集的用例调大它。
+  int episodeCount = 1;
 
   /// The two notifiers the page's providers resolve to; kept as fields so a
   /// test can re-load the feed without a gesture.
@@ -99,13 +109,17 @@ class _Session {
       dramaProvider.overrideWith(() => drama),
     ],
     child: MaterialApp(
+      theme: theme,
       home: TickerMode(
         enabled: tickerEnabled,
         child: DramaPage(
           directoryLoader: (id, tab) async {
             directoryCalls.add('$id:$tab');
             return [
-              [Chapter(itemId: '$id-1', title: '第 1 集', volumeName: '剧集')],
+              [
+                for (var n = 1; n <= episodeCount; n++)
+                  Chapter(itemId: '$id-$n', title: '第 $n 集', volumeName: '剧集'),
+              ],
             ];
           },
           contentLoader: (itemId, tab) async {
@@ -185,6 +199,8 @@ void main() {
   // has to exist before the first build.
   setUp(() async {
     SharedPreferences.setMockInitialValues({});
+    // 频道选择是进程级静态态：别的用例切过频道会带进本页的冷启动恢复。
+    DramaChannelPreferences.reset();
     TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
         .setMockMethodCallHandler(
           const MethodChannel('fqapp/native_player'),
@@ -292,6 +308,83 @@ void main() {
     expect(rect.bottom, lessThanOrEqualTo(feed.bottom + 0.5));
     // 横版源：官方 `vk3.a.a` 只在非竖屏源上显示 30dp 圆形全屏钮。
     expect(find.byKey(const Key('drama_fullscreen_button')), findsOneWidget);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('上划换集后横屏钮仍在（判据不随 videoSize 重置退回未知）', (tester) async {
+    // 官方 `vk3.a.a` 读数据层 `isVertical()`，与「解码尺寸此刻是否已知」无关；
+    // 此前用 `videoSize` 宽高比代理，换集时它被重置成 `Size.zero`，图标就再也
+    // 不出现（用户反馈「上划后按钮不见了」）。
+    final session = _Session(width: 1920, height: 1080);
+    await _mount(tester, session);
+    expect(find.byKey(const Key('drama_fullscreen_button')), findsOneWidget);
+
+    await _swipeUp(tester);
+    expect(find.byKey(const Key('drama_fullscreen_button')), findsOneWidget);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('尺寸晚到也要点亮横屏钮（真机时序：创建时 0×0）', (tester) async {
+    // 真机上 `create()` 那一刻播放器还是 0×0，真实尺寸随后才由
+    // `videoSizeStream` 送来。此前只在 `_adoptVideoSize`（创建/复用当下读
+    // 尺寸）里判横竖，于是 `landscapeSource` 永远是 null、钮不出现——用户
+    // 在 CI 产物上实测到的就是这个回归。
+    final session = _Session(width: 0, height: 0);
+    await _mount(tester, session);
+    // 尺寸未知：不渲染（官方此时也无从知道横竖）。
+    expect(find.byKey(const Key('drama_fullscreen_button')), findsNothing);
+
+    session.players.single.emitVideoSize(1920, 1080);
+    await _flush(tester);
+    expect(find.byKey(const Key('drama_fullscreen_button')), findsOneWidget);
+
+    // 竖版片源尺寸晚到：仍然不给入口（官方 `!isVertical()` 才显示）。
+    session.players.single.emitVideoSize(1080, 1920);
+    await _flush(tester);
+    expect(find.byKey(const Key('drama_fullscreen_button')), findsNothing);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('滑回复用池内解码器后，横屏钮仍在（复用路径也要恢复判据）', (tester) async {
+    // 播放器那条路。如果这条路不重算横竖，滑回来时钮就没了。
+    final session = _Session(width: 1920, height: 1080);
+    await _mount(tester, session);
+    expect(find.byKey(const Key('drama_fullscreen_button')), findsOneWidget);
+
+    await _swipeUp(tester);
+    await _flush(tester);
+    expect(session.players, hasLength(2));
+
+    await tester.drag(
+      find.byKey(const Key('drama_feed')),
+      const Offset(0, 600),
+    );
+    await tester.pumpAndSettle();
+    await _flush(tester);
+    expect(session.players, hasLength(2));
+    expect(find.byKey(const Key('drama_fullscreen_button')), findsOneWidget);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('点横屏钮进播放页且一进去就是全屏（官方独立横屏页）', (tester) async {
+    // 官方那颗钮走 `zf3.c.w` → `transformToLandActivity` →
+    // `startActivity(ShortSeriesLandActivity)`（`jq3/x.java:4499`），页面一起来
+    // 就是横屏全屏，不是「观看全集」那种先竖屏播放页。
+    final session = _Session(width: 1920, height: 1080);
+    await _mount(tester, session);
+    final button = find.byKey(const Key('drama_fullscreen_button'));
+    expect(button, findsOneWidget);
+
+    await tester.tap(button);
+    await _flush(tester);
+    await tester.pump(const Duration(milliseconds: 400));
+    await _flush(tester);
+
+    expect(find.byType(PlayerPage), findsOneWidget);
+    // 进页即全屏：`openFullScreen` 把播放页放在全屏态，与官方横屏 Activity
+    // 一致（竖屏常驻的「全屏观看」药丸在全屏态下已收起）。
+    final page = tester.widget<PlayerPage>(find.byType(PlayerPage));
+    expect(page.openFullScreen, isTrue);
     expect(tester.takeException(), isNull);
   });
 
@@ -553,10 +646,13 @@ void main() {
   });
 
   testWidgets('看剧海报格不在背后起播，切回推荐才重新播放', (tester) async {
+    addTearDown(() => dramaLightPageNotifier.value = false);
     final session = _Session();
     await _mount(tester, session);
     final feedPlayer = session.players.single;
     expect(feedPlayer.isPlaying, isTrue);
+    // 推荐是视频流：壳层 dock 保持深色玻璃。
+    expect(dramaLightPageNotifier.value, isFalse);
 
     final historyWrite = Completer<void>();
     session.store.writeGate = historyWrite;
@@ -564,6 +660,8 @@ void main() {
     await _flush(tester);
     await _flush(tester);
 
+    // 看剧是浅色页：壳层 dock / 系统导航栏要跟着换回浅色。
+    expect(dramaLightPageNotifier.value, isTrue);
     expect(find.byKey(const Key('drama_episode_grid')), findsOneWidget);
     expect(find.byType(Texture), findsNothing);
     expect(feedPlayer.isPlaying, isFalse);
@@ -574,6 +672,7 @@ void main() {
     await _flush(tester);
     await tester.tap(find.text('推荐'));
     await _flush(tester);
+    expect(dramaLightPageNotifier.value, isFalse);
     expect(session.players, hasLength(2));
     expect(session.players.last.isPlaying, isTrue);
     expect(tester.takeException(), isNull);
@@ -679,15 +778,23 @@ void main() {
     // 浅色支没有取消行（官方 aae 布局同款）。
     expect(find.text('取消'), findsNothing);
 
-    // 选 1.25x：药丸点击立即回传（官方 jj3/i.e 语义），feed 播放器生效并
-    // 写入全局速率配置（全页播放页读同一份）。面板退场动画跨帧推进。
-    await tester.tap(find.byKey(const ValueKey('player-more-light-rate-1.25')));
+    // 选 1.25x：面板的「倍速」入口行先收起面板，再级联开档位弹层，选中
+    // 即落地并写入全局速率配置（全页播放页读同一份）。
+    await tester.tap(find.text('倍速'));
     await tester.pump(const Duration(milliseconds: 400));
     await tester.pump(const Duration(milliseconds: 300));
     await _flush(tester);
     await tester.pump(const Duration(milliseconds: 600));
     await _flush(tester);
     expect(find.byKey(const ValueKey('player-more-light-panel')), findsNothing);
+    expect(find.byKey(const ValueKey('player-rate-sheet')), findsOneWidget);
+    await tester.tap(find.byKey(const ValueKey('player-rate-sheet-2')));
+    await tester.pump(const Duration(milliseconds: 400));
+    await tester.pump(const Duration(milliseconds: 300));
+    await _flush(tester);
+    await tester.pump(const Duration(milliseconds: 600));
+    await _flush(tester);
+    expect(find.byKey(const ValueKey('player-rate-sheet')), findsNothing);
     expect(session.players.single.calls, contains('rate:1.25'));
     expect(await PlayerPreferences.loadPlaybackRate(), 1.25);
     // 面板选速不是快进：速率≠1 也不出现「2倍速快进中」。
@@ -706,6 +813,31 @@ void main() {
     await _flush(tester);
     expect(session.players.single.calls, contains('rate:1.25'));
     expect(find.byKey(const Key('drama_rate_hint')), findsNothing);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('深色主题下 feed 更多面板底跟着翻深', (tester) async {
+    // 浅色支面板的内容按 Theme 亮度翻白（PlayletMorePanelLight），弹层底
+    // 不跟着翻就是 #FAFAFA 底配白字。
+    SharedPreferences.setMockInitialValues({});
+    final session = _Session(hasFirstFrame: true)
+      ..theme = AppTheme.createTheme(Brightness.dark);
+    await _mount(tester, session);
+    session.players.single.emitDuration(const Duration(minutes: 2));
+    await _flush(tester);
+    await tester.longPress(find.byKey(const Key('drama_card_gestures')));
+    await tester.pump(const Duration(milliseconds: 300));
+    await _flush(tester);
+    expect(
+      find.byKey(const ValueKey('player-more-light-panel')),
+      findsOneWidget,
+    );
+    final sheet = tester.widget<BottomSheet>(find.byType(BottomSheet));
+    expect(sheet.backgroundColor, const Color(0xFF1C1C1C));
+    expect(
+      tester.widget<Text>(find.text('倍速')).style?.color,
+      const Color(0xCCFFFFFF),
+    );
     expect(tester.takeException(), isNull);
   });
 
@@ -808,11 +940,18 @@ void main() {
     await tester.pump(const Duration(milliseconds: 300));
     await _flush(tester);
     expect(find.text('清晰度'), findsOneWidget);
+    // 档位不再内联铺开：点入口行才开档位弹层。
+    expect(find.text('540P'), findsNothing);
+    await tester.tap(find.text('清晰度'));
+    await tester.pump(const Duration(milliseconds: 400));
+    await tester.pump(const Duration(milliseconds: 300));
+    await _flush(tester);
+    expect(find.byKey(const ValueKey('player-quality-sheet')), findsOneWidget);
     expect(find.text('1080P'), findsOneWidget);
     expect(find.text('540P'), findsOneWidget);
 
     // 选 1080P（官方 bgw）：Toast 立即出，不等换流完成。
-    await tester.tap(find.byKey(const ValueKey('player-more-light-quality-0')));
+    await tester.tap(find.byKey(const ValueKey('player-quality-sheet-0')));
     await tester.pump(const Duration(milliseconds: 100));
     expect(find.text('清晰度已成功切换至1080P'), findsOneWidget);
     await tester.pump(const Duration(milliseconds: 400));
@@ -820,7 +959,7 @@ void main() {
     await _flush(tester);
     await tester.pump(const Duration(milliseconds: 600));
     await _flush(tester);
-    expect(find.byKey(const ValueKey('player-more-light-panel')), findsNothing);
+    expect(find.byKey(const ValueKey('player-quality-sheet')), findsNothing);
     // 旧解码器销毁（换档不是入池），新解码器按所选档重建并回跳 30s。
     expect(session.players, hasLength(2));
     expect(session.players.first.calls, contains('dispose'));
@@ -989,6 +1128,37 @@ void main() {
     await _flush(tester);
     expect(find.byKey(const ValueKey('player-more-light-panel')), findsNothing);
     expect(find.byKey(const ValueKey('download-sheet')), findsOneWidget);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('feed 下载弹窗从续播的那集算起，并带上本集真实画质', (tester) async {
+    // 回归：feed 入口曾不传 currentIndex/qualities，「往后N集」从第 1 集
+    // 算、默认分组停在第一组、画质只剩预设档位（播放页入口是对的）。
+    SharedPreferences.setMockInitialValues({});
+    final session = _Session(hasFirstFrame: true)
+      ..episodeCount = 3
+      ..variantNames = ['1080P', '540P'];
+    // 内存仓库对任何剧都回这条记录：按集序号续播到第 3 集。
+    session.store.entry = {'episode': 2};
+    await _mount(tester, session);
+    session.players.single.emitDuration(const Duration(minutes: 2));
+    await _flush(tester);
+    expect(session.contentCalls.first, contains('-3:'));
+
+    await tester.longPress(find.byKey(const Key('drama_card_gestures')));
+    await tester.pump(const Duration(milliseconds: 300));
+    await _flush(tester);
+    await tester.tap(find.byKey(const ValueKey('player-more-light-download')));
+    await tester.pump(const Duration(milliseconds: 400));
+    await _flush(tester);
+    await tester.pump(const Duration(milliseconds: 400));
+    await _flush(tester);
+
+    final sheet = tester.widget<DramaDownloadSheet>(
+      find.byType(DramaDownloadSheet),
+    );
+    expect(sheet.currentIndex, 2);
+    expect(sheet.qualities.map((variant) => variant.name), ['1080P', '540P']);
     expect(tester.takeException(), isNull);
   });
 

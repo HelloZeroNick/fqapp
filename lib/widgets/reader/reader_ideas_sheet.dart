@@ -5,7 +5,10 @@ import 'package:flutter_lucide/flutter_lucide.dart';
 
 import '../../models/book_comment.dart';
 import '../../models/chapter_ideas.dart';
+import '../../models/comment_reply.dart';
 import '../../services/reader_preferences.dart';
+import '../comment_emoji.dart';
+import '../comment_images.dart';
 import '../home/home_design.dart';
 import 'reader_theme.dart';
 
@@ -26,12 +29,19 @@ class ReaderIdeasSheet extends StatefulWidget {
   final ReaderThemePreset preset;
   final int? initialParaIndex;
 
+  /// Loads a comment's replies on first expand; null disables the affordance.
+  ///
+  /// Replies are read-only here for the same reason as the detail page: the
+  /// backend exposes counts but no reaction writes (issue #95).
+  final Future<CommentReplyPage> Function(String commentId)? replyLoader;
+
   const ReaderIdeasSheet({
     super.key,
     required this.ideas,
     required this.loadComments,
     required this.preset,
     this.initialParaIndex,
+    this.replyLoader,
   });
 
   @override
@@ -295,6 +305,7 @@ class _ReaderIdeasSheetState extends State<ReaderIdeasSheet> {
             comment: comments[index],
             textColor: _textColor,
             mutedColor: _mutedColor,
+            replyLoader: widget.replyLoader,
           );
         },
       ),
@@ -335,21 +346,121 @@ class _ReaderIdeasSheetState extends State<ReaderIdeasSheet> {
 enum _MoreStatus { idle, fetching, held, failed }
 
 /// Avatar beside the name and body; date, reply and reactions below the body.
-class _CommentRow extends StatelessWidget {
+///
+/// Tapping the reply counter expands that comment's replies in place. They load
+/// on first tap only: a paragraph can carry many comments and most are never
+/// expanded (issue #95).
+class _CommentRow extends StatefulWidget {
   final BookComment comment;
   final Color textColor;
   final Color mutedColor;
+  final Future<CommentReplyPage> Function(String commentId)? replyLoader;
 
   const _CommentRow({
     required this.comment,
     required this.textColor,
     required this.mutedColor,
+    this.replyLoader,
   });
 
-  Widget _avatarFallback() => ColoredBox(
-    color: mutedColor.withValues(alpha: 0.12),
-    child: Icon(LucideIcons.user, size: 18, color: mutedColor),
-  );
+  @override
+  State<_CommentRow> createState() => _CommentRowState();
+}
+
+class _CommentRowState extends State<_CommentRow> {
+  CommentReplyPage? _replies;
+  bool _loading = false;
+  bool _failed = false;
+
+  BookComment get comment => widget.comment;
+  Color get textColor => widget.textColor;
+  Color get mutedColor => widget.mutedColor;
+
+  /// Zero-reply comments get no collapsible footer (issue #173); the official
+  /// list only appends one when replies remain.
+  bool get _hasReplies => (_replies?.totalCount ?? comment.replyCount) > 0;
+
+  Future<void> _toggleReplies() async {
+    if (_loading) return;
+    // A second tap collapses; the page is kept so reopening is instant.
+    if (_replies != null) {
+      setState(() => _replies = null);
+      return;
+    }
+    final loader = widget.replyLoader;
+    if (loader == null) return;
+    setState(() {
+      _loading = true;
+      _failed = false;
+    });
+    try {
+      final page = await loader(comment.id);
+      if (!mounted) return;
+      setState(() {
+        _replies = page;
+        _loading = false;
+      });
+    } catch (_) {
+      if (!mounted) return;
+      setState(() {
+        _failed = true;
+        _loading = false;
+      });
+    }
+  }
+
+  /// Reply counter: tap to expand, chevron rotates with the state.
+  ///
+  /// The three labels follow the official state machine
+  /// (`xt1/e0.java` `A2()`, driven by the holder's state):
+  ///
+  /// | 状态 | 文案 | 箭头 |
+  /// | --- | --- | --- |
+  /// | 可展开 | `展开%d条回复` (strings `b9g`) | 0° |
+  /// | 已展开 | `收起` (strings `b9i`) | 180° |
+  /// | 加载中 | `加载中` (strings `b9j`) | — |
+  ///
+  /// Without a loader it stays a plain count, exactly as before: an offline
+  /// caller must not get a control that can only fail.
+  Widget _replyCounter(TextStyle metaStyle) {
+    final canOpen = widget.replyLoader != null;
+    final open = _replies != null;
+    final label = _replies?.totalCount ?? comment.replyCount;
+    // 不可展开时保留原来的只读计数，不冒充「展开 N 条回复」。
+    if (!canOpen) {
+      return Text(
+        label > 0 ? '回复 ${formatCount(label)}' : '回复',
+        style: metaStyle,
+      );
+    }
+    final text = _loading
+        ? '加载中'
+        : open
+        ? '收起'
+        : '展开 ${formatCount(label)} 条回复';
+    return GestureDetector(
+      key: ValueKey('reader_reply_toggle_${comment.id}'),
+      behavior: HitTestBehavior.opaque,
+      onTap: () => unawaited(_toggleReplies()),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Text(text, style: metaStyle),
+          const SizedBox(width: 2),
+          // 官方是把同一个箭头旋转 0°/180°，这里用上下箭头等价表达。
+          AnimatedRotation(
+            turns: open ? 0.5 : 0,
+            duration: const Duration(milliseconds: 160),
+            child: Icon(
+              LucideIcons.chevron_down,
+              size: 13,
+              color: mutedColor,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -360,26 +471,10 @@ class _CommentRow extends StatelessWidget {
       child: Row(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          ClipOval(
-            child: SizedBox.square(
-              dimension: 32,
-              child: comment.userAvatar.isEmpty
-                  ? _avatarFallback()
-                  : Image.network(
-                      comment.userAvatar,
-                      fit: BoxFit.cover,
-                      // The upstream serves 144px avatars for a 32dp slot;
-                      // decode once at the display size instead of keeping
-                      // full-size surfaces alive for every row.
-                      cacheWidth: (32 * MediaQuery.devicePixelRatioOf(context))
-                          .round(),
-                      gaplessPlayback: true,
-                      filterQuality: FilterQuality.low,
-                      frameBuilder: (context, child, frame, _) =>
-                          frame == null ? _avatarFallback() : child,
-                      errorBuilder: (context, _, _) => _avatarFallback(),
-                    ),
-            ),
+          _IdeaAvatar(
+            url: comment.userAvatar,
+            size: 32,
+            mutedColor: mutedColor,
           ),
           const SizedBox(width: 8),
           Expanded(
@@ -413,10 +508,35 @@ class _CommentRow extends StatelessWidget {
                   ],
                 ),
                 const SizedBox(height: 6),
-                Text(
-                  comment.text,
-                  style: TextStyle(color: textColor, fontSize: 16, height: 1.5),
-                ),
+                if (comment.text.isNotEmpty)
+                  CommentEmojiText(
+                    text: comment.text,
+                    style: TextStyle(
+                      color: textColor,
+                      fontSize: 16,
+                      height: 1.5,
+                    ),
+                  ),
+                if (comment.imageUrls.isNotEmpty) ...[
+                  if (comment.text.isNotEmpty) const SizedBox(height: 8),
+                  CommentImages(imageUrls: comment.imageUrls),
+                ],
+                if (_replies case final CommentReplyPage loaded) ...[
+                  const SizedBox(height: 8),
+                  _ReplyList(
+                    page: loaded,
+                    textColor: textColor,
+                    mutedColor: mutedColor,
+                  ),
+                ],
+                if (_failed) ...[
+                  const SizedBox(height: 6),
+                  Text(
+                    '回复加载失败',
+                    key: ValueKey('reader_reply_error_${comment.id}'),
+                    style: TextStyle(color: mutedColor, fontSize: 12.5),
+                  ),
+                ],
                 const SizedBox(height: 10),
                 Row(
                   children: [
@@ -426,12 +546,7 @@ class _CommentRow extends StatelessWidget {
                         runSpacing: 4,
                         children: [
                           if (time.isNotEmpty) Text(time, style: metaStyle),
-                          Text(
-                            comment.replyCount > 0
-                                ? '回复 ${formatCount(comment.replyCount)}'
-                                : '回复',
-                            style: metaStyle,
-                          ),
+                          if (_hasReplies) _replyCounter(metaStyle),
                         ],
                       ),
                     ),
@@ -471,4 +586,159 @@ class _CommentRow extends StatelessWidget {
       ),
     );
   }
+}
+
+/// Read-only reply list under an expanded paragraph comment.
+class _ReplyList extends StatelessWidget {
+  final CommentReplyPage page;
+  final Color textColor;
+  final Color mutedColor;
+
+  const _ReplyList({
+    required this.page,
+    required this.textColor,
+    required this.mutedColor,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    if (page.isEmpty) return const SizedBox.shrink();
+    return Container(
+      padding: const EdgeInsets.fromLTRB(10, 6, 10, 8),
+      decoration: BoxDecoration(
+        color: mutedColor.withValues(alpha: 0.08),
+        borderRadius: BorderRadius.circular(8),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          for (final reply in page.replies)
+            _ReplyTile(
+              reply: reply,
+              textColor: textColor,
+              mutedColor: mutedColor,
+            ),
+          if (page.hasMore)
+            Padding(
+              padding: const EdgeInsets.only(top: 4),
+              child: Text(
+                '仅显示部分回复',
+                style: TextStyle(color: mutedColor, fontSize: 11.5),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+}
+
+class _ReplyTile extends StatelessWidget {
+  final CommentReply reply;
+  final Color textColor;
+  final Color mutedColor;
+
+  const _ReplyTile({
+    required this.reply,
+    required this.textColor,
+    required this.mutedColor,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final time = reply.relativeTime();
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 4),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          _IdeaAvatar(
+            key: ValueKey('reader_reply_avatar_${reply.id}'),
+            url: reply.userAvatar,
+            size: 22,
+            mutedColor: mutedColor,
+          ),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                RichText(
+                  text: TextSpan(
+                    style: TextStyle(
+                      color: textColor,
+                      fontSize: 13.5,
+                      height: 1.4,
+                    ),
+                    children: [
+                      TextSpan(
+                        text: reply.userName.isEmpty ? '读者' : reply.userName,
+                        style: TextStyle(
+                          color: mutedColor,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                      if (time.isNotEmpty)
+                        TextSpan(
+                          text: '  $time',
+                          style: TextStyle(color: mutedColor, fontSize: 11.5),
+                        ),
+                      // Image-only replies would otherwise leave a blank line.
+                      if (reply.text.isNotEmpty)
+                        ...commentEmojiSpans('\n${reply.text}', fontSize: 13.5),
+                    ],
+                  ),
+                ),
+                if (reply.imageUrls.isNotEmpty) ...[
+                  const SizedBox(height: 6),
+                  CommentImages(imageUrls: reply.imageUrls),
+                ],
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// Round avatar shared by paragraph comments and their replies.
+class _IdeaAvatar extends StatelessWidget {
+  final String url;
+  final double size;
+  final Color mutedColor;
+
+  const _IdeaAvatar({
+    super.key,
+    required this.url,
+    required this.size,
+    required this.mutedColor,
+  });
+
+  Widget _fallback() => ColoredBox(
+    color: mutedColor.withValues(alpha: 0.12),
+    child: Icon(LucideIcons.user, size: size * 0.56, color: mutedColor),
+  );
+
+  @override
+  Widget build(BuildContext context) => ClipOval(
+    child: SizedBox.square(
+      dimension: size,
+      child: url.isEmpty
+          ? _fallback()
+          : Image.network(
+              url,
+              fit: BoxFit.cover,
+              // The upstream serves 144px avatars for small slots; decode once
+              // at the display size instead of keeping full-size surfaces
+              // alive for every row.
+              cacheWidth: (size * MediaQuery.devicePixelRatioOf(context))
+                  .round(),
+              gaplessPlayback: true,
+              filterQuality: FilterQuality.low,
+              frameBuilder: (context, child, frame, _) =>
+                  frame == null ? _fallback() : child,
+              errorBuilder: (context, _, _) => _fallback(),
+            ),
+    ),
+  );
 }

@@ -31,10 +31,8 @@ class ReaderUnderline {
   });
 
   /// See [paragraphUnderlineId].
-  int get id => paragraphUnderlineId(
-    paraIndex: paraIndex,
-    blockIndex: blockIndex,
-  );
+  int get id =>
+      paragraphUnderlineId(paraIndex: paraIndex, blockIndex: blockIndex);
 
   String get key => ReaderUnderlineStore.keyFor(
     bookId: bookId,
@@ -99,12 +97,24 @@ class ReaderRangeUnderline {
   final String bookId;
   final String chapterId;
 
-  /// Offsets into the chapter's display text — the same space as
-  /// `ReaderContentBlock.start`, see [ReaderUnderlineStore.rangeKeyFor].
+  /// Offsets into the original chapter text (the untransformed v2 layout).
+  /// The reader maps display selections back before saving, so changing
+  /// replacement rules does not move stored marks onto unrelated text.
   final int start;
   final int end;
   final String text;
   final int createdAt;
+
+  /// Display-only marks (AI edits) can use a dotted stroke. User underlines
+  /// always stay solid and are persisted without this flag.
+  final bool dashed;
+
+  /// True for a zero-width AI deletion marker. [start] and [end] are the same
+  /// display offset; the painter draws a caret there instead of a glyph range.
+  final bool deletion;
+
+  /// Optional in-memory payload for display-only AI marks.
+  final Object? payload;
 
   const ReaderRangeUnderline({
     required this.bookId,
@@ -113,6 +123,9 @@ class ReaderRangeUnderline {
     required this.end,
     required this.text,
     this.createdAt = 0,
+    this.dashed = false,
+    this.deletion = false,
+    this.payload,
   });
 
   bool get isEmpty => end <= start;
@@ -123,8 +136,7 @@ class ReaderRangeUnderline {
 
   /// True when the selection sits entirely inside this mark, so removing it
   /// cannot cut through an unrelated underline.
-  bool contains(int start, int end) =>
-      this.start <= start && end <= this.end;
+  bool contains(int start, int end) => this.start <= start && end <= this.end;
 
   String get key => ReaderUnderlineStore.rangeKeyFor(
     bookId: bookId,
@@ -232,8 +244,10 @@ class ReaderUnderlineStore {
     try {
       // Hive throws synchronously when it has no directory yet, so the call
       // itself has to sit inside the guard, not only its await.
-      final pending =
-          _opening ??= EncryptedHive.openBox<dynamic>(_hive, _boxName);
+      final pending = _opening ??= EncryptedHive.openBox<dynamic>(
+        _hive,
+        _boxName,
+      );
       final box = await pending;
       if (box.isOpen) return box;
       _opening = null;
@@ -303,9 +317,7 @@ class ReaderUnderlineStore {
     if (box.length <= maxEntries) return;
     final oldest = box.keys.toList()
       ..sort(
-        (a, b) => _createdAtOf(
-          box.get(a),
-        ).compareTo(_createdAtOf(box.get(b))),
+        (a, b) => _createdAtOf(box.get(a)).compareTo(_createdAtOf(box.get(b))),
       );
     await box.deleteAll(oldest.take(box.length - maxEntries));
   }
@@ -339,7 +351,8 @@ class ReaderUnderlineStore {
     final doomed = <dynamic>[];
     for (final key in box.keys) {
       final raw = box.get(key);
-      final book = ReaderUnderline.fromMap(raw)?.bookId ??
+      final book =
+          ReaderUnderline.fromMap(raw)?.bookId ??
           ReaderRangeUnderline.fromMap(raw)?.bookId;
       if (book == bookId) doomed.add(key);
     }

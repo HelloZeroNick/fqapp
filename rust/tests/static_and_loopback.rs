@@ -13,17 +13,7 @@ const MARKER: &str = "OFFLINE_TEST_MARKER_OUTSIDE_SRC";
 
 async fn fixture() -> (TempDir, std::sync::Arc<fqapi_core::endpoints::Server>) {
     let dir = TempDir::new("static");
-    let server = build_server(
-        &dir,
-        None,
-        &[
-            ("index.html", "<html>index</html>"),
-            ("assets/css/all.min.css", "body{}"),
-        ],
-        &[("ok.txt", "0123456789")],
-        &pool_json(5),
-    )
-    .await;
+    let server = build_server(&dir, None, &[], &[("ok.txt", "0123456789")], &pool_json(5)).await;
     // A sibling of src/ that must never be reachable through /src/.
     dir.write("outside.txt", MARKER);
     (dir, server)
@@ -84,6 +74,8 @@ async fn refuses_to_escape_the_resource_root() {
 #[tokio::test]
 async fn refuses_encoded_and_absolute_components() {
     let (_dir, server) = fixture().await;
+    // `/assets/` and page routes no longer exist; they stay in the list so a
+    // future re-introduction cannot silently serve outside the resource root.
     for path in [
         "/src/%2e%2e%2foutside.txt",
         "/assets/../../outside.txt",
@@ -101,18 +93,6 @@ async fn directory_without_an_index_is_not_listed() {
     let (_dir, server) = fixture().await;
     let (status, _, _) = body_string(&server, &get("/src", &[])).await;
     assert_eq!(status, 404);
-}
-
-#[tokio::test]
-async fn serves_the_web_root_and_index() {
-    let (_dir, server) = fixture().await;
-    let (status, body, _) = body_string(&server, &get("/", &[])).await;
-    assert_eq!(status, 200);
-    assert_eq!(body, "<html>index</html>");
-
-    let (status, body, _) = body_string(&server, &get("/index.html", &[])).await;
-    assert_eq!(status, 200);
-    assert_eq!(body, "<html>index</html>");
 }
 
 #[tokio::test]
@@ -218,6 +198,9 @@ async fn file_bodies_are_ranges_not_whole_files() {
             assert_eq!((offset, length, total), (1, 3, 10));
         }
         ResponseBody::Bytes(bytes) => panic!("expected a file range, got {} bytes", bytes.len()),
+        ResponseBody::FileDecrypted { .. } => {
+            panic!("a plain text file must not take the decrypted path")
+        }
     }
 }
 
@@ -290,6 +273,67 @@ async fn loopback_adapter_refuses_traversal_over_a_real_socket() {
         assert_eq!(status, 404, "path {path:?}");
         assert!(!String::from_utf8_lossy(&body).contains(MARKER));
     }
+    lb.task.abort();
+}
+
+// --- Loopback request bodies ------------------------------------------------
+
+/// The account routes read their credentials from a POST body. The adapter
+/// must forward it: draining every body sent these requests to the handlers
+/// empty, which rejected them as unparseable.
+#[tokio::test]
+async fn loopback_adapter_forwards_account_post_bodies() {
+    let (_dir, server) = fixture().await;
+    let lb = start_loopback(server).await;
+    let client = reqwest::Client::builder().build().expect("client");
+
+    // Both bodies parse; they fail only the cookie check, which proves the
+    // handler saw the body instead of an empty one.
+    let cases = [
+        (
+            "/api/v1/account/fanqie/history",
+            r#"{"cookie":"not-a-session","offset":0,"last_min_read_timestamp_ms":0,"is_first_load":true}"#,
+        ),
+        (
+            "/api/v1/account/fanqie/library",
+            r#"{"cookie":"not-a-session","resource":"history"}"#,
+        ),
+    ];
+    for (path, body) in cases {
+        let resp = client
+            .post(lb.bare_url(path))
+            .body(body)
+            .send()
+            .await
+            .expect("loopback post");
+        assert_eq!(resp.status().as_u16(), 400, "path {path}");
+        let text = resp.text().await.expect("response body");
+        assert!(
+            text.contains("未取得有效登录态"),
+            "path {path}: handler did not see the POST body: {text}"
+        );
+    }
+    lb.task.abort();
+}
+
+#[tokio::test]
+async fn loopback_adapter_refuses_an_oversized_account_body() {
+    let (_dir, server) = fixture().await;
+    let lb = start_loopback(server).await;
+    let client = reqwest::Client::builder().build().expect("client");
+
+    let body = "x".repeat(fqapi_core::dispatch::ACCOUNT_REQUEST_BODY_LIMIT + 1);
+    let resp = client
+        .post(lb.bare_url("/api/v1/account/fanqie/history"))
+        .body(body)
+        .send()
+        .await
+        .expect("loopback post");
+    assert_eq!(
+        resp.status().as_u16(),
+        413,
+        "an over-limit account body must be refused before buffering"
+    );
     lb.task.abort();
 }
 
@@ -485,5 +529,95 @@ async fn loopback_adapter_refuses_a_symlinked_index_and_serves_empty_files() {
     assert_eq!(status, 200);
     assert_eq!(body, b"<html>sub</html>");
 
+    lb.task.abort();
+}
+
+// --- P1-7: CENC-encrypted video cache serving ------------------------------
+
+/// The independently generated CENC fixture (see the unit tests in
+/// endpoints::video): encrypted MP4 bytes, the content key, the plaintext
+/// samples an independent implementation produced, and the mdat offset.
+fn cenc_fixture() -> (Vec<u8>, Vec<u8>, Vec<u8>, usize) {
+    use base64::Engine;
+    let raw = include_str!("../testdata/cenc_sample_fixture.json");
+    let f: serde_json::Value = serde_json::from_str(raw).expect("fixture json");
+    let c = &f["cenc"];
+    let dec = |v: &serde_json::Value| {
+        base64::engine::general_purpose::STANDARD
+            .decode(v.as_str().expect("b64 field"))
+            .expect("decode fixture")
+    };
+    let encrypted = dec(&c["full_sample_b64"]);
+    let key = hex::decode(c["key_hex"].as_str().expect("key hex")).expect("key");
+    let mut plain_samples = Vec::new();
+    for s in c["full_sample_plain_b64"].as_array().expect("samples") {
+        plain_samples.extend(dec(s));
+    }
+    let mdat_off = c["full_mdat_offset"].as_u64().expect("mdat offset") as usize;
+    (encrypted, key, plain_samples, mdat_off)
+}
+
+async fn encrypted_video_server(
+    with_key: bool,
+) -> (TempDir, std::sync::Arc<fqapi_core::endpoints::Server>) {
+    let dir = TempDir::new("cenc");
+    let server = build_server(&dir, None, &[], &[], &pool_json(5)).await;
+    let (encrypted, key, _, _) = cenc_fixture();
+    std::fs::write(dir.join("src/vid1.mp4"), &encrypted).expect("write encrypted cache");
+    if with_key {
+        std::fs::write(dir.join("src/vid1.mp4.key"), hex::encode(&key)).expect("write sidecar");
+    }
+    (dir, server)
+}
+
+#[tokio::test]
+async fn encrypted_cache_video_is_served_decrypted_in_ranges() {
+    let (dir, server) = encrypted_video_server(true).await;
+    let (encrypted, _key, plain_samples, mdat_off) = cenc_fixture();
+
+    // A range covering exactly the sample data decrypts to the plaintext
+    // the independent fixture stored.
+    let range = format!("bytes={}-{}", mdat_off, encrypted.len() - 1);
+    let resp = dispatch(&server, &get("/src/vid1.mp4", &[("range", &range)])).await;
+    assert_eq!(resp.status, 206);
+    let body = resp.into_bytes().await.expect("body");
+    assert_eq!(body, plain_samples);
+    assert_ne!(
+        body,
+        encrypted[mdat_off..],
+        "ciphertext must not be served as-is"
+    );
+
+    // The header view carries the clear sample entry (encv -> hvc1, the
+    // type field at the fixture's offset 88) and the blanked sinf payload.
+    let resp = dispatch(&server, &get("/src/vid1.mp4", &[("range", "bytes=0-345")])).await;
+    let head = resp.into_bytes().await.expect("head body");
+    assert_eq!(&head[88..92], b"hvc1", "sample entry must read as clear");
+    assert!(
+        head[182..190].iter().all(|&b| b == 0),
+        "sinf payload must be blanked in the view"
+    );
+
+    // Serving never rewrites the file on disk.
+    let on_disk = std::fs::read(dir.join("src/vid1.mp4")).expect("read cache");
+    assert_eq!(on_disk, encrypted, "the cache file must stay encrypted");
+}
+
+#[tokio::test]
+async fn encrypted_cache_video_without_a_key_is_an_error_not_ciphertext() {
+    let (_dir, server) = encrypted_video_server(false).await;
+    let resp = dispatch(&server, &get("/src/vid1.mp4", &[])).await;
+    assert_eq!(resp.status, 503);
+}
+
+#[tokio::test]
+async fn encrypted_cache_video_streams_decrypted_over_loopback() {
+    let (_dir, server) = encrypted_video_server(true).await;
+    let (encrypted, _, plain_samples, mdat_off) = cenc_fixture();
+    let lb = start_loopback(server).await;
+    let range = format!("bytes={}-{}", mdat_off, encrypted.len() - 1);
+    let (status, _, body) = http_get(&lb, "/src/vid1.mp4", Some(&range)).await;
+    assert_eq!(status, 206);
+    assert_eq!(body, plain_samples);
     lb.task.abort();
 }

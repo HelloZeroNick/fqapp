@@ -1,12 +1,27 @@
 import 'package:flutter/material.dart';
 
+import '../../services/app_theme.dart';
 import '../../services/reader_preferences.dart';
+
+/// 阅读页右下角两颗动作钮（看 / 听）的直径。
+///
+/// 取听书胶囊里那圈圆形封面的尺寸（`AudioFloatingPlayer._width/_height`
+/// 里的 42dp），两颗钮原先照官方资源按 56dp 摆，比胶囊里的图书封面大出
+/// 三分之一，压在正文上也显得重。缩到 42 后与胶囊同高，两处并排时视线
+/// 不再被按钮抢走；「看」展开成提示条时的宽高也按这个比例一起缩。
+const double kReaderActionSize = 42;
 
 extension ReaderThemeColors on ReaderThemePreset {
   bool get isDark => this == ReaderThemePreset.dark;
 
   /// #15/#9 墨水屏：纯黑白，不走任何色调推导，墨水屏量化时不产生灰阶。
   bool get isEink => this == ReaderThemePreset.eink;
+
+  /// 全局 OLED 纯黑：只给夜间底色降为 #000000 省电，面板 / 字段仍用近黑
+  /// + 描边，避免纯黑把正文、弹层边界一起吞掉。只在深色外观下生效；
+  /// 生效时阅读页被强制到夜间预设（见 reader_page 的 _effectivePreset），
+  /// 与墨水屏一致。
+  bool get isOled => isDark && oledActive();
 
   String get label => switch (this) {
     ReaderThemePreset.light => '米白',
@@ -20,7 +35,7 @@ extension ReaderThemeColors on ReaderThemePreset {
     ReaderThemePreset.light => const Color(0xFFFAF9F6),
     ReaderThemePreset.eyeCare => const Color(0xFFE8F1DF),
     ReaderThemePreset.parchment => const Color(0xFFF3E4C2),
-    ReaderThemePreset.dark => const Color(0xFF171717),
+    ReaderThemePreset.dark => isOled ? Colors.black : const Color(0xFF171717),
     ReaderThemePreset.eink => Colors.white,
   };
 
@@ -39,8 +54,12 @@ extension ReaderThemeColors on ReaderThemePreset {
     _ => const Color(0xFF9B6743),
   };
 
-  Color get mutedTextColor =>
-      isEink ? Colors.black : textColor.withValues(alpha: 0.6);
+  Color get mutedTextColor {
+    if (isEink) return Colors.black;
+    // 纯黑底上 60% 的前景色只剩 #7E7E7E，12sp 提示字偏灰；OLED 用固定值。
+    if (isOled) return const Color(0xFF9E9A94);
+    return textColor.withValues(alpha: 0.6);
+  }
 
   /// 官方每个阅读主题一个选区强调色(un4.j.t / ReaderCommonColor.getHighlightColor
   /// 的 b4e-b4i 资源表):light #FA6725、parchment(纸) #CC8114、eyeCare(绿)
@@ -55,8 +74,7 @@ extension ReaderThemeColors on ReaderThemePreset {
   /// The wash behind a text selection. 官方 markingConfig.b()(ReaderViewLayout
   /// 的 ie5.a 实现)= un4.j.C(theme, 0.16f) —— 强调色 @ 16%,C 会整体重设
   /// alpha,所以夜间也是 16% 橙。
-  Color get selectionWashColor =>
-      selectionAccentColor.withValues(alpha: 0.16);
+  Color get selectionWashColor => selectionAccentColor.withValues(alpha: 0.16);
 
   /// 控点实色(un4.j.t):夜间降到 60% 的橙,其余主题用强调色原色。
   Color get selectionHandleColor =>
@@ -66,14 +84,28 @@ extension ReaderThemeColors on ReaderThemePreset {
   /// 不是正文色;夜间自带 60% alpha。
   Color get selectionUnderlineColor => selectionHandleColor;
 
-  /// 朗读句高亮底色：与选区强调色区分开的暖黄，墨水屏用淡黑灰以免
-  /// 盖住正文。
+  /// 朗读句高亮底色（默认值）：取**当前背景加深**，而不是固定暖黄。
+  ///
+  /// 浅色纸面用正文色压 10% 混进背景，得到同色系里深一档的底；夜间主题的
+  /// 正文色是浅色，混出来自然是「提亮」，白字仍读得清。墨水屏保留淡黑灰，
+  /// 避免彩色底把残影放大。
+  ///
+  /// 用户可在「设置 → 听书 → 高亮颜色」里覆盖（见
+  /// [ReaderPreferences.narrationHighlightColor]）。
   Color get narrationHighlightColor => isEink
       ? Colors.black.withValues(alpha: 0.10)
-      : const Color(0xFFFFC107).withValues(alpha: 0.28);
+      : Color.alphaBlend(textColor.withValues(alpha: 0.10), backgroundColor);
+
+  /// Dialogue uses a quiet theme accent, separate from the playback color.
+  Color get dialogueHighlightColor => Color.alphaBlend(
+    accentColor.withValues(alpha: isDark ? 0.18 : 0.12),
+    backgroundColor,
+  );
 
   Color get panelColor {
     if (isEink) return Colors.white;
+    // OLED：纯黑页面上的浮层必须比底色亮一档，否则面板边界消失。
+    if (isOled) return const Color(0xFF0C0C0E);
     return Color.alphaBlend(
       isDark ? const Color(0x0DFFFFFF) : const Color(0x99FFFFFF),
       backgroundColor,
@@ -82,6 +114,7 @@ extension ReaderThemeColors on ReaderThemePreset {
 
   Color get fieldColor {
     if (isEink) return Colors.white;
+    if (isOled) return const Color(0xFF141417);
     return Color.alphaBlend(
       textColor.withValues(alpha: isDark ? 0.06 : 0.035),
       panelColor,
@@ -90,12 +123,16 @@ extension ReaderThemeColors on ReaderThemePreset {
 
   Color get borderColor {
     if (isEink) return Colors.black;
+    if (isOled) return const Color(0xFF2E2E34);
     return textColor.withValues(alpha: 0.09);
   }
+
   /// 排版面板表面 = 阅读页背景本身(官方 bottombar/t.java 直接把面板根
   /// View 设为 readerConfig.getBackgroundColor(),面板与页面同色);chip/
   /// 控件底色另走 fieldColor(官方是白色 5% 叠加,x4 色表)。
-  Color get sheetColor => backgroundColor;
+  /// OLED 例外：页面是 #000000 时面板也铺黑就分不清边界了，改取近黑档，
+  /// 与 theme() 的 bottomSheetTheme 保持一致。
+  Color get sheetColor => isOled ? panelColor : backgroundColor;
 
   /// Built themes per preset, keyed by the base theme's identity. `fromSeed`
   /// runs a full HCT palette build and `textTheme.apply` copies ~90 text
@@ -103,13 +140,16 @@ extension ReaderThemeColors on ReaderThemePreset {
   /// sliders re-run it per frame) — rebuilding identical instances each time
   /// is pure waste. The app's base theme is a constant instance between hot
   /// reloads, so an identity check recomputes only when it actually changes.
-  static final Map<ReaderThemePreset, (ThemeData, ThemeData)> _themeCache = {};
+  static final Map<(ReaderThemePreset, bool), (ThemeData, ThemeData)>
+  _themeCache = {};
 
   ThemeData theme(ThemeData base) {
-    final cached = _themeCache[this];
+    // OLED 开关会改变色板，缓存键必须带上它，否则关灯后仍拿旧主题。
+    final key = (this, isOled);
+    final cached = _themeCache[key];
     if (cached != null && identical(cached.$1, base)) return cached.$2;
     final built = _buildTheme(base);
-    _themeCache[this] = (base, built);
+    _themeCache[key] = (base, built);
     return built;
   }
 
@@ -153,6 +193,14 @@ extension ReaderThemeColors on ReaderThemePreset {
             surface: panelColor,
             onSurface: textColor,
             onSurfaceVariant: mutedTextColor,
+            // OLED：种子推导出的棕灰在纯黑上会发亮；表面层次换成与全局
+            // OLED 色板一致的近黑档，弹层 / 插图占位不再冒出一块暖灰。
+            surfaceContainerLowest: isOled ? Colors.black : null,
+            surfaceContainerLow: isOled ? const Color(0xFF0C0C0E) : null,
+            surfaceContainer: isOled ? const Color(0xFF121215) : null,
+            surfaceContainerHigh: isOled ? const Color(0xFF17171A) : null,
+            surfaceContainerHighest: isOled ? const Color(0xFF1F1F23) : null,
+            outlineVariant: isOled ? const Color(0xFF2E2E34) : null,
           );
     return base.copyWith(
       colorScheme: scheme,

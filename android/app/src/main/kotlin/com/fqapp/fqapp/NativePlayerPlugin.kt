@@ -7,12 +7,17 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
+import android.media.AudioAttributes
+import android.media.AudioFocusRequest
 import android.media.AudioManager
+import android.media.AudioTrack
 import android.net.Uri
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.provider.Settings
 import android.util.Log
 import android.view.WindowManager
 import androidx.core.app.ActivityCompat
@@ -29,10 +34,15 @@ import androidx.media3.datasource.DataSource
 import androidx.media3.datasource.DataSourceException
 import androidx.media3.datasource.DataSpec
 import androidx.media3.datasource.HttpDataSource
+import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.analytics.AnalyticsListener
+import androidx.media3.exoplayer.audio.AudioSink
+import androidx.media3.exoplayer.audio.DefaultAudioSink
+import androidx.media3.exoplayer.mediacodec.MediaCodecInfo
 import androidx.media3.exoplayer.mediacodec.MediaCodecRenderer.DecoderInitializationException
+import androidx.media3.exoplayer.mediacodec.MediaCodecSelector
 import androidx.media3.exoplayer.source.ProgressiveMediaSource
 import com.example.shortplay.CryptoNative
 import com.example.shortplay.HttpBridge
@@ -48,6 +58,18 @@ import java.io.EOFException
 import java.io.IOException
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
+
+/** 播放器日志 tag：类内与顶层 [buildPlayer] 共用，避免两处字面量漂移。 */
+internal const val PLAYER_LOG_TAG = "NativePlayerPlugin"
+
+/**
+ * 起播诊断日志开关：只在 debuggable 包上打开，release 的 logcat 不该被每次
+ * open 刷一条。由 [NativePlayerPlugin.onAttachedToEngine] 按 ApplicationInfo 设置；
+ * 默认关闭也顺带保住 JVM 单测（`android.util.Log` 没有桩）。
+ */
+@Volatile
+internal var playerDiagnosticsEnabled = false
 
 /**
  * Native ExoPlayer host for DRM (CENC) short dramas and audiobook audio playback.
@@ -57,19 +79,81 @@ import java.util.concurrent.atomic.AtomicInteger
 @androidx.annotation.OptIn(UnstableApi::class)
 class NativePlayerPlugin internal constructor(
     private val cryptoStream: CryptoStream = JniCryptoStream,
-    private val playerFactory: (Context) -> ExoPlayer = { context ->
-        // Note: decoder init fallback and 206 diagnostics — see
-        // .agents/notes/implemented/bug-fix/2026-10-15-issue2-decoder-initialization-fallback.md.
-        val renderers = DefaultRenderersFactory(context).setEnableDecoderFallback(true)
-        ExoPlayer.Builder(context, renderers).build()
-    }
-) : FlutterPlugin, MethodChannel.MethodCallHandler, ActivityAware,
+    private val playerFactory: (Context, PlayerBuildOptions) -> ExoPlayer = ::buildPlayer
+) : FlutterPlugin,
+    MethodChannel.MethodCallHandler,
+    ActivityAware,
     PluginRegistry.RequestPermissionsResultListener {
 
     companion object {
-        private const val TAG = "NativePlayerPlugin"
+        private const val TAG = PLAYER_LOG_TAG
         private const val POST_NOTIFICATIONS_REQUEST = 7412
+
         @Volatile private var instance: NativePlayerPlugin? = null
+        private val floatingOwners = AtomicLong(0)
+        private val floatingSurfaces = AtomicLong(0)
+        private var latestFloatingStart = 0L
+        private var retiredFloatingOwner = 0L
+        @Volatile private var currentFloating: FloatingAllocation? = null
+
+        internal fun desiredFloatingOwner(): Long? = currentFloating?.owner
+
+        internal fun floatingState(owner: Long): Map<String, Any?>? =
+            currentFloating?.takeIf { it.owner == owner }?.state?.toMap()
+
+        internal fun floatingVisible(owner: Long): Boolean =
+            currentFloating?.takeIf { it.owner == owner }?.visible == true
+
+        internal fun allocateFloatingSurface(): Long = floatingSurfaces.incrementAndGet().also {
+            check(it > 0) { "Floating surface IDs exhausted" }
+        }
+
+        internal fun dispatchFloatingSurfaceReady(owner: Long, surfaceId: Long, surface: android.view.Surface) {
+            val allocation = currentFloating?.takeIf { it.owner == owner } ?: return
+            allocation.plugin.handler.post {
+                if (currentFloating === allocation) {
+                    allocation.plugin.attachFloatingSurface(allocation, surfaceId, surface)
+                }
+            }
+        }
+
+        internal fun dispatchFloatingSurfaceDestroyed(owner: Long, surfaceId: Long) {
+            val allocation = currentFloating?.takeIf { it.owner == owner } ?: return
+            allocation.plugin.handler.post {
+                if (currentFloating === allocation) {
+                    allocation.plugin.detachFloatingSurface(allocation, surfaceId)
+                }
+            }
+        }
+
+        internal fun dispatchFloatingAction(owner: Long, action: String) {
+            val allocation = currentFloating?.takeIf { it.owner == owner } ?: return
+            val dispatch = {
+                if (currentFloating === allocation && allocation.plugin.attachedToEngine) {
+                    allocation.plugin.methodChannel.invokeMethod(
+                        "onFloatingAction", mapOf("owner" to owner, "action" to action)
+                    )
+                }
+            }
+            if (Looper.myLooper() == Looper.getMainLooper()) dispatch()
+            else allocation.plugin.handler.post { dispatch() }
+        }
+
+        // New START admission uses high waters; accepted callbacks use exact
+        // allocation identity, even after a higher pending token was retired.
+        internal fun retireFloatingOwner(owner: Long, pause: Boolean = false) {
+            if (owner <= 0 || owner > floatingOwners.get()) return
+            retiredFloatingOwner = maxOf(retiredFloatingOwner, owner)
+            val allocation = currentFloating?.takeIf { it.owner == owner }
+            try {
+                if (allocation != null) {
+                    currentFloating = null
+                    allocation.plugin.releaseFloatingAllocation(allocation, pause)
+                }
+            } finally {
+                FloatingVideoService.retire(owner)
+            }
+        }
 
         fun dispatchNotificationAction(action: String) {
             instance?.let { plugin ->
@@ -89,6 +173,7 @@ class NativePlayerPlugin internal constructor(
     private lateinit var eventChannel: EventChannel
     private lateinit var textureRegistry: TextureRegistry
     private lateinit var flutterBinding: FlutterPlugin.FlutterPluginBinding
+
     @Volatile private var attachedToEngine = false
 
     private var activity: Activity? = null
@@ -98,6 +183,32 @@ class NativePlayerPlugin internal constructor(
     private val pendingPlayerIds = ConcurrentHashMap.newKeySet<Int>()
     private val nextId = AtomicInteger(1)
     private val handler = Handler(Looper.getMainLooper())
+
+    private var floatingAllocation: FloatingAllocation? = null
+
+    private class FloatingAllocation(
+        val owner: Long,
+        val plugin: NativePlayerPlugin,
+        var player: PlayerInstance?,
+        val state: MutableMap<String, Any?>
+    ) {
+        var visible = false
+        var surface: android.view.Surface? = null
+        var surfaceId: Long? = null
+        var newestSurfaceId = 0L
+        var attachedPlayer: PlayerInstance? = null
+        var audioManager: AudioManager? = null
+        var focusRequest: Any? = null
+        var focusListener: AudioManager.OnAudioFocusChangeListener? = null
+        var ducked = false
+        var duckedPlayer: Pair<PlayerInstance, Float>? = null
+    }
+
+    /**
+     * 播放页「上下滑动调亮度」覆盖的窗口亮度。null = 当前没有覆盖；存起来
+     * 是为了退出播放页时还原系统/宿主原来的亮度。
+     */
+    private var originalWindowBrightness: Float? = null
 
     private var eventSink: EventChannel.EventSink? = null
     private var noisyReceiverRegistered = false
@@ -133,6 +244,11 @@ class NativePlayerPlugin internal constructor(
         attachedToEngine = true
         instance = this
         flutterBinding = binding
+        // applicationInfo 在 JVM 单测里是 null（Context 是 mock），这里必须容忍；
+        // 生产环境的 applicationContext 由 Flutter 引擎给出，不受影响。
+        playerDiagnosticsEnabled =
+            ((binding.applicationContext.applicationInfo?.flags ?: 0) and
+                ApplicationInfo.FLAG_DEBUGGABLE) != 0
         // The offline-file bridge only serves file:// URLs inside the app's
         // download/cache trees; configure it before any playback can occur.
         HttpBridge.configure(binding.applicationContext)
@@ -159,6 +275,8 @@ class NativePlayerPlugin internal constructor(
         activityBinding?.removeRequestPermissionsResultListener(this)
         activityBinding = null
         activity = null
+        // 窗口随 Activity 重建，亮度覆盖已经不存在，别让下一次 reset 拿旧值。
+        originalWindowBrightness = null
     }
     override fun onReattachedToActivityForConfigChanges(binding: ActivityPluginBinding) {
         activity = binding.activity
@@ -169,24 +287,26 @@ class NativePlayerPlugin internal constructor(
         activityBinding?.removeRequestPermissionsResultListener(this)
         activityBinding = null
         activity = null
+        originalWindowBrightness = null
     }
 
-    override fun onRequestPermissionsResult(
-        requestCode: Int,
-        permissions: Array<out String>,
-        grantResults: IntArray
-    ): Boolean = requestCode == POST_NOTIFICATIONS_REQUEST
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray): Boolean =
+        requestCode == POST_NOTIFICATIONS_REQUEST
 
     private fun requestNotificationPermissionIfNeeded() {
         val currentActivity = activity ?: return
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU ||
             currentActivity.applicationInfo.targetSdkVersion < Build.VERSION_CODES.TIRAMISU
-        ) return
+        ) {
+            return
+        }
         if (ContextCompat.checkSelfPermission(
                 currentActivity,
                 Manifest.permission.POST_NOTIFICATIONS
             ) == PackageManager.PERMISSION_GRANTED || notificationPermissionRequested
-        ) return
+        ) {
+            return
+        }
         notificationPermissionRequested = true
         try {
             ActivityCompat.requestPermissions(
@@ -203,6 +323,17 @@ class NativePlayerPlugin internal constructor(
     override fun onDetachedFromEngine(binding: FlutterPlugin.FlutterPluginBinding) {
         attachedToEngine = false
         if (instance === this) instance = null
+        floatingAllocation?.let { allocation ->
+            try {
+                if (currentFloating === allocation) retireFloatingOwner(allocation.owner)
+                else {
+                    try { releaseFloatingAllocation(allocation, false) }
+                    finally { FloatingVideoService.retire(allocation.owner) }
+                }
+            } catch (error: Throwable) {
+                Log.w(TAG, "floating detach failed: ${error.javaClass.simpleName}")
+            }
+        }
         activityBinding?.removeRequestPermissionsResultListener(this)
         activityBinding = null
         activity = null
@@ -259,77 +390,224 @@ class NativePlayerPlugin internal constructor(
         return value
     }
 
+    /**
+     * 分屏播放页上下滑手势的初始档位：窗口亮度（没有覆盖时读系统亮度）与
+     * 媒体音量，都归一化到 0..1，并带上音量的档数（HUD 按同一档位取整，
+     * 避免「显示 37% 实际是第 59/160 档」的偏差）。拿不到 Activity 时回
+     * null，Dart 侧显示「暂不可用」而不是静默无效。
+     */
+    private fun gestureLevels(): Map<String, Any>? {
+        val currentActivity = activity ?: return null
+        return try {
+            val windowBrightness = currentActivity.window.attributes.screenBrightness
+            val brightness = if (windowBrightness >= 0f) {
+                windowBrightness.coerceIn(NativeGestureLevels.BRIGHTNESS_FLOOR, 1f)
+            } else {
+                val raw = Settings.System.getInt(
+                    currentActivity.contentResolver,
+                    Settings.System.SCREEN_BRIGHTNESS,
+                    128
+                )
+                NativeGestureLevels.normaliseBrightness(raw)
+            }
+            val audio = currentActivity.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+            val maxVolume = audio?.getStreamMaxVolume(AudioManager.STREAM_MUSIC) ?: 0
+            val volume = if (audio != null && maxVolume > 0) {
+                NativeGestureLevels.volumeFraction(
+                    audio.getStreamVolume(AudioManager.STREAM_MUSIC),
+                    maxVolume
+                )
+            } else {
+                0.0
+            }
+            mapOf(
+                "brightness" to brightness.toDouble(),
+                "volume" to volume,
+                "volumeSteps" to maxVolume
+            )
+        } catch (error: Throwable) {
+            Log.w(TAG, "read gesture levels failed", error)
+            null
+        }
+    }
+
+    private fun applyWindowBrightness(value: Float) {
+        val currentActivity = activity ?: return
+        val attributes = currentActivity.window.attributes
+        // 第一次调节才记原值：后续手势都在覆盖值上继续，不会把中间值当成原值。
+        if (originalWindowBrightness == null) {
+            originalWindowBrightness = attributes.screenBrightness
+        }
+        attributes.screenBrightness = value.coerceIn(NativeGestureLevels.BRIGHTNESS_FLOOR, 1f)
+        currentActivity.window.attributes = attributes
+    }
+
+    private fun resetWindowBrightness() {
+        val original = originalWindowBrightness ?: return
+        originalWindowBrightness = null
+        val currentActivity = activity ?: return
+        val attributes = currentActivity.window.attributes
+        attributes.screenBrightness = original
+        currentActivity.window.attributes = attributes
+    }
+
+    private fun applyMediaVolume(value: Float) {
+        val audio = activity?.getSystemService(Context.AUDIO_SERVICE) as? AudioManager ?: return
+        val maxVolume = audio.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
+        if (maxVolume <= 0) return
+        // flags=0：不弹系统音量面板，反馈由 Flutter 侧的档位 HUD 负责。
+        // 勿扰/固定音量模式下 setStreamVolume 可能直接抛 SecurityException，
+        // 手势失败不能把播放一起带崩。
+        try {
+            audio.setStreamVolume(
+                AudioManager.STREAM_MUSIC,
+                NativeGestureLevels.volumeIndex(value, maxVolume),
+                0
+            )
+        } catch (error: Throwable) {
+            Log.w(TAG, "set media volume failed", error)
+        }
+    }
+
     override fun onMethodCall(call: MethodCall, result: MethodChannel.Result) {
         when (call.method) {
             "create" -> {
                 val cdnUrl = call.requiredArgument<String>("cdnUrl", result) ?: return
                 val keyHex = call.requiredArgument<String>("keyHex", result) ?: return
-                handleCreate(cdnUrl, keyHex, result)
+                // 缺省/未知取值都退化为自动，保持老客户端的默认行为。
+                val decoder = VideoDecoderPreference.fromName(
+                    call.argument<String>("videoDecoder")
+                )
+                // 纯音频播放器（听书）才能选系统混音器变速；缺省/未知取值退回
+                // Media3 内建的 Sonic，与本次改动前完全一致（issue #129）。
+                val audioOnly = call.argument<Boolean>("audioOnly") == true
+                val rateEngine = if (audioOnly) {
+                    AudioRateEngine.fromName(call.argument<String>("audioRateEngine"))
+                } else {
+                    AudioRateEngine.BUILT_IN
+                }
+                handleCreate(
+                    cdnUrl,
+                    keyHex,
+                    PlayerBuildOptions(decoder, audioOnly, rateEngine),
+                    // 起播位置：在 prepare() 之前交给 ExoPlayer，等于「初始播放
+                    // 位置」而不是「已准备完再 seek」。负值/缺省当 0。
+                    call.argument<Number>("startPositionMs")?.toLong()?.coerceAtLeast(0L) ?: 0L,
+                    result
+                )
             }
+
             "play" -> {
                 val id = call.requiredArgument<Int>("id", result) ?: return
                 players[id]?.player?.play()
                 result.success(null)
             }
+
             "pause" -> {
                 val id = call.requiredArgument<Int>("id", result) ?: return
                 players[id]?.player?.pause()
                 result.success(null)
             }
+
             "seek" -> {
                 val id = call.requiredArgument<Int>("id", result) ?: return
-                val positionMs = call.requiredArgument<Number>("positionMs", result)?.toLong() ?: return
+                val positionMs =
+                    call.requiredArgument<Number>("positionMs", result)?.toLong() ?: return
                 players[id]?.player?.seekTo(positionMs)
                 result.success(null)
             }
+
             "setVolume" -> {
                 val id = call.requiredArgument<Int>("id", result) ?: return
                 val volume = call.requiredArgument<Number>("volume", result)?.toFloat() ?: return
                 players[id]?.player?.volume = volume
                 result.success(null)
             }
+
+            // 分屏播放页上下滑手势：左半窗口亮度、右半媒体音量。都是设备级
+            // 档位，不属于某个播放器实例，所以不带 id。
+            "gestureLevels" -> result.success(gestureLevels())
+
+            "setScreenBrightness" -> {
+                val value = call.requiredArgument<Number>("value", result)?.toFloat() ?: return
+                applyWindowBrightness(value)
+                result.success(null)
+            }
+
+            "resetScreenBrightness" -> {
+                resetWindowBrightness()
+                result.success(null)
+            }
+
+            "setMediaVolume" -> {
+                val value = call.requiredArgument<Number>("value", result)?.toFloat() ?: return
+                applyMediaVolume(value)
+                result.success(null)
+            }
+
             "setRate" -> {
                 val id = call.requiredArgument<Int>("id", result) ?: return
                 val rate = call.requiredArgument<Number>("rate", result)?.toFloat() ?: return
                 players[id]?.player?.playbackParameters = PlaybackParameters(rate)
                 result.success(null)
             }
+
             "dispose" -> {
                 val id = call.requiredArgument<Int>("id", result) ?: return
                 disposePlayer(id)
                 result.success(null)
             }
+
             "setKeepScreenOn" -> {
                 val on = call.argument<Boolean>("on") ?: false
                 handler.post {
                     activity?.window?.let { w ->
-                        if (on) w.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-                        else w.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                        if (on) {
+                            w.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                        } else {
+                            w.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                        }
                     }
                 }
                 result.success(null)
             }
+
             "startListenForeground" -> {
                 val context = activity ?: flutterBinding.applicationContext
                 requestNotificationPermissionIfNeeded()
                 val intent = Intent(context, ListenKeepAliveService::class.java).apply {
                     putExtra(ListenKeepAliveService.EXTRA_TITLE, call.argument<String>("title"))
                     putExtra(ListenKeepAliveService.EXTRA_EPISODE, call.argument<String>("episode"))
-                    putExtra(ListenKeepAliveService.EXTRA_PLAYING, call.argument<Boolean>("playing") ?: true)
-                    putExtra(ListenKeepAliveService.EXTRA_HAS_PREV, call.argument<Boolean>("hasPrev") ?: true)
-                    putExtra(ListenKeepAliveService.EXTRA_HAS_NEXT, call.argument<Boolean>("hasNext") ?: true)
+                    // 通知大图与媒体卡封面用当前作品封面（issue #123）。空串时
+                    // 服务退回应用图标。
+                    putExtra(
+                        ListenKeepAliveService.EXTRA_COVER_URL,
+                        call.argument<String>("coverUrl")
+                    )
+                    putExtra(
+                        ListenKeepAliveService.EXTRA_PLAYING,
+                        call.argument<Boolean>("playing") ?: true
+                    )
+                    putExtra(
+                        ListenKeepAliveService.EXTRA_HAS_PREV,
+                        call.argument<Boolean>("hasPrev") ?: true
+                    )
+                    putExtra(
+                        ListenKeepAliveService.EXTRA_HAS_NEXT,
+                        call.argument<Boolean>("hasNext") ?: true
+                    )
                     // 进度条与两侧时间全靠这三个值；漏传就等于永远上报 0/0。
                     putExtra(
                         ListenKeepAliveService.EXTRA_POSITION_MS,
-                        call.argument<Number>("positionMs")?.toLong() ?: 0L,
+                        call.argument<Number>("positionMs")?.toLong() ?: 0L
                     )
                     putExtra(
                         ListenKeepAliveService.EXTRA_DURATION_MS,
-                        call.argument<Number>("durationMs")?.toLong() ?: 0L,
+                        call.argument<Number>("durationMs")?.toLong() ?: 0L
                     )
                     putExtra(
                         ListenKeepAliveService.EXTRA_SPEED,
-                        call.argument<Number>("speed")?.toFloat() ?: 1f,
+                        call.argument<Number>("speed")?.toFloat() ?: 1f
                     )
                 }
                 try {
@@ -353,17 +631,21 @@ class NativePlayerPlugin internal constructor(
                         Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
                             error is ForegroundServiceStartNotAllowedException ->
                             "FOREGROUND_SERVICE_NOT_ALLOWED"
+
                         error is SecurityException -> "FOREGROUND_SERVICE_SECURITY"
+
                         error is IllegalStateException -> "FOREGROUND_SERVICE_STATE"
+
                         else -> "FOREGROUND_SERVICE_FAILED"
                     }
                     result.error(
                         code,
                         "Failed to start listen foreground service: ${error.javaClass.simpleName}",
-                        null,
+                        null
                     )
                 }
             }
+
             "stopListenForeground" -> {
                 val context = activity ?: flutterBinding.applicationContext
                 try {
@@ -374,11 +656,143 @@ class NativePlayerPlugin internal constructor(
                 }
                 result.success(null)
             }
+
+            "canDrawOverlays" -> {
+                val context = activity ?: flutterBinding.applicationContext
+                result.success(
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                        Settings.canDrawOverlays(context)
+                    } else {
+                        true
+                    }
+                )
+            }
+
+            "requestOverlayPermission" -> {
+                val currentActivity = activity
+                if (currentActivity == null ||
+                    Build.VERSION.SDK_INT < Build.VERSION_CODES.M
+                ) {
+                    result.success(false)
+                    return
+                }
+                try {
+                    val intent = Intent(
+                        Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                        Uri.parse("package:${currentActivity.packageName}")
+                    )
+                    currentActivity.startActivity(intent)
+                    result.success(true)
+                } catch (error: Throwable) {
+                    Log.w(TAG, "overlay permission request failed", error)
+                    result.success(false)
+                }
+            }
+
+            "allocateFloatingOwner" -> {
+                val owner = floatingOwners.incrementAndGet()
+                if (owner <= 0) result.error("FLOATING_OWNER_EXHAUSTED", "Floating IDs exhausted", null)
+                else result.success(owner)
+            }
+
+            "startFloating" -> {
+                val owner = floatingOwner(call, result) ?: return
+                val id = call.argument<Int>("playerId")
+                val player = id?.let { players[it] }
+                if (!attachedToEngine || player == null) {
+                    retireFloatingOwner(owner)
+                    result.error("FLOATING_NO_PLAYER", "Floating player unavailable", null)
+                    return
+                }
+                val current = currentFloating
+                if (current?.owner == owner && current.plugin === this) {
+                    result.success(null)
+                    return
+                }
+                if (owner <= latestFloatingStart || owner <= retiredFloatingOwner) {
+                    result.error("FLOATING_RETIRED", "Floating start superseded", null)
+                    return
+                }
+                latestFloatingStart = owner
+                val allocation = FloatingAllocation(owner, this, player,
+                    floatingExtras(call).filterValues { it != null }.toMutableMap())
+                currentFloating = allocation
+                floatingAllocation = allocation
+                try {
+                    if (current != null) {
+                        retiredFloatingOwner = maxOf(retiredFloatingOwner, current.owner)
+                        try {
+                            current.plugin.releaseFloatingAllocation(current, current.player !== player)
+                        } finally {
+                            FloatingVideoService.retire(current.owner)
+                        }
+                    }
+                    if (!requestFloatingFocus(allocation)) {
+                        retireFloatingOwner(owner, pause = true)
+                        result.error("FLOATING_FOCUS_DENIED", "Floating audio focus denied", null)
+                        return
+                    }
+                    FloatingVideoService.start(activity ?: flutterBinding.applicationContext, owner)
+                    result.success(null)
+                } catch (error: Throwable) {
+                    Log.w(TAG, "floating start failed: ${error.javaClass.simpleName}")
+                    try { retireFloatingOwner(owner, pause = true) }
+                    catch (cleanup: Throwable) {
+                        Log.w(TAG, "floating cleanup failed: ${cleanup.javaClass.simpleName}")
+                    }
+                    result.error("FLOATING_START_FAILED", "Floating start failed", null)
+                }
+            }
+
+            "showFloating" -> {
+                val owner = floatingOwner(call, result) ?: return
+                ownedFloating(owner)?.let {
+                    it.visible = true
+                    FloatingVideoService.show(owner)
+                }
+                result.success(null)
+            }
+
+            "updateFloating" -> {
+                val owner = floatingOwner(call, result) ?: return
+                ownedFloating(owner)?.let { allocation ->
+                    val extras = floatingExtras(call).filterValues { it != null }
+                    allocation.state.putAll(extras)
+                    FloatingVideoService.update(owner, extras)
+                }
+                result.success(null)
+            }
+
+            "stopFloating" -> {
+                val owner = floatingOwner(call, result) ?: return
+                retireFloatingOwner(owner)
+                result.success(null)
+            }
+
+            "swapFloatingPlayer" -> {
+                val owner = floatingOwner(call, result) ?: return
+                val allocation = ownedFloating(owner)
+                val id = call.argument<Int>("playerId")
+                val player = id?.let { players[it] }
+                if (allocation == null || player == null) {
+                    result.error("FLOATING_SWAP_FAILED", "Floating owner/player unavailable", null)
+                    return
+                }
+                try {
+                    moveFloatingPlayer(allocation, player)
+                    result.success(null)
+                } catch (error: Throwable) {
+                    Log.w(TAG, "floating swap failed: ${error.javaClass.simpleName}")
+                    retireFloatingOwner(owner, pause = true)
+                    result.error("FLOATING_SWAP_FAILED", "Floating swap failed", null)
+                }
+            }
+
             else -> result.notImplemented()
         }
     }
 
-    private fun handleCreate(cdnUrl: String, keyHex: String, result: MethodChannel.Result) {
+    private fun handleCreate(cdnUrl: String, keyHex: String, options: PlayerBuildOptions, startPositionMs: Long, result: MethodChannel.Result) {
         // Note: deferred CDN I/O — see .agents/notes/implemented/bug-fix/2026-09-17-reviewed-runtime-boundaries.md.
         val playerId = nextId.getAndIncrement()
         pendingPlayerIds.add(playerId)
@@ -386,7 +800,7 @@ class NativePlayerPlugin internal constructor(
 
         if (keyHex.isEmpty()) {
             handler.post {
-                createPlayerWithUri(playerId, cdnUrl)
+                createPlayerWithUri(playerId, cdnUrl, options, startPositionMs)
             }
         } else {
             try {
@@ -395,7 +809,7 @@ class NativePlayerPlugin internal constructor(
                 // A separate probe repeats all metadata I/O and cannot be
                 // cancelled while the native open is still obtaining a handle.
                 handler.post {
-                    createPlayerWithCrypto(playerId, cdnUrl, keyHex)
+                    createPlayerWithCrypto(playerId, cdnUrl, keyHex, options, startPositionMs)
                 }
             } catch (_: Throwable) {
                 failCreation(playerId)
@@ -409,29 +823,27 @@ class NativePlayerPlugin internal constructor(
         }
     }
 
-    private fun createPlayerWithUri(playerId: Int, uri: String) {
-        createPlayer(playerId) { player ->
-            player.setMediaItem(MediaItem.fromUri(uri))
+    private fun createPlayerWithUri(playerId: Int, uri: String, options: PlayerBuildOptions, startPositionMs: Long) {
+        createPlayer(playerId, options) { player ->
+            player.setMediaItem(MediaItem.fromUri(uri), startPositionMs)
         }
     }
 
-    private fun createPlayerWithCrypto(playerId: Int, cdnUrl: String, keyHex: String) {
+    private fun createPlayerWithCrypto(playerId: Int, cdnUrl: String, keyHex: String, options: PlayerBuildOptions, startPositionMs: Long) {
         cryptoStream.clearHttpStatus(cdnUrl)
-        createPlayer(playerId, cdnUrl) { player ->
+        createPlayer(playerId, options, cdnUrl) { player ->
             val dataSourceFactory = DataSource.Factory {
                 CryptoDataSource(cdnUrl, keyHex, cryptoStream)
             }
             val mediaSource = ProgressiveMediaSource.Factory(dataSourceFactory)
                 .createMediaSource(MediaItem.fromUri("crypto://$cdnUrl"))
-            player.setMediaSource(mediaSource)
+            // 起点直接作为 media source 的初始位置：Media3 在时间线就绪后从
+            // 这里开始装载，不会先按 0 拉一段再丢掉重开。
+            player.setMediaSource(mediaSource, startPositionMs)
         }
     }
 
-    private fun createPlayer(
-        playerId: Int,
-        diagnosticUrl: String? = null,
-        configure: (ExoPlayer) -> Unit
-    ) {
+    private fun createPlayer(playerId: Int, options: PlayerBuildOptions, diagnosticUrl: String? = null, configure: (ExoPlayer) -> Unit) {
         if (!attachedToEngine || !pendingPlayerIds.remove(playerId)) return
         var producer: TextureRegistry.SurfaceProducer? = null
         var player: ExoPlayer? = null
@@ -443,7 +855,7 @@ class NativePlayerPlugin internal constructor(
             // MediaCodec supplies the buffer dimensions; don't resize the
             // producer to match the description panel's Flutter rectangle.
             producer = textureRegistry.createSurfaceProducer()
-            player = playerFactory(flutterBinding.applicationContext)
+            player = playerFactory(flutterBinding.applicationContext, options)
             output = NativeVideoOutput(player, producer)
             players[playerId] = PlayerInstance(playerId, player, output, diagnosticUrl)
             output.attach()
@@ -507,6 +919,7 @@ class NativePlayerPlugin internal constructor(
             override fun onPlaybackStateChanged(playbackState: Int) {
                 when (playbackState) {
                     Player.STATE_BUFFERING -> sendEvent(playerId, "buffering", true)
+
                     Player.STATE_READY -> {
                         sendEvent(playerId, "buffering", false)
                         // 时长此刻常常还没拿到（C.TIME_UNSET）；真拿到才发，Dart 侧才认。
@@ -514,12 +927,14 @@ class NativePlayerPlugin internal constructor(
                             sendEvent(playerId, "duration", player.duration)
                         }
                     }
+
                     Player.STATE_ENDED -> {
                         // The periodic updater stops with isPlaying. Publish
                         // the exact end position before saving stop-at-end history.
                         sendEvent(playerId, "position", player.currentPosition)
                         sendEvent(playerId, "completed", true)
                     }
+
                     Player.STATE_IDLE -> {}
                 }
             }
@@ -547,18 +962,20 @@ class NativePlayerPlugin internal constructor(
                     val rotation = instance.videoOutput.rotationCorrection(formatRotation)
                     handler.post {
                         if (!attachedToEngine || players[playerId] !== instance) return@post
-                        eventSink?.success(mapOf(
-                            "playerId" to playerId,
-                            "type" to "videoSize",
-                            "width" to videoSize.width,
-                            "height" to videoSize.height,
-                            "rotationCorrection" to rotation,
-                            // 诊断（issue #11）：区分「producer 已代理旋转」与
-                            // 「需要 Flutter 自己转」两条路径，避免靠猜。
-                            "formatRotation" to formatRotation,
-                            "handlesCropAndRotation" to
-                                instance.videoOutput.handlesCropAndRotation()
-                        ))
+                        eventSink?.success(
+                            mapOf(
+                                "playerId" to playerId,
+                                "type" to "videoSize",
+                                "width" to videoSize.width,
+                                "height" to videoSize.height,
+                                "rotationCorrection" to rotation,
+                                // 诊断（issue #11）：区分「producer 已代理旋转」与
+                                // 「需要 Flutter 自己转」两条路径，避免靠猜。
+                                "formatRotation" to formatRotation,
+                                "handlesCropAndRotation" to
+                                    instance.videoOutput.handlesCropAndRotation()
+                            )
+                        )
                     }
                 }
             }
@@ -584,8 +1001,10 @@ class NativePlayerPlugin internal constructor(
                     mapOf(
                         "message" to "Playback failed",
                         "errorCode" to error.errorCode,
-                        "httpStatusCode" to (httpError?.responseCode
-                            ?: diagnosticUrl?.let(cryptoStream::lastHttpStatus)),
+                        "httpStatusCode" to (
+                            httpError?.responseCode
+                                ?: diagnosticUrl?.let(cryptoStream::lastHttpStatus)
+                            ),
                         "decoder" to decoderDiagnostics(error)
                     )
                 )
@@ -665,7 +1084,188 @@ class NativePlayerPlugin internal constructor(
         }
     }
 
+    private fun floatingOwner(call: MethodCall, result: MethodChannel.Result): Long? {
+        val raw = call.argument<Any>("owner")
+        val owner = when (raw) { is Long -> raw; is Int -> raw.toLong(); else -> 0L }
+        if (owner <= 0 || owner > floatingOwners.get()) {
+            result.error("FLOATING_BAD_OWNER", "Allocated floating owner required", null)
+            return null
+        }
+        return owner
+    }
+
+    private fun ownedFloating(owner: Long): FloatingAllocation? = currentFloating?.takeIf {
+        it.owner == owner && it.plugin === this && floatingAllocation === it
+    }
+
+    private fun floatingExtras(call: MethodCall): Map<String, Any?> = mapOf(
+        FloatingVideoService.EXTRA_TITLE to call.argument<String>("title"),
+        FloatingVideoService.EXTRA_EPISODE to call.argument<String>("episode"),
+        FloatingVideoService.EXTRA_PLAYING to call.argument<Boolean>("playing"),
+        FloatingVideoService.EXTRA_HAS_PREV to call.argument<Boolean>("hasPrev"),
+        FloatingVideoService.EXTRA_HAS_NEXT to call.argument<Boolean>("hasNext"),
+        FloatingVideoService.EXTRA_POSITION_MS to call.argument<Number>("positionMs")?.toLong(),
+        FloatingVideoService.EXTRA_DURATION_MS to call.argument<Number>("durationMs")?.toLong(),
+        FloatingVideoService.EXTRA_SPEED to call.argument<Number>("speed")?.toFloat(),
+        FloatingVideoService.EXTRA_VIDEO_WIDTH to call.argument<Number>("videoWidth")?.toInt(),
+        FloatingVideoService.EXTRA_VIDEO_HEIGHT to call.argument<Number>("videoHeight")?.toInt()
+    )
+
+    private fun attachFloatingSurface(allocation: FloatingAllocation, surfaceId: Long, surface: android.view.Surface) {
+        if (surfaceId <= allocation.newestSurfaceId) return
+        allocation.newestSurfaceId = surfaceId
+        // A queued creation may already have been destroyed by WindowManager.
+        if (!surface.isValid) return
+        allocation.surfaceId = surfaceId
+        allocation.surface = surface
+        val player = allocation.player ?: return
+        if (players[player.id] !== player) return
+        try {
+            allocation.attachedPlayer = player
+            player.videoOutput.detachForFloating()
+            player.videoOutput.attachFloating(surface)
+        } catch (error: Throwable) {
+            Log.w(TAG, "floating surface attach failed: ${error.javaClass.simpleName}")
+            retireFloatingOwner(allocation.owner, pause = true)
+        }
+    }
+
+    private fun restoreFloatingPlayer(allocation: FloatingAllocation) {
+        val player = allocation.attachedPlayer
+        allocation.attachedPlayer = null
+        if (player == null || players[player.id] !== player) return
+        if (currentFloating !== allocation && currentFloating?.attachedPlayer === player) return
+        try {
+            player.videoOutput.restoreFromFloating()
+        } catch (error: Throwable) {
+            Log.w(TAG, "floating surface restore failed: ${error.javaClass.simpleName}")
+        }
+    }
+
+    private fun detachFloatingSurface(allocation: FloatingAllocation, surfaceId: Long) {
+        if (allocation.surfaceId != surfaceId) return
+        allocation.surface = null
+        allocation.surfaceId = null
+        restoreFloatingPlayer(allocation)
+    }
+
+    private fun moveFloatingPlayer(allocation: FloatingAllocation, player: PlayerInstance) {
+        if (allocation.player === player && allocation.attachedPlayer === player) return
+        restoreFloatingPlayer(allocation)
+        restoreFloatingVolume(allocation)
+        allocation.player = player
+        if (allocation.ducked) duckFloatingPlayer(allocation)
+        allocation.surface?.takeIf { it.isValid }?.let { surface ->
+            allocation.attachedPlayer = player
+            player.videoOutput.detachForFloating()
+            player.videoOutput.attachFloating(surface)
+        }
+    }
+
+    private fun releaseFloatingAllocation(allocation: FloatingAllocation, pause: Boolean) {
+        if (floatingAllocation === allocation) floatingAllocation = null
+        if (pause) allocation.player?.takeIf { players[it.id] === it }?.let {
+            try { it.player.pause() } catch (_: Throwable) { }
+        }
+        restoreFloatingPlayer(allocation)
+        allocation.surface = null
+        allocation.surfaceId = null
+        abandonFloatingFocus(allocation)
+        allocation.player = null
+        if (attachedToEngine) {
+            try {
+                methodChannel.invokeMethod("onFloatingStopped", mapOf("owner" to allocation.owner))
+            } catch (error: Throwable) {
+                Log.w(TAG, "floating retirement delivery failed: ${error.javaClass.simpleName}")
+            }
+        }
+    }
+
+    private fun duckFloatingPlayer(allocation: FloatingAllocation) {
+        val player = allocation.player ?: return
+        if (allocation.duckedPlayer?.first === player) return
+        allocation.duckedPlayer = player to player.player.volume
+        try { player.player.volume = (player.player.volume * 0.2f).coerceIn(0f, 1f) }
+        catch (_: Throwable) { }
+    }
+
+    private fun restoreFloatingVolume(allocation: FloatingAllocation) {
+        val previous = allocation.duckedPlayer
+        allocation.duckedPlayer = null
+        if (previous != null && players[previous.first.id] === previous.first) {
+            try { previous.first.player.volume = previous.second } catch (_: Throwable) { }
+        }
+    }
+
+    private fun requestFloatingFocus(allocation: FloatingAllocation): Boolean {
+        val manager = flutterBinding.applicationContext.getSystemService(Context.AUDIO_SERVICE)
+            as? AudioManager ?: return false
+        allocation.audioManager = manager
+        val listener = AudioManager.OnAudioFocusChangeListener { change ->
+            handler.post {
+                if (currentFloating !== allocation) return@post
+                val player = allocation.player?.takeIf { players[it.id] === it } ?: return@post
+                when (change) {
+                    AudioManager.AUDIOFOCUS_LOSS, AudioManager.AUDIOFOCUS_LOSS_TRANSIENT -> {
+                        try { player.player.pause() } catch (_: Throwable) { }
+                        val state = mapOf(FloatingVideoService.EXTRA_PLAYING to false)
+                        allocation.state.putAll(state)
+                        FloatingVideoService.update(allocation.owner, state)
+                    }
+                    AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK -> {
+                        allocation.ducked = true
+                        duckFloatingPlayer(allocation)
+                    }
+                    AudioManager.AUDIOFOCUS_GAIN -> {
+                        allocation.ducked = false
+                        restoreFloatingVolume(allocation)
+                    }
+                }
+            }
+        }
+        allocation.focusListener = listener
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val request = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
+                .setAudioAttributes(AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_MEDIA)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_MOVIE).build())
+                .setOnAudioFocusChangeListener(listener, handler).build()
+            allocation.focusRequest = request
+            manager.requestAudioFocus(request) == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
+        } else {
+            @Suppress("DEPRECATION")
+            manager.requestAudioFocus(listener, AudioManager.STREAM_MUSIC,
+                AudioManager.AUDIOFOCUS_GAIN) == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
+        }
+    }
+
+    private fun abandonFloatingFocus(allocation: FloatingAllocation) {
+        restoreFloatingVolume(allocation)
+        allocation.ducked = false
+        val listener = allocation.focusListener
+        val request = allocation.focusRequest
+        val manager = allocation.audioManager
+        allocation.focusListener = null
+        allocation.focusRequest = null
+        allocation.audioManager = null
+        try {
+            if (request != null && manager != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                manager.abandonAudioFocusRequest(request as AudioFocusRequest)
+            } else if (listener != null && manager != null) {
+                @Suppress("DEPRECATION")
+                manager.abandonAudioFocus(listener)
+            }
+        } catch (_: Throwable) { }
+    }
+
     private fun disposePlayer(id: Int) {
+        floatingAllocation?.let { allocation ->
+            if (allocation.player?.id == id) {
+                allocation.player = null
+                allocation.attachedPlayer = null
+                allocation.duckedPlayer = null
+            }
+        }
         // Only a still-pending request may allocate. A queued create callback
         // must stay cancelled even if the platform thread stalls.
         pendingPlayerIds.remove(id)
@@ -693,6 +1293,7 @@ class NativePlayerPlugin internal constructor(
         private var uri: Uri? = null
         private var bytesRemaining: Long = C.LENGTH_UNSET.toLong()
         private var opened = false
+
         // Reused across read() calls so the hot path doesn't allocate a fresh
         // buffer for every chunk.
         private var readBuffer: ByteArray? = null
@@ -700,6 +1301,8 @@ class NativePlayerPlugin internal constructor(
         override fun open(dataSpec: DataSpec): Long {
             uri = dataSpec.uri
             transferInitializing(dataSpec)
+            // 起播诊断：一次 open 要先探长度再开流，每次 seek 还会重新 open。
+            val openedAtMs = System.nanoTime() / 1_000_000
             try {
                 streamHandle = stream.open(cdnUrl, keyHex)
                 if (streamHandle == 0L) {
@@ -707,9 +1310,17 @@ class NativePlayerPlugin internal constructor(
                 }
                 val totalSize = stream.size(streamHandle)
                 if (totalSize > 0 && dataSpec.position > totalSize) {
-                    throw DataSourceException(PlaybackException.ERROR_CODE_IO_READ_POSITION_OUT_OF_RANGE)
+                    throw DataSourceException(
+                        PlaybackException.ERROR_CODE_IO_READ_POSITION_OUT_OF_RANGE
+                    )
                 }
-                val available = if (totalSize > 0) totalSize - dataSpec.position else C.LENGTH_UNSET.toLong()
+                val available = if (totalSize >
+                    0
+                ) {
+                    totalSize - dataSpec.position
+                } else {
+                    C.LENGTH_UNSET.toLong()
+                }
                 bytesRemaining = when {
                     dataSpec.length == C.LENGTH_UNSET.toLong() -> available
                     available == C.LENGTH_UNSET.toLong() -> dataSpec.length
@@ -722,6 +1333,21 @@ class NativePlayerPlugin internal constructor(
                 }
                 opened = true
                 transferStarted(dataSpec)
+                if (playerDiagnosticsEnabled) {
+                    // 只记数字：地址/密钥不能进日志，但「open 花了多久、从哪个偏移、
+                    // 总长多少」足够把「转圈」归到开流还是解码/起播门槛。日记账是旁路：
+                    // android.util.Log 在 JVM 单测里没有桩会抛，且这里抛出去还会被下面的
+                    // catch 当成开流失败，所以单独兜住。
+                    try {
+                        Log.d(
+                            PLAYER_LOG_TAG,
+                            "crypto open ${System.nanoTime() / 1_000_000 - openedAtMs}ms " +
+                                "at=${dataSpec.position} size=$totalSize remaining=$bytesRemaining"
+                        )
+                    } catch (_: Throwable) {
+                        // 日志不可用不影响播放。
+                    }
+                }
                 return bytesRemaining
             } catch (error: Throwable) {
                 close()
@@ -791,6 +1417,183 @@ class NativePlayerPlugin internal constructor(
 internal fun isSoftwareDecoder(decoderName: String): Boolean =
     decoderName.startsWith("OMX.google.") || decoderName.startsWith("c2.android.")
 
+/** 用户选择的视频解码器策略（与 Dart 侧 `VideoDecoderPreference` 同名）。 */
+internal enum class VideoDecoderPreference {
+    AUTOMATIC,
+    HARDWARE,
+    SOFTWARE;
+
+    companion object {
+        fun fromName(value: String?): VideoDecoderPreference = entries.firstOrNull { it.name.equals(value, ignoreCase = true) } ?: AUTOMATIC
+    }
+}
+
+/**
+ * 听书倍速的变速实现（与 Dart 侧 `AudioRateEngine` 同名，issue #129）。
+ *
+ * [BUILT_IN] = Media3 自带的 Sonic 时伸缩（`SonicAudioProcessor`，默认行为）；
+ * [PLATFORM] = 系统音频混音器时伸缩（`AudioTrack.setPlaybackParams`，需要
+ * Media3 的 `setEnableAudioTrackPlaybackParams(true)` 才会启用）。
+ *
+ * 同一段智能朗读语音 2.0× 实测，Sonic 的谐噪比比系统实现低 2.9 dB，听感就是
+ * 用户报的「电音/金属感」。系统实现依赖厂商 AudioFlinger/APM，而 ExoPlayer
+ * 历史上在部分蓝牙设备上开这个选项会报 AudioTrack init failed（#9712），
+ * 所以保留 [BUILT_IN] 作为可回退的兼容档。
+ */
+internal enum class AudioRateEngine(val wireName: String) {
+    /** 移植自官方 FFmpeg af_atempo 的 WSOLA，听感对齐番茄官方（issue #129）。 */
+    WSOLA("wsola"),
+    PLATFORM("platform"),
+    BUILT_IN("builtIn");
+
+    companion object {
+        /** 缺省/未知取值退回内建 Sonic（与 Dart 侧默认一致，issue #170）。 */
+        fun fromName(value: String?): AudioRateEngine = entries.firstOrNull { it.wireName.equals(value, ignoreCase = true) } ?: BUILT_IN
+    }
+}
+
+/**
+ * 建播放器时的固定参数。
+ *
+ * [audioOnly] 是听书专用播放器：只有这种播放器才能选 [AudioRateEngine.PLATFORM]。
+ * 视频/短剧必须走 Media3 内建变速，否则音频处理与视频渲染不再步进同一套计时
+ * （画面与声音会错位）。
+ */
+internal data class PlayerBuildOptions(
+    val decoder: VideoDecoderPreference = VideoDecoderPreference.AUTOMATIC,
+    val audioOnly: Boolean = false,
+    val rateEngine: AudioRateEngine = AudioRateEngine.BUILT_IN
+) {
+    /** 真正生效的变速引擎：视频播放器永远强制内建变速。 */
+    val effectiveRateEngine: AudioRateEngine
+        get() = if (audioOnly) rateEngine else AudioRateEngine.BUILT_IN
+}
+
+/**
+ * 设备原生输出采样率，等价于官方 TTPlayer 里的 `getNativeOutputSampleRate`。
+ *
+ * 官方在 atempo 之前用 FFSampleFilter/aformat 把 PCM 统一到这个速率
+ * （`start samplefilter %p, src samplerate:%d ... dst samplerate:%d`），
+ * 这样 AudioTrack 不必再做一次隐式重采样。拿不到时退回 48 kHz 这个
+ * Android 音频输出的通用速率。
+ */
+internal fun nativeOutputSampleRate(): Int = try {
+    AudioTrack.getNativeOutputSampleRate(AudioManager.STREAM_MUSIC)
+        .takeIf { it > 0 } ?: FALLBACK_SAMPLE_RATE
+} catch (_: Throwable) {
+    FALLBACK_SAMPLE_RATE
+}
+
+private const val FALLBACK_SAMPLE_RATE = 48_000
+
+/**
+ * 播放器工厂。解码器偏好与变速引擎都是 builder 期定型，事后无法改，
+ * 不过两者都会影响 renderer 集合。
+ */
+internal fun buildPlayer(context: Context, options: PlayerBuildOptions): ExoPlayer {
+    // Note: decoder init fallback and 206 diagnostics — see
+    // .agents/notes/implemented/bug-fix/2026-10-15-issue2-decoder-initialization-fallback.md.
+    // issue #129：听书倍速改由系统混音器做（AudioTrack/APM），高倍速下
+    // 谐噪比明显好于内建 Sonic。默认值 false，视频播放器保持内建变速。
+    val platformRate = options.effectiveRateEngine == AudioRateEngine.PLATFORM
+    if (options.audioOnly) {
+        // 一行可检索的日志：反馈「高倍速电音/没声音」时能先分清是哪一档。
+        Log.i(
+            PLAYER_LOG_TAG,
+            "audio rate engine=${options.effectiveRateEngine.wireName} platform=$platformRate"
+        )
+    }
+    /*
+     * issue #129：选 WSOLA 时用自定义 AudioProcessorChain —— 把内建 Sonic 换成
+     * 移植过来的 FFmpeg atempo（SpeechTempoProcessor），听感与番茄官方一致。
+     * 音高/速度变化的时机、SilenceSkipping 的位置都保持 Media3 的默认编排，
+     * 只替换「谁来做时伸缩」。
+     */
+    val wsola = options.effectiveRateEngine == AudioRateEngine.WSOLA
+    val factory = if (wsola) {
+        object : DefaultRenderersFactory(context) {
+            override fun buildAudioSink(context: Context, enableFloatOutput: Boolean, enableAudioTrackPlaybackParams: Boolean): AudioSink =
+                DefaultAudioSink.Builder(context)
+                    .setAudioProcessorChain(
+                        WsolaProcessorChain(nativeOutputSampleRate())
+                    )
+                    .setEnableFloatOutput(enableFloatOutput)
+                    // 时伸缩已由 WSOLA 完成，AudioTrack 不能再做一次。
+                    .setEnableAudioTrackPlaybackParams(false)
+                    .build()
+        }
+    } else {
+        DefaultRenderersFactory(context)
+    }
+
+    val renderers = factory
+        .setEnableDecoderFallback(true)
+        // 用户选的解码器策略（issue #92）。自动 = 不干预，MediaTek 部分芯片
+        // 在 Android 15 + HEVC + DRM 上硬解静默黑屏（androidx/media#2711），
+        // 没有错误回调，只能让用户手动切软解。
+        .setMediaCodecSelector(
+            when (options.decoder) {
+                VideoDecoderPreference.SOFTWARE -> SoftwareOnlyCodecSelector
+                VideoDecoderPreference.HARDWARE -> HardwareFirstCodecSelector
+                VideoDecoderPreference.AUTOMATIC -> MediaCodecSelector.DEFAULT
+            }
+        )
+        .setEnableAudioTrackPlaybackParams(platformRate)
+    // 默认 LoadControl 要攒够 2.5 秒媒体数据才开始播放（重缓冲门槛 5 秒）：短剧
+    // 一集只有几十秒，这个门槛就是「点开转圈」的一部分固定成本。只降起播门槛，
+    // 第 4 个参数（重缓冲）保持默认——降到 1.5 秒会在吞吐贴着码率时反复
+    // resume→stall。前两个是 DefaultLoadControl 的默认缓冲深度，显式写出只为
+    // 了让「只改了起播门槛」一眼可见；升级 Media3 时需按新默认值核对。
+    val loadControl = DefaultLoadControl.Builder()
+        .setBufferDurationsMs(50_000, 50_000, 800, 5_000)
+        .build()
+    return ExoPlayer.Builder(context, renderers)
+        .setLoadControl(loadControl)
+        .build()
+}
+
+/**
+ * 只保留 AOSP 软解码器，用于 [VideoDecoderPreference.SOFTWARE]。
+ *
+ * 部分 MediaTek 芯片在 Android 15 上播 HEVC + 加密内容时硬解静默黑屏或卡帧，
+ * 且不抛任何错误（androidx/media#2711、Google issue 437738589），
+ * `setEnableDecoderFallback` 因此永远不会被触发。用户手动选软解时走这里。
+ *
+ * 过滤规则与 [isSoftwareDecoder] 一致，避免两处判断漂移。过滤后为空时退回默认
+ * 列表，让 ExoPlayer 自己报无可用解码器，而不是静默不给候选。
+ */
+internal object SoftwareOnlyCodecSelector : MediaCodecSelector {
+    override fun getDecoderInfos(
+        mimeType: String,
+        requiresSecureDecoder: Boolean,
+        requiresTunnelingDecoder: Boolean
+    ): List<MediaCodecInfo> {
+        val all = MediaCodecSelector.DEFAULT
+            .getDecoderInfos(mimeType, requiresSecureDecoder, requiresTunnelingDecoder)
+        val software = all.filter { isSoftwareDecoder(it.name) }
+        return software.ifEmpty { all }
+    }
+}
+
+/**
+ * 硬解优先：把系统软解码器排到后面，用于 [VideoDecoderPreference.HARDWARE]。
+ *
+ * 与 [MediaCodecSelector.DEFAULT] 的唯一差别是排序，不删除任何候选——硬解真的
+ * 不可用时仍能回落到软解。
+ */
+internal object HardwareFirstCodecSelector : MediaCodecSelector {
+    override fun getDecoderInfos(
+        mimeType: String,
+        requiresSecureDecoder: Boolean,
+        requiresTunnelingDecoder: Boolean
+    ): List<MediaCodecInfo> {
+        val all = MediaCodecSelector.DEFAULT
+            .getDecoderInfos(mimeType, requiresSecureDecoder, requiresTunnelingDecoder)
+        return all.filterNot { isSoftwareDecoder(it.name) } +
+            all.filter { isSoftwareDecoder(it.name) }
+    }
+}
+
 /** Injectable JNI boundary for creation and DataSource range/error checks on the JVM. */
 internal interface CryptoStream {
     fun ensureInitialized()
@@ -808,8 +1611,7 @@ private object JniCryptoStream : CryptoStream {
     override fun open(url: String, keyHex: String) = CryptoNative.nativePlayerStreamOpen(url, keyHex)
     override fun size(handle: Long) = CryptoNative.nativePlayerStreamSize(handle)
     override fun seek(handle: Long, position: Long) = CryptoNative.nativePlayerStreamSeek(handle, position)
-    override fun read(handle: Long, buffer: ByteArray, length: Int) =
-        CryptoNative.nativePlayerStreamRead(handle, buffer, length)
+    override fun read(handle: Long, buffer: ByteArray, length: Int) = CryptoNative.nativePlayerStreamRead(handle, buffer, length)
     override fun close(handle: Long) = CryptoNative.nativePlayerStreamClose(handle)
     override fun lastHttpStatus(url: String) = com.example.shortplay.HttpBridge.lastHttpStatus(url)
     override fun clearHttpStatus(url: String) = com.example.shortplay.HttpBridge.clearHttpStatus(url)

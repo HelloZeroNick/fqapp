@@ -34,12 +34,15 @@ class ReaderTextSelection {
   int get length => end - start;
   bool get isValid => end > start;
 
-  ReaderTextSelection copyWith({int? start, int? end, bool? isWholeParagraph}) =>
-      ReaderTextSelection(
-        start: start ?? this.start,
-        end: end ?? this.end,
-        isWholeParagraph: isWholeParagraph ?? this.isWholeParagraph,
-      );
+  ReaderTextSelection copyWith({
+    int? start,
+    int? end,
+    bool? isWholeParagraph,
+  }) => ReaderTextSelection(
+    start: start ?? this.start,
+    end: end ?? this.end,
+    isWholeParagraph: isWholeParagraph ?? this.isWholeParagraph,
+  );
 
   /// Moves one bound to [offset] within the chapter text of length
   /// [textLength], keeping the selection non-empty: a drag landing exactly on
@@ -136,7 +139,10 @@ int snapToCharacter(String text, int offset) {
   var x = isStart ? 0.0 : columnWidth;
   final leading = block.isTitle ? 0 : 1;
   final boxes = painter.getBoxesForSelection(
-    TextSelection(baseOffset: textOffset + leading, extentOffset: textOffset + leading + 1),
+    TextSelection(
+      baseOffset: textOffset + leading,
+      extentOffset: textOffset + leading + 1,
+    ),
     boxHeightStyle: BoxHeightStyle.tight,
   );
   if (boxes.isNotEmpty) {
@@ -241,7 +247,9 @@ class ReaderSelectionGeometry {
     final entry = _entryAt(global);
     if (entry == null) return null;
     final local = entry.box.globalToLocal(global);
-    final y = local.dy.clamp(0.0, math.max(0.0, entry.block.height - .01)).toDouble();
+    final y = local.dy
+        .clamp(0.0, math.max(0.0, entry.block.height - .01))
+        .toDouble();
     final position = entry.painter.getPositionForOffset(Offset(local.dx, y));
     final leading = entry.block.isTitle ? 0 : 1;
     final textOffset = (position.offset - leading).clamp(
@@ -261,12 +269,26 @@ class ReaderSelectionScope {
   final Color underlineColor;
   final Color narrationColor;
 
+  /// 朗读句画成下划线而非色块（墨水屏色块会整屏拖影）。
+  final bool narrationUnderline;
+  final Map<int, List<(int, int)>> dialogueRangesByBlock;
+  final Color dialogueColor;
+  final bool dialogueUnderline;
+
+  final void Function(ReaderRangeUnderline underline)? onMarkTap;
+  bool consumeMarkTap = false;
+
   ReaderSelectionScope({
     required this.geometry,
     required this.washColor,
     required this.handleColor,
     required this.underlineColor,
     required this.narrationColor,
+    this.narrationUnderline = false,
+    this.dialogueRangesByBlock = const {},
+    this.dialogueColor = Colors.transparent,
+    this.dialogueUnderline = false,
+    this.onMarkTap,
   });
 }
 
@@ -316,6 +338,9 @@ class ReaderBlockMarkLayer extends StatefulWidget {
 
 class _ReaderBlockMarkLayerState extends State<ReaderBlockMarkLayer> {
   TextPainter? _painter;
+  ReaderRangeUnderline? _pendingMark;
+  Offset? _markDownPosition;
+  bool _markMoved = false;
 
   @override
   void initState() {
@@ -364,6 +389,51 @@ class _ReaderBlockMarkLayerState extends State<ReaderBlockMarkLayer> {
     });
   }
 
+  List<Rect> _markRects(ReaderRangeUnderline underline) {
+    if (underline.deletion) {
+      final local = (underline.start - widget.block.start).clamp(
+        0,
+        widget.block.text.length,
+      );
+      final line = lineForOffset(widget.block, local);
+      final leading = widget.block.isTitle ? 0 : 1;
+      final caret = _lazyPainter.getOffsetForCaret(
+        TextPosition(offset: local + leading),
+        Rect.zero,
+      );
+      return [
+        Rect.fromLTRB(
+          caret.dx - 20,
+          line.top - 2,
+          caret.dx + 20,
+          line.bottom + 4,
+        ),
+      ];
+    }
+    final range = blockSelectionRange(
+      widget.block,
+      underline.start,
+      underline.end,
+    );
+    if (range == null) return const [];
+    final leading = widget.block.isTitle ? 0 : 1;
+    final rects = <Rect>[];
+    for (final line in widget.block.lines) {
+      final from = math.max(range.$1, line.start);
+      final to = math.min(range.$2, line.end);
+      if (to <= from) continue;
+      final boxes = _lazyPainter.getBoxesForSelection(
+        TextSelection(baseOffset: from + leading, extentOffset: to + leading),
+        boxHeightStyle: BoxHeightStyle.tight,
+      );
+      for (final box in boxes) {
+        if (box.right <= box.left) continue;
+        rects.add(Rect.fromLTRB(box.left, line.top, box.right, line.bottom));
+      }
+    }
+    return rects;
+  }
+
   @override
   Widget build(BuildContext context) {
     final selection = widget.selection;
@@ -374,7 +444,7 @@ class _ReaderBlockMarkLayerState extends State<ReaderBlockMarkLayer> {
     final narrationRange = narration == null
         ? null
         : blockSelectionRange(widget.block, narration.$1, narration.$2);
-    return Stack(
+    final stack = Stack(
       children: [
         // First child paints first: the marks sit behind the text.
         Positioned.fill(
@@ -388,11 +458,67 @@ class _ReaderBlockMarkLayerState extends State<ReaderBlockMarkLayer> {
               underlineColor: widget.scope.underlineColor,
               narrationRange: narrationRange,
               narrationColor: widget.scope.narrationColor,
+              narrationUnderline: widget.scope.narrationUnderline,
+              dialogueRanges:
+                  widget.scope.dialogueRangesByBlock[widget.block.index] ??
+                  const [],
+              dialogueColor: widget.scope.dialogueColor,
+              dialogueUnderline: widget.scope.dialogueUnderline,
             ),
           ),
         ),
         widget.child,
       ],
+    );
+    final onMarkTap = widget.scope.onMarkTap;
+    if (onMarkTap == null) return stack;
+    return Listener(
+      behavior: HitTestBehavior.translucent,
+      onPointerDown: (event) {
+        _pendingMark = null;
+        _markDownPosition = event.localPosition;
+        _markMoved = false;
+        for (final underline in widget.rangeUnderlines) {
+          if (underline.payload == null) continue;
+          for (final rect in _markRects(underline)) {
+            if (!rect.inflate(28).contains(event.localPosition)) continue;
+            _pendingMark = underline;
+            // Mark this before the page-level tap recognizer runs, otherwise
+            // the same tap opens the detail sheet and turns the page.
+            widget.scope.consumeMarkTap = true;
+            return;
+          }
+        }
+      },
+      onPointerMove: (event) {
+        if (_pendingMark == null || _markMoved) return;
+        final down = _markDownPosition;
+        if (down != null && (event.localPosition - down).distance > 8) {
+          _markMoved = true;
+          _pendingMark = null;
+          widget.scope.consumeMarkTap = false;
+        }
+      },
+      onPointerUp: (event) {
+        final pending = _pendingMark;
+        final down = _markDownPosition;
+        _pendingMark = null;
+        _markDownPosition = null;
+        if (pending == null) return;
+        if (_markMoved ||
+            (down != null && (event.localPosition - down).distance > 8)) {
+          widget.scope.consumeMarkTap = false;
+          return;
+        }
+        onMarkTap(pending);
+      },
+      onPointerCancel: (_) {
+        _pendingMark = null;
+        _markDownPosition = null;
+        _markMoved = false;
+        widget.scope.consumeMarkTap = false;
+      },
+      child: stack,
     );
   }
 }
@@ -508,6 +634,10 @@ class ReaderBlockMarkPainter extends CustomPainter {
   final Color underlineColor;
   final (int, int)? narrationRange;
   final Color narrationColor;
+  final bool narrationUnderline;
+  final List<(int, int)> dialogueRanges;
+  final Color dialogueColor;
+  final bool dialogueUnderline;
 
   const ReaderBlockMarkPainter({
     required this.block,
@@ -518,6 +648,10 @@ class ReaderBlockMarkPainter extends CustomPainter {
     required this.underlineColor,
     required this.narrationRange,
     required this.narrationColor,
+    this.narrationUnderline = false,
+    this.dialogueRanges = const [],
+    this.dialogueColor = Colors.transparent,
+    this.dialogueUnderline = false,
   });
 
   /// Per-line glyph rects for a block-text range: the vertical span of the
@@ -531,7 +665,10 @@ class ReaderBlockMarkPainter extends CustomPainter {
       final lineEnd = math.min(to, line.end);
       if (lineEnd <= lineStart) continue;
       final boxes = painter.getBoxesForSelection(
-        TextSelection(baseOffset: lineStart + leading, extentOffset: lineEnd + leading),
+        TextSelection(
+          baseOffset: lineStart + leading,
+          extentOffset: lineEnd + leading,
+        ),
         boxHeightStyle: BoxHeightStyle.tight,
       );
       for (final TextBox box in boxes) {
@@ -544,16 +681,44 @@ class ReaderBlockMarkPainter extends CustomPainter {
 
   @override
   void paint(Canvas canvas, Size size) {
-    // Narration first (underneath): a user selection over the narrated
-    // sentence must stay visible on top of it.
+    // Dialogue sits below playback and selection marks, without changing the
+    // spans that pagination, comments and selection offsets address.
+    final dialoguePaint = Paint()
+      ..color = dialogueColor
+      ..strokeWidth = 1.2;
+    for (final range in dialogueRanges) {
+      for (final rect in _lineRects(range.$1, range.$2)) {
+        if (dialogueUnderline) {
+          _strokeRow(canvas, rect, dialoguePaint);
+        } else {
+          canvas.drawRRect(
+            RRect.fromRectAndRadius(rect, const Radius.circular(2)),
+            dialoguePaint,
+          );
+        }
+      }
+    }
+    // A user selection must stay visible over the narrated sentence.
     final narration = narrationRange;
     if (narration != null) {
-      final narrationPaint = Paint()..color = narrationColor;
-      for (final rect in _lineRects(narration.$1, narration.$2)) {
-        canvas.drawRRect(
-          RRect.fromRectAndRadius(rect, const Radius.circular(2)),
-          narrationPaint,
-        );
+      final rects = _lineRects(narration.$1, narration.$2);
+      if (narrationUnderline) {
+        // 墨水屏走下划线：色块会整屏拖影，线只刷几行。线要够粗才看得见
+        // （2px 在高 dpi 上仍嫌细），颜色由调用方保证是深色/不透明。
+        final line = Paint()
+          ..color = narrationColor
+          ..strokeWidth = 3;
+        for (final rect in rects) {
+          _strokeRow(canvas, rect, line);
+        }
+      } else {
+        final paint = Paint()..color = narrationColor;
+        for (final rect in rects) {
+          canvas.drawRRect(
+            RRect.fromRectAndRadius(rect, const Radius.circular(2)),
+            paint,
+          );
+        }
       }
     }
     final wash = Paint()..color = washColor;
@@ -569,23 +734,78 @@ class ReaderBlockMarkPainter extends CustomPainter {
     final line = Paint()
       ..color = underlineColor
       ..strokeWidth = 1.6;
+    final dashed = Paint()
+      ..color = underlineColor
+      ..strokeWidth = 1.4
+      ..strokeCap = StrokeCap.round;
     for (final underline in rangeUnderlines) {
+      if (underline.deletion) {
+        _paintDeletionCaret(canvas, underline);
+        continue;
+      }
       final range = blockSelectionRange(block, underline.start, underline.end);
       if (range == null) continue;
       for (final rect in _lineRects(range.$1, range.$2)) {
-        // Sit the stroke just under the glyphs, inside the line box.
-        final y = rect.bottom - .5;
-        canvas.drawLine(Offset(rect.left, y), Offset(rect.right, y), line);
+        if (underline.dashed) {
+          _strokeDashedRow(canvas, rect, dashed);
+        } else {
+          _strokeRow(canvas, rect, line);
+        }
       }
+    }
+  }
+
+  void _paintDeletionCaret(Canvas canvas, ReaderRangeUnderline underline) {
+    final local = (underline.start - block.start).clamp(0, block.text.length);
+    final line = lineForOffset(block, local);
+    final leading = block.isTitle ? 0 : 1;
+    final caret = painter.getOffsetForCaret(
+      TextPosition(offset: local + leading),
+      Rect.zero,
+    );
+    final paint = Paint()
+      ..color = underlineColor
+      ..strokeWidth = underline.dashed ? 1.4 : 1.8
+      ..strokeCap = StrokeCap.round;
+    canvas.drawLine(
+      Offset(caret.dx, line.top + 2),
+      Offset(caret.dx, line.bottom - 2),
+      paint,
+    );
+  }
+
+  /// 描一条贴着字形底边的横线（选区下划线与朗读句下划线共用）。
+  void _strokeRow(Canvas canvas, Rect rect, Paint line) {
+    // Sit the stroke just under the glyphs, inside the line box.
+    final y = rect.bottom - .5;
+    canvas.drawLine(Offset(rect.left, y), Offset(rect.right, y), line);
+  }
+
+  /// Low-contrast dotted mark used for AI edits; user underlines stay solid.
+  void _strokeDashedRow(Canvas canvas, Rect rect, Paint line) {
+    final y = rect.bottom - .5;
+    const dash = 2.2;
+    const gap = 3.0;
+    var x = rect.left;
+    while (x < rect.right) {
+      final end = math.min(x + dash, rect.right);
+      canvas.drawLine(Offset(x, y), Offset(end, y), line);
+      x += dash + gap;
     }
   }
 
   @override
   bool shouldRepaint(ReaderBlockMarkPainter old) =>
+      !identical(old.block, block) ||
+      !identical(old.painter, painter) ||
+      !listEquals(old.dialogueRanges, dialogueRanges) ||
+      old.dialogueColor != dialogueColor ||
+      old.dialogueUnderline != dialogueUnderline ||
       old.selectionRange != selectionRange ||
       !listEquals(old.rangeUnderlines, rangeUnderlines) ||
       old.washColor != washColor ||
       old.underlineColor != underlineColor ||
       old.narrationRange != narrationRange ||
-      old.narrationColor != narrationColor;
+      old.narrationColor != narrationColor ||
+      old.narrationUnderline != narrationUnderline;
 }

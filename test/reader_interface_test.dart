@@ -5,19 +5,21 @@ import 'dart:ui' as ui;
 import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter_lucide/flutter_lucide.dart';
 import 'package:flutter_test/flutter_test.dart';
-import 'package:shared_preferences/shared_preferences.dart';
 import 'package:fqapp/models/media_item.dart';
 import 'package:fqapp/pages/reader_page.dart';
 import 'package:fqapp/services/reader_device.dart';
 import 'package:fqapp/services/reader_preferences.dart';
+import 'package:fqapp/widgets/reader/settings/reader_settings_widgets.dart';
 
 import 'support/fakes.dart';
+import 'support/reader_settings_nav.dart';
 
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
   setUp(() {
-    SharedPreferences.setMockInitialValues({
+    setSingleChapterPrefs({
       'reader_page_mode': 'scroll',
       'reader_info_mode': 'detailed',
     });
@@ -123,12 +125,9 @@ void main() {
     expect(device.calls, contains('start:true:0.5'));
     await _openMenu(tester);
     await _openSettings(tester);
-    final slider = tester.widget<Slider>(
-      find.byKey(const ValueKey('reader-brightness')),
-    );
-    slider.onChanged!(0.3);
-    slider.onChangeEnd!(0.3);
-    await tester.pumpAndSettle();
+    // 亮度在「屏幕」分类里。
+    await openReaderSettingsCategory(tester, 'page');
+    await setReaderSliderValue(tester, 'reader-brightness', 0.3);
     expect(device.calls, contains('brightness:false:0.3'));
     expect((await ReaderPreferences.load()).followSystemBrightness, isFalse);
     tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.paused);
@@ -156,28 +155,19 @@ void main() {
       await tester.pumpAndSettle();
       final anchor = _firstVisibleParagraph(tester);
       await _openAppearance(tester);
-      await tester.tap(find.byTooltip('增大字号'));
-      await tester.pumpAndSettle();
+      // 字号与字距、标题对齐都在「字体」分类。
+      await openReaderSettingsCategory(tester, 'font');
+      await setReaderSliderValue(tester, 'reader-font-size', 19);
       expect(_firstVisibleParagraph(tester), anchor);
-      // 字距 lives under 更多排版 (官方版式首屏没有它).
-      await tester.ensureVisible(
-        find.byKey(const ValueKey('reader-more-appearance')),
-      );
-      await tester.tap(find.text('更多排版'));
+      await setReaderSliderValue(tester, 'reader-letter-spacing', 0.1);
+      await tester.ensureVisible(find.text('居中'));
+      await tester.tap(find.text('居中'));
       await tester.pumpAndSettle();
-      await tester.ensureVisible(find.byTooltip('增大字距'));
-      await tester.tap(find.byTooltip('增大字距'));
-      await tester.pumpAndSettle();
-      await tester.ensureVisible(find.text('标题居中'));
-      await tester.tap(find.text('标题居中'));
-      // 上下边距 is an official-style chip row: tap the 宽 preset.
-      await tester.ensureVisible(
-        find.byKey(const ValueKey('reader-vertical-padding-28.0')),
-      );
-      await tester.tap(find.byKey(const ValueKey('reader-vertical-padding-28.0')));
-      await tester.pumpAndSettle();
-      await tester.tap(find.byTooltip('关闭排版设置'));
-      await tester.pumpAndSettle();
+      // 上下边距在「屏幕」分类里；默认 16。
+      await backToReaderSettingsCategories(tester);
+      await openReaderSettingsCategory(tester, 'page');
+      await setReaderSliderValue(tester, 'reader-vertical-padding', 28);
+      await closeReaderSettingsSheet(tester);
       final preferences = await ReaderPreferences.load();
       expect(preferences.fontSize, 19);
       expect(preferences.letterSpacing, closeTo(0.1, 0.001));
@@ -190,7 +180,7 @@ void main() {
   testWidgets(
     'night directory uses the reader palette instead of the app day theme',
     (tester) async {
-      SharedPreferences.setMockInitialValues({
+      setSingleChapterPrefs({
         'reader_theme_preset': 'dark',
         'reader_page_mode': 'scroll',
       });
@@ -199,7 +189,7 @@ void main() {
       await _openMenu(tester);
       await tester.tap(find.text('目录'));
       await tester.pumpAndSettle();
-      final directory = find.text('目录 · 2 章');
+      final directory = find.text('目录');
       expect(
         Theme.of(tester.element(directory)).colorScheme.brightness,
         Brightness.dark,
@@ -217,19 +207,66 @@ void main() {
     },
   );
 
+  testWidgets('the listening source sheet follows the reader preset', (
+    tester,
+  ) async {
+    await _size(tester, const Size(390, 800));
+    await tester.pumpWidget(_app(_reader()));
+    await tester.pumpAndSettle();
+    await _openMenu(tester);
+    // 「听书方式」在「听书」分类里；从坞上的「操作」进去后退回网格才能看到它。
+    await tester.tap(find.byKey(const ValueKey('reader-operations-entry')));
+    await tester.pumpAndSettle();
+    await backToReaderSettingsCategories(tester);
+    await openReaderSettingsCategory(tester, 'listening');
+    await tester.ensureVisible(find.text('听书方式'));
+    await tester.tap(find.text('听书方式'));
+    // The entry's busy indicator runs until the source sheet closes.
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 500));
+
+    final frame = tester.widget<ReaderSettingsSheetFrame>(
+      find.byType(ReaderSettingsSheetFrame),
+    );
+    expect(frame.preset, ReaderThemePreset.light);
+    expect(find.text('听书方式'), findsOneWidget);
+    final sheet = find.byType(ReaderSettingsSheetFrame);
+    for (final icon in [
+      LucideIcons.headphones,
+      LucideIcons.locate_fixed,
+      LucideIcons.mic,
+    ]) {
+      expect(
+        find.descendant(of: sheet, matching: find.byIcon(icon)),
+        findsOneWidget,
+      );
+    }
+
+    await tester.tap(find.byTooltip('关闭'));
+    await tester.pumpAndSettle();
+    expect(find.byType(ReaderSettingsSheetFrame), findsNothing);
+    await tester.pumpWidget(const SizedBox.shrink());
+  });
+
   testWidgets('a cancelled font import keeps the existing appearance', (
     tester,
   ) async {
     await tester.pumpWidget(_app(_reader()));
     await tester.pumpAndSettle();
     await _openAppearance(tester);
-    await tester.ensureVisible(find.text('导入字体'));
+    await openReaderSettingsCategory(tester, 'font');
+    await tester.ensureVisible(
+      find.byKey(const ValueKey('reader-font-picker')),
+    );
+    await tester.tap(find.byKey(const ValueKey('reader-font-picker')));
+    await tester.pumpAndSettle();
     await tester.tap(find.text('导入字体'));
     await tester.pumpAndSettle();
     expect(find.text('系统字体'), findsOneWidget);
     expect(find.textContaining('无法载入字体'), findsNothing);
-    await tester.tap(find.byTooltip('关闭排版设置'));
+    await tester.tap(find.byTooltip('关闭字体设置'));
     await tester.pumpAndSettle();
+    await closeReaderSettingsSheet(tester);
     expect((await ReaderPreferences.load()).fontPath, isEmpty);
     await tester.pumpWidget(const SizedBox.shrink());
   });
@@ -252,15 +289,20 @@ void main() {
         expect(tester.takeException(), isNull);
         if (layout.name == 'portrait') await _capture(tester, 'menu');
         await _openSettings(tester);
-        await tester.ensureVisible(find.text('排版'));
-        await tester.tap(find.text('排版'));
-        await tester.pumpAndSettle();
-        expect(find.text('排版设置'), findsOneWidget);
+        expect(
+          find.byKey(const ValueKey('reader-settings-category-grid')),
+          findsOneWidget,
+        );
         expect(tester.takeException(), isNull);
         if (layout.name == 'portrait') await _capture(tester, 'appearance');
+        // 主题 chips 在「主题」分类里。
+        await openReaderSettingsCategory(tester, 'theme');
+        await tester.ensureVisible(
+          find.byKey(const ValueKey('reader-theme-dark')),
+        );
         await tester.tap(find.byKey(const ValueKey('reader-theme-dark')));
         await tester.pumpAndSettle();
-        await tester.tap(find.byTooltip('关闭排版设置'));
+        await closeReaderSettingsSheet(tester);
         await tester.pumpAndSettle();
         expect(tester.takeException(), isNull);
         if (layout.name == 'portrait') await _capture(tester, 'night');
@@ -330,9 +372,6 @@ Future<void> _openMenu(WidgetTester tester) async {
 Future<void> _openAppearance(WidgetTester tester) async {
   await _openMenu(tester);
   await _openSettings(tester);
-  await tester.ensureVisible(find.text('排版'));
-  await tester.tap(find.text('排版'));
-  await tester.pumpAndSettle();
 }
 
 ValueKey<String> _firstVisibleParagraph(WidgetTester tester) {
@@ -426,10 +465,14 @@ Future<void> _capture(WidgetTester tester, String name) async {
   });
 }
 
-/// Expands the 设置 section of the reading menu. The section keeps its state
-/// across chapter changes, so this is a no-op while it is already open.
+/// 从阅读菜单的「外观」直接打开阅读设置面板。
 Future<void> _openSettings(WidgetTester tester) async {
-  if (find.byTooltip('上一章').evaluate().isNotEmpty) return;
+  if (find
+      .byKey(const ValueKey('reader-settings-category-grid'))
+      .evaluate()
+      .isNotEmpty) {
+    return;
+  }
   await tester.tap(find.byKey(const ValueKey('reader-settings')));
   await tester.pumpAndSettle();
 }

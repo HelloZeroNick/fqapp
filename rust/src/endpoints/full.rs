@@ -1,6 +1,9 @@
 //! `full` endpoint: CM DH handshake + per-item AES-256 decrypt.
 
+use std::sync::Arc;
+
 use futures::future::BoxFuture;
+use futures::{stream, StreamExt};
 use serde_json::{json, Map, Value};
 
 use crate::endpoints::base::{
@@ -36,7 +39,11 @@ pub fn parse_item_ids(raw: &str) -> Vec<String> {
 }
 
 pub async fn get_chapters(ctx: &Ctx, book_id: &str, item_ids: &[String]) -> ApiResult<Value> {
-    let cm = CM::new().map_err(|e| ApiError::Internal(format!("cm init: {e}")))?;
+    let cm = Arc::new(
+        CM::new_off_thread()
+            .await
+            .map_err(|e| ApiError::Internal(format!("cm init: {e}")))?,
+    );
     let key = cm.client_handshake();
 
     let req_body = serde_json::to_vec(&json!({
@@ -58,14 +65,32 @@ pub async fn get_chapters(ctx: &Ctx, book_id: &str, item_ids: &[String]) -> ApiR
         .await?;
 
     let mut root: Value = crate::endpoints::util::raw_json(&raw)?;
-    let mut data: Map<String, Value> = match root.get("data").and_then(|d| d.as_object()) {
-        Some(d) if !d.is_empty() => d.clone(),
-        _ => return Ok(root),
-    };
-    let item_infos = match data.get("item_infos") {
-        Some(v) => v.clone(),
-        None => return Ok(root),
-    };
+    drop(raw);
+    // Inspect before mutating so the pass-through cases return the parsed root
+    // untouched. The checks borrow immutably; the clone-free take below needs
+    // the borrow to end first.
+    if !matches!(
+        root.get("data").and_then(|d| d.as_object()),
+        Some(d) if !d.is_empty()
+    ) {
+        return Ok(root);
+    }
+    if root.get("data").and_then(|d| d.get("item_infos")).is_none() {
+        return Ok(root);
+    }
+    // Take `item_infos` out of `data` in place: cloning the whole map (and
+    // then inserting the processed one back) copied every chapter body for no
+    // reason. `mem::take` leaves the key in place, so key order and therefore
+    // the serialized JSON stay unchanged.
+    let data = root
+        .as_object_mut()
+        .and_then(|root_obj| root_obj.get_mut("data"))
+        .and_then(|d| d.as_object_mut())
+        .expect("data is a non-empty object, checked above");
+    let item_infos = data
+        .get_mut("item_infos")
+        .map(std::mem::take)
+        .expect("item_infos exists, checked above");
 
     let processor = FullContentProcessor::new();
     let zwsm = ctx.cfg.zwsm.clone();
@@ -73,30 +98,49 @@ pub async fn get_chapters(ctx: &Ctx, book_id: &str, item_ids: &[String]) -> ApiR
     match item_infos {
         Value::Object(item_map) => {
             let mut out = Map::new();
-            for (id, item) in item_map {
-                match item {
-                    Value::Object(mut obj) => {
-                        decrypt_full_item_content(&mut obj, &cm, &zwsm, &processor);
-                        out.insert(id, Value::Object(obj));
+            let mut pending = stream::iter(item_map)
+                .map(|(id, item)| {
+                    let cm = &cm;
+                    let zwsm = &zwsm;
+                    let processor = &processor;
+                    async move {
+                        let item = match item {
+                            Value::Object(mut obj) => {
+                                decrypt_full_item_content(&id, &mut obj, cm, zwsm, processor).await;
+                                Value::Object(obj)
+                            }
+                            other => other,
+                        };
+                        (id, item)
                     }
-                    other => {
-                        out.insert(id, other);
-                    }
-                }
+                })
+                .buffer_unordered(2);
+            while let Some((id, item)) = pending.next().await {
+                out.insert(id, item);
             }
             data.insert("item_infos".to_string(), Value::Object(out));
         }
         Value::Array(item_arr) => {
-            let mut out = Vec::with_capacity(item_arr.len());
-            for item in item_arr {
-                match item {
-                    Value::Object(mut obj) => {
-                        decrypt_full_item_content(&mut obj, &cm, &zwsm, &processor);
-                        out.push(Value::Object(obj));
+            // Arrays preserve upstream order; CM also enforces a process-wide
+            // limit so concurrent batches cannot flood the blocking pool.
+            let out = stream::iter(item_arr)
+                .map(|item| {
+                    let cm = &cm;
+                    let zwsm = &zwsm;
+                    let processor = &processor;
+                    async move {
+                        match item {
+                            Value::Object(mut obj) => {
+                                decrypt_full_item_content("", &mut obj, cm, zwsm, processor).await;
+                                Value::Object(obj)
+                            }
+                            other => other,
+                        }
                     }
-                    other => out.push(other),
-                }
-            }
+                })
+                .buffered(2)
+                .collect()
+                .await;
             data.insert("item_infos".to_string(), Value::Array(out));
         }
         other => {
@@ -104,15 +148,13 @@ pub async fn get_chapters(ctx: &Ctx, book_id: &str, item_ids: &[String]) -> ApiR
         }
     }
 
-    if let Some(root_obj) = root.as_object_mut() {
-        root_obj.insert("data".to_string(), Value::Object(data));
-    }
     Ok(root)
 }
 
-fn decrypt_full_item_content(
+async fn decrypt_full_item_content(
+    label: &str,
     item_obj: &mut Map<String, Value>,
-    cm: &CM,
+    cm: &Arc<CM>,
     zwsm: &str,
     processor: &FullContentProcessor,
 ) {
@@ -121,21 +163,43 @@ fn decrypt_full_item_content(
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
-    let content = item_obj
-        .get("content")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
+    let Some(Value::String(content)) = item_obj.get_mut("content") else {
+        return;
+    };
     if key.is_empty() || content.is_empty() {
         return;
     }
-    if let Ok(plain) = cm.decrypt(&key, &content) {
-        let text = format!(
-            "{}{}",
-            processor.process(&String::from_utf8_lossy(&plain)),
-            zwsm
-        );
-        item_obj.insert("content".to_string(), Value::from(text));
+    let content = std::mem::take(content);
+    let content_len = content.len();
+    let key_len = key.len();
+    let zwsm = zwsm.to_owned();
+    let processor = *processor;
+    let processed = cm
+        .process_off_thread(move |cm| {
+            let plain = cm.decrypt(&key, &content)?;
+            let mut text = processor.process(&String::from_utf8_lossy(&plain));
+            text.push_str(&zwsm);
+            Ok(text)
+        })
+        .await;
+    match processed {
+        Ok(text) => {
+            item_obj.insert("content".to_string(), Value::from(text));
+        }
+        Err(error) => {
+            // A failed decrypt is not "no content": leaving the upstream base64
+            // in place means it gets served as the chapter text, because
+            // `content.rs` only checks that `content` is non-empty. Drop the
+            // field so the caller's fallback can take over, and say so - this
+            // used to fail with no log at all.
+            log::warn!(
+                "full content {label}: decrypt failed ({error}); dropping ciphertext \
+                 (content_len={}, key_len={})",
+                content_len,
+                key_len
+            );
+            item_obj.remove("content");
+        }
     }
 }
 
@@ -164,4 +228,35 @@ fn handle<'a>(ctx: &'a Ctx, params: &'a Params) -> BoxFuture<'a, ApiResult<Value
 
 pub fn register(s: &mut Server) {
     s.add_route("full", handle);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A failed decrypt must not leave the upstream base64 in place: `content.rs`
+    /// only checks that `content` is non-empty, so it used to be served as the
+    /// chapter text. Dropping the field lets the caller's fallback take over.
+    #[tokio::test]
+    async fn a_failed_decrypt_drops_the_ciphertext_instead_of_serving_it() {
+        let cm = Arc::new(CM::new().expect("cm"));
+        let mut item = Map::new();
+        // Short content / degenerate key: `CM::decrypt` returns an error for both.
+        item.insert("key".to_string(), Value::from("AQ=="));
+        item.insert("content".to_string(), Value::from("AAAA"));
+
+        decrypt_full_item_content(
+            "chapter-1",
+            &mut item,
+            &cm,
+            "",
+            &FullContentProcessor::new(),
+        )
+        .await;
+
+        assert!(
+            !item.contains_key("content"),
+            "failed ciphertext must not survive as the chapter body: {item:?}"
+        );
+    }
 }

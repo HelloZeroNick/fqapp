@@ -5,17 +5,68 @@
 //! carries the gzip magic), and some endpoints set `Accept-Encoding` by hand.
 //! Redirect policy and business-error handling therefore stay identical too.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures::StreamExt;
+use once_cell::sync::OnceCell;
 
 use crate::crypto::{gunzip_capped, GunzipError, MAX_GUNZIP_BYTES};
 
 /// Response-body cap for JSON/API calls (P2-12). The video download path
-/// (`video.rs` unsigned_get) deliberately does not use it — it streams
-/// through the uncapped `request` until its own streaming fix lands, so a
-/// 64 MiB cap here must never apply to media bytes.
+/// passes its own per-file bound instead, so API callers all share one cap.
 pub const API_BODY_LIMIT_BYTES: usize = 64 * 1024 * 1024;
+
+const INLINE_GUNZIP_LIMIT: usize = 64 * 1024;
+static GUNZIP_WORK: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+
+fn inflate_body(body: Vec<u8>, limit: usize) -> Result<Vec<u8>, TransportError> {
+    match gunzip_capped(&body, limit) {
+        Ok(inflated) => Ok(inflated),
+        Err(GunzipError::OverLimit) => Err(TransportError::TooLarge(format!(
+            "gunzip output exceeds {limit} bytes"
+        ))),
+        // Preserve corrupt gzip for the downstream parser to reject.
+        Err(GunzipError::Corrupt(_)) => Ok(body),
+    }
+}
+
+async fn inflate_response(body: Vec<u8>, limit: usize) -> Result<Vec<u8>, TransportError> {
+    if body.len() <= INLINE_GUNZIP_LIMIT {
+        // Bound actual output, not the untrusted gzip size trailer. Even a
+        // tiny compressed body can expand into megabytes.
+        match gunzip_capped(&body, limit.min(INLINE_GUNZIP_LIMIT)) {
+            Ok(inflated) => return Ok(inflated),
+            Err(GunzipError::Corrupt(_)) => return Ok(body),
+            Err(GunzipError::OverLimit) if limit <= INLINE_GUNZIP_LIMIT => {
+                return Err(TransportError::TooLarge(format!(
+                    "gunzip output exceeds {limit} bytes"
+                )));
+            }
+            Err(GunzipError::OverLimit) => {}
+        }
+    }
+    let queued = Instant::now();
+    let input_bytes = body.len();
+    let permit = GUNZIP_WORK
+        .acquire()
+        .await
+        .map_err(|e| TransportError::Network(e.to_string()))?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let wait_ms = queued.elapsed().as_millis();
+        let started = Instant::now();
+        let result = inflate_body(body, limit);
+        let work_ms = started.elapsed().as_millis();
+        if wait_ms + work_ms >= 100 {
+            log::info!(
+                "gunzip slow: queue_ms={wait_ms} work_ms={work_ms} input_bytes={input_bytes}"
+            );
+        }
+        result
+    })
+    .await
+    .map_err(|e| TransportError::Network(format!("gunzip task failed: {e}")))?
+}
 
 #[derive(Debug, Clone)]
 pub struct RawResponse {
@@ -37,6 +88,11 @@ impl RawResponse {
 pub enum TransportError {
     /// Connection-level failure (Go: `http.Client.Do` error).
     Network(String),
+    /// A *local* size limit was hit (caller cap, gunzip cap). This is not a
+    /// transport failure and must not be read as one: callers rotate a pooled
+    /// device on `Network`, and a response that is simply too big says nothing
+    /// about the device.
+    TooLarge(String),
 }
 
 pub struct HttpTransport {
@@ -46,10 +102,22 @@ pub struct HttpTransport {
 
 impl HttpTransport {
     pub fn new(timeout_secs: u64) -> Result<Self, String> {
+        Self::build(timeout_secs, false)
+    }
+
+    /// Account cookies must never follow a redirect to a different origin.
+    pub fn without_redirects(timeout_secs: u64) -> Result<Self, String> {
+        Self::build(timeout_secs, true)
+    }
+
+    fn build(timeout_secs: u64, no_redirects: bool) -> Result<Self, String> {
         ensure_crypto_provider();
         let tls = build_tls_config()?;
-        let client = reqwest::Client::builder()
-            .tls_backend_preconfigured(tls)
+        let mut builder = reqwest::Client::builder().tls_backend_preconfigured(tls);
+        if no_redirects {
+            builder = builder.redirect(reqwest::redirect::Policy::none());
+        }
+        let client = builder
             .build()
             .map_err(|e| format!("build http client: {e}"))?;
         Ok(HttpTransport {
@@ -58,9 +126,9 @@ impl HttpTransport {
         })
     }
 
-    /// Uncapped request. Only the video download path uses this (see
-    /// [API_BODY_LIMIT_BYTES]); every JSON/API caller must use
-    /// [HttpTransport::request_with_limit].
+    /// Uncapped request. Every JSON/API caller must use
+    /// [HttpTransport::request_with_limit]; this stays as the escape hatch for
+    /// callers that bound the body some other way.
     pub async fn request(
         &self,
         method: &str,
@@ -70,6 +138,36 @@ impl HttpTransport {
         timeout: Option<Duration>,
     ) -> Result<RawResponse, TransportError> {
         self.request_with_limit(method, url, headers, body, timeout, None)
+            .await
+    }
+
+    /// Bounded read-only account GET, using the shared transport cap logic.
+    pub async fn request_bounded(
+        &self,
+        method: &str,
+        url: &str,
+        headers: &[(String, String)],
+        max_bytes: usize,
+    ) -> Result<RawResponse, TransportError> {
+        self.request_with_limit(method, url, headers, None, None, Some(max_bytes))
+            .await
+    }
+
+    /// Sign and transmit the same bounded JSON body for account read RPCs.
+    pub async fn request_body_bounded(
+        &self,
+        method: &str,
+        url: &str,
+        headers: &[(String, String)],
+        body: Vec<u8>,
+        max_bytes: usize,
+    ) -> Result<RawResponse, TransportError> {
+        if body.len() > 16 * 1024 {
+            return Err(TransportError::TooLarge(
+                "request exceeds size limit".into(),
+            ));
+        }
+        self.request_with_limit(method, url, headers, Some(body), None, Some(max_bytes))
             .await
     }
 
@@ -85,12 +183,15 @@ impl HttpTransport {
         timeout: Option<Duration>,
         body_limit: Option<usize>,
     ) -> Result<RawResponse, TransportError> {
+        let timeout = super::budget::cap_timeout(timeout.unwrap_or(self.timeout));
+        if timeout.is_zero() {
+            return Err(TransportError::Network(
+                "request deadline exceeded".to_string(),
+            ));
+        }
         let m = reqwest::Method::from_bytes(method.as_bytes())
             .map_err(|e| TransportError::Network(format!("bad method {method}: {e}")))?;
-        let mut builder = self
-            .client
-            .request(m, url)
-            .timeout(timeout.unwrap_or(self.timeout));
+        let mut builder = self.client.request(m, url).timeout(timeout);
         if !headers.is_empty() {
             let mut map = reqwest::header::HeaderMap::new();
             for (k, v) in headers {
@@ -128,14 +229,14 @@ impl HttpTransport {
         let mut stream = resp.bytes_stream();
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(|e| TransportError::Network(e.to_string()))?;
-            body.extend_from_slice(&chunk);
             if let Some(limit) = body_limit {
-                if body.len() > limit {
-                    return Err(TransportError::Network(format!(
+                if chunk.len() > limit.saturating_sub(body.len()) {
+                    return Err(TransportError::TooLarge(format!(
                         "response body exceeds {limit} bytes"
                     )));
                 }
             }
+            body.extend_from_slice(&chunk);
         }
 
         let gzip_header = headers.iter().any(|(k, v)| {
@@ -143,18 +244,8 @@ impl HttpTransport {
         });
         let gzip_magic = body.len() >= 2 && body[0] == 0x1f && body[1] == 0x8b;
         if gzip_header || gzip_magic {
-            match gunzip_capped(&body, MAX_GUNZIP_BYTES) {
-                Ok(inflated) => body = inflated,
-                // A gzip bomb is a hard failure, never a silent pass-through.
-                Err(GunzipError::OverLimit) => {
-                    return Err(TransportError::Network(format!(
-                        "gunzip output exceeds {MAX_GUNZIP_BYTES} bytes"
-                    )));
-                }
-                // Corrupt gzip keeps the old behavior: the compressed bytes
-                // flow downstream, where JSON parsing rejects them.
-                Err(GunzipError::Corrupt(_)) => {}
-            }
+            let inflate_limit = body_limit.unwrap_or(MAX_GUNZIP_BYTES).min(MAX_GUNZIP_BYTES);
+            body = inflate_response(body, inflate_limit).await?;
         }
 
         Ok(RawResponse {
@@ -163,6 +254,18 @@ impl HttpTransport {
             body,
         })
     }
+}
+
+/// Process-wide transport for account cookie requests.
+///
+/// Account reads must not follow redirects with a cookie attached, and every
+/// collection request used to build a fresh `reqwest::Client` (TLS roots and
+/// all) just for that. The transport is stateless, so one shared instance is
+/// safe and keeps client construction off the per-request path. A failed
+/// first build is retried on the next call.
+pub fn account_transport() -> Result<&'static HttpTransport, String> {
+    static ACCOUNT_TRANSPORT: OnceCell<HttpTransport> = OnceCell::new();
+    ACCOUNT_TRANSPORT.get_or_try_init(|| HttpTransport::without_redirects(20))
 }
 
 /// reqwest is built with `rustls-no-provider` so exactly one TLS backend is
@@ -229,7 +332,9 @@ mod body_cap_tests {
         let transport = HttpTransport::new(5).expect("transport");
         let err = run(transport.request_with_limit("GET", &url, &[], None, None, Some(1024)))
             .expect_err("1 MiB body must exceed a 1 KiB cap");
-        assert!(matches!(err, TransportError::Network(_)));
+        // A local cap is its own class: `Network` would make the caller retire
+        // a pooled device over a response that is merely too large.
+        assert!(matches!(err, TransportError::TooLarge(_)));
     }
 
     #[test]
@@ -240,5 +345,22 @@ mod body_cap_tests {
             .expect("small body passes");
         assert_eq!(resp.status, 200);
         assert_eq!(resp.body, b"{\"ok\":true}");
+    }
+}
+
+#[cfg(test)]
+mod account_transport_tests {
+    use super::account_transport;
+
+    // Account collection runs several requests per import; each one used to
+    // rebuild the TLS client. The shared handle must stay identical.
+    #[test]
+    fn the_account_transport_is_built_once_and_reused() {
+        let first = account_transport().expect("account transport");
+        let second = account_transport().expect("account transport");
+        assert!(
+            std::ptr::eq(first, second),
+            "account requests must reuse the cached no-redirect transport"
+        );
     }
 }

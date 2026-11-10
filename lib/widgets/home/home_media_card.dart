@@ -1,12 +1,14 @@
-import 'dart:math' as math;
-
 import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_lucide/flutter_lucide.dart';
 
-import '../../services/poster_cache.dart';
 import '../../models/media_item.dart';
+import '../../services/app_style_tokens.dart';
+import '../../services/poster_cache.dart';
 import '../cover_tag_chip.dart';
+import '../media_card.dart' show mediaLengthLabel;
+import 'classic_home_cover_artwork.dart';
+import 'home_archive.dart';
 import 'home_design.dart';
 
 String homeKindLabel(String kind) => switch (kind) {
@@ -25,95 +27,102 @@ IconData homeKindIcon(String kind) => switch (kind) {
   _ => LucideIcons.book_open,
 };
 
-/// Fixed cover proportions, with a measured text allowance for large fonts.
-int _homeColumns(BuildContext context, double width) {
-  final scaler = MediaQuery.textScalerOf(context);
-  final largeType = scaler.scale(14) > 21;
-  return largeType && width < 560
-      ? 2
-      : width < 300
-      ? 2
-      : width < 560
-      ? 3
-      : width < 740
-      ? 4
-      : 5;
-}
-
-/// The laid-out width of one cover cell. Shared with the cards so the decoded
-/// cover size matches the cell exactly, which lets a card skip a
-/// [LayoutBuilder] of its own.
-double homeCardWidth(BuildContext context, double width) {
-  final columns = _homeColumns(context, width);
-  return (width - (columns - 1) * 14) / columns;
-}
-
-SliverGridDelegate homeGridDelegate(BuildContext context, double width) {
-  final scaler = MediaQuery.textScalerOf(context);
-  final cardWidth = homeCardWidth(context, width);
-  return SliverGridDelegateWithFixedCrossAxisCount(
-    crossAxisCount: _homeColumns(context, width),
-    crossAxisSpacing: 14,
-    mainAxisSpacing: 22,
-    mainAxisExtent:
-        cardWidth * 1.4 +
-        8 +
-        scaler.scale(14) * 1.35 * 2 +
-        5 +
-        scaler.scale(11) * 1.3 +
-        2,
-  );
-}
+/// 评分文案：整数不带小数位（`9.3分` / `9分`）。
+String homeScoreText(double score) => score == score.roundToDouble()
+    ? '${score.toStringAsFixed(0)}分'
+    : '${score.toStringAsFixed(1)}分';
 
 class StoryCover extends StatelessWidget {
   final MediaItem item;
   final int cacheWidth;
   final Alignment alignment;
 
+  /// How the poster fills its box.
+  ///
+  /// `cover` is the default: the grid cell itself is a tall 5:7 card, so
+  /// cropping a little is fine. A desktop feed card is a landscape window
+  /// instead — the same 9:16 poster laid out by width overflows several
+  /// times, leaving only the top slice visible. Pass [BoxFit.contain] there
+  /// so the whole poster fits (letterboxed black, matching the desktop
+  /// video's `VideoFit.contain`).
+  final BoxFit fit;
+
   const StoryCover({
     super.key,
     required this.item,
     required this.cacheWidth,
     this.alignment = Alignment.center,
+    this.fit = BoxFit.cover,
   });
 
   @override
   Widget build(BuildContext context) {
-    final fallback = CustomPaint(
-      painter: _CoverArtwork(item.kind),
-      child: Center(
-        child: Icon(
-          homeKindIcon(item.kind),
-          color: Colors.white.withValues(alpha: 0.32),
-          size: 38,
-        ),
+    final palette = HomePalette.of(context);
+    final fallback = AppStyleTokens.of(context).isClassic
+        ? CustomPaint(
+            painter: ClassicHomeCoverArtwork(item.kind),
+            child: Center(
+              child: Icon(
+                homeKindIcon(item.kind),
+                color: Colors.white.withValues(alpha: 0.32),
+                size: 38,
+              ),
+            ),
+          )
+        : CustomPaint(painter: _CoverArtwork(item));
+    final Widget art;
+    if (item.cover.isEmpty) {
+      art = fallback;
+    } else {
+      art = CachedNetworkImage(
+        cacheManager: PosterCache.instance,
+        imageUrl: item.cover,
+        fit: fit,
+        alignment: alignment,
+        memCacheWidth: cacheWidth.clamp(1, 1200),
+        fadeInDuration: MediaQuery.disableAnimationsOf(context)
+            ? Duration.zero
+            : const Duration(milliseconds: 220),
+        placeholder: (_, _) => fallback,
+        errorWidget: (_, _, _) => fallback,
+      );
+    }
+    if (!palette.eink) return art;
+    // 墨水屏：封面转灰阶，再压一圈 1dp 黑线（官方墨水屏模式的口径）。
+    return ColorFiltered(
+      colorFilter: einkCoverFilter,
+      child: Stack(
+        fit: StackFit.expand,
+        children: [
+          art,
+          IgnorePointer(
+            child: DecoratedBox(
+              decoration: BoxDecoration(
+                border: Border.all(color: Colors.black, width: 1),
+              ),
+            ),
+          ),
+        ],
       ),
-    );
-    if (item.cover.isEmpty) return fallback;
-    return CachedNetworkImage(
-      cacheManager: PosterCache.instance,
-      imageUrl: item.cover,
-      fit: BoxFit.cover,
-      alignment: alignment,
-      memCacheWidth: cacheWidth.clamp(1, 1200),
-      fadeInDuration: MediaQuery.disableAnimationsOf(context)
-          ? Duration.zero
-          : const Duration(milliseconds: 220),
-      placeholder: (_, _) => fallback,
-      errorWidget: (_, _, _) => fallback,
     );
   }
 }
 
-/// An original geometric cover is useful even when an upstream image fails.
+/// 没有封面图时的档案兜底：按媒介取色的渐变 + 竖排衬线书名。
+///
+/// 旧版是「几何圆环 + 线条图标」，和档案版式的细线、编号不成体系；新版照
+/// 搬 mockup 的封面块——书名竖排在左上，底部压一道暗角收边。墨水屏不在这
+/// 里另画一套：外层 [einkCoverFilter] 统一转灰度，和 mockup 的
+/// `filter: grayscale(1)` 同一口径。
 class _CoverArtwork extends CustomPainter {
-  final String kind;
+  _CoverArtwork(this.item);
 
-  const _CoverArtwork(this.kind);
+  final MediaItem item;
 
   @override
   void paint(Canvas canvas, Size size) {
-    final colors = switch (kind) {
+    final rect = Offset.zero & size;
+    final colors = switch (item.kind) {
       'video' => [const Color(0xFF734740), const Color(0xFF242428)],
       'manju' => [const Color(0xFF8B557E), const Color(0xFF35283D)],
       'manga' => [const Color(0xFF6F6887), const Color(0xFF343349)],
@@ -121,39 +130,68 @@ class _CoverArtwork extends CustomPainter {
       _ => [const Color(0xFF6A7964), const Color(0xFF293C35)],
     };
     canvas.drawRect(
-      Offset.zero & size,
+      rect,
       Paint()
         ..shader = LinearGradient(
-          begin: Alignment.topLeft,
-          end: Alignment.bottomRight,
+          // mockup 的渐变角度是 160deg（略偏右下），不是对角 135deg。
+          begin: const Alignment(-0.34, -0.94),
+          end: const Alignment(0.34, 0.94),
           colors: colors,
-        ).createShader(Offset.zero & size),
+        ).createShader(rect),
     );
-    final line = Paint()
-      ..style = PaintingStyle.stroke
-      ..strokeWidth = 0.8
-      ..color = const Color(0xFFF2DFC3).withValues(alpha: 0.22);
-    final center = Offset(size.width * 0.92, size.height * 0.30);
-    for (var i = 0; i < 6; i++) {
-      canvas.drawCircle(center, size.width * (0.27 + i * 0.14), line);
+
+    // 竖排书名：左上起排，最多露出封面的 74%，超出的字截断。
+    final titleSize = (size.width * 0.13).clamp(12.0, 22.0);
+    final style = homeSerifStyle(
+      size: titleSize,
+      color: const Color(0xEBFFFFFF),
+      height: 1.2,
+    ).copyWith(letterSpacing: titleSize * 0.12);
+    final left = size.width * 0.11;
+    final top = size.height * 0.09;
+    final limit = top + size.height * 0.74;
+    var y = top;
+    for (final char in item.title.characters.take(8)) {
+      if (y + titleSize * 1.2 > limit) break;
+      final glyph = TextPainter(
+        text: TextSpan(text: char, style: style),
+        textDirection: TextDirection.ltr,
+      )..layout();
+      glyph.paint(canvas, Offset(left, y));
+      y += titleSize * 1.2;
     }
-    canvas.save();
-    canvas.translate(size.width * 0.17, size.height * 0.74);
-    canvas.rotate(-math.pi / 5);
-    canvas.drawRRect(
-      RRect.fromRectAndRadius(
-        Rect.fromLTWH(0, 0, size.width * 1.1, size.height * 0.13),
-        const Radius.circular(4),
-      ),
-      Paint()..color = const Color(0xFFE2C99A).withValues(alpha: 0.13),
+
+    final scrim = Rect.fromLTWH(
+      0,
+      size.height * 0.78,
+      size.width,
+      size.height * 0.22,
     );
-    canvas.restore();
+    canvas.drawRect(
+      scrim,
+      Paint()
+        ..shader = const LinearGradient(
+          begin: Alignment.topCenter,
+          end: Alignment.bottomCenter,
+          colors: [Color(0x00000000), Color(0x2E000000)],
+        ).createShader(scrim),
+    );
   }
 
   @override
-  bool shouldRepaint(_CoverArtwork oldDelegate) => oldDelegate.kind != kind;
+  bool shouldRepaint(_CoverArtwork oldDelegate) =>
+      oldDelegate.item.title != item.title ||
+      oldDelegate.item.kind != item.kind;
 }
 
+/// The one book card on the shelf.
+///
+/// 旧版是「白卡 + 阴影 + 评分角标 + 两行简介 + 彩色 chip 行」的模板卡，信息
+/// 密度高但每一层都在抢注意力。新版把封面直接铺在画布上、只留三行字：
+/// 书名、作者/评分/一句推荐理由。封面自己就是卡片，阴影和描边都不要——
+/// 画布是 #F4F3EF，封面的色块已经足够把它和背景分开。
+///
+/// 简介不进网格：网格负责扫，主视觉负责读。
 class HomeMediaCard extends StatelessWidget {
   final MediaItem item;
   final VoidCallback onTap;
@@ -162,11 +200,28 @@ class HomeMediaCard extends StatelessWidget {
   /// delegate with it), and passing it in avoids a [LayoutBuilder] per card.
   final double? coverWidth;
 
+  /// 副标题里带作品长度（「200万字」「共103集」）。首页的推荐卡不需要它，
+  /// 搜索结果需要——长度是判断一本书能不能读下去的关键信息。
+  final bool showLength;
+
+  /// 封面圆角。首页传入主题 token；其他页面可保留自己的圆角。
+  final double radius;
+
+  /// 书名字号。首页 14.5，其他页面保持原来的 15。
+  final double titleSize;
+
+  /// 书名下面的一行等宽档案编号；null 或经典主题时连同间距一起移除。
+  final String? archiveCode;
+
   const HomeMediaCard({
     super.key,
     required this.item,
     required this.onTap,
     this.coverWidth,
+    this.showLength = false,
+    this.radius = 12,
+    this.titleSize = 15,
+    this.archiveCode,
   });
 
   @override
@@ -174,192 +229,140 @@ class HomeMediaCard extends StatelessWidget {
     final palette = HomePalette.of(context);
     final pixelRatio = MediaQuery.devicePixelRatioOf(context);
     final scaler = MediaQuery.textScalerOf(context);
+    final meta = _metaText(item, showLength: showLength);
+    final archiveCode = AppStyleTokens.of(context).showDecorativeCodes
+        ? this.archiveCode
+        : null;
     return _CardWidth(
       width: coverWidth,
       builder: (width) => HomePressable(
         onTap: onTap,
-        borderRadius: BorderRadius.circular(12),
+        borderRadius: BorderRadius.circular(radius),
+        semanticLabel: item.title,
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             AspectRatio(
               aspectRatio: 5 / 7,
               child: RepaintBoundary(
-                child: Container(
-                  decoration: BoxDecoration(
-                    borderRadius: BorderRadius.circular(12),
-                    border: Border.all(
-                      color: palette.line.withValues(alpha: 0.55),
-                      width: 0.6,
-                    ),
-                    boxShadow: [
-                      BoxShadow(
-                        color: Colors.black.withValues(
-                          alpha: palette.dark ? 0.28 : 0.05,
-                        ),
-                        blurRadius: 8,
-                        offset: const Offset(0, 3),
+                child: ClipRRect(
+                  borderRadius: BorderRadius.circular(radius),
+                  child: Stack(
+                    fit: StackFit.expand,
+                    children: [
+                      StoryCover(
+                        item: item,
+                        cacheWidth: (width * pixelRatio).ceil(),
                       ),
-                    ],
-                  ),
-                  child: ClipRRect(
-                    borderRadius: BorderRadius.circular(11.4),
-                    child: Stack(
-                      fit: StackFit.expand,
-                      children: [
-                        StoryCover(
-                          item: item,
-                          cacheWidth: (width * pixelRatio).ceil(),
-                        ),
+                      // 只有带配色的角标才是促销标签；没有颜色的 tag 是
+                      // 搜索结果里的分类文字，不在封面上重复。
+                      if (item.tag case final MediaTag tag when tag.hasColors)
                         Positioned(
-                          left: 7,
-                          top: 7,
-                          right: 7,
-                          child: Row(
-                            children: [
-                              CoverTagChip(label: homeKindLabel(item.kind)),
-                              // Only coloured tags are badges; see MediaTag.hasColors.
-                              if (item.tag case final MediaTag tag
-                                  when tag.hasColors) ...[
-                                const SizedBox(width: 4),
-                                // Flexible so a long upstream label ellipsizes
-                                // instead of overflowing the cover.
-                                Flexible(
-                                  child: CoverTagChip(
-                                    key: const Key('home_card_tag'),
-                                    label: tag.text,
-                                    colors: tag.colorsFor(dark: palette.dark),
-                                  ),
-                                ),
-                              ],
-                            ],
+                          left: 8,
+                          top: 8,
+                          right: 8,
+                          child: Align(
+                            alignment: Alignment.topLeft,
+                            child: CoverTagChip(
+                              key: const Key('home_card_tag'),
+                              label: tag.text,
+                              colors: tag.colorsFor(dark: palette.dark),
+                            ),
                           ),
                         ),
-                        if (item.ep.isNotEmpty)
-                          Positioned(
-                            left: 7,
-                            right: 7,
-                            bottom: 7,
-                            child: Align(
-                              alignment: Alignment.bottomRight,
-                              child: Container(
-                                padding: const EdgeInsets.symmetric(
-                                  horizontal: 6,
-                                  vertical: 3,
-                                ),
-                                decoration: BoxDecoration(
-                                  color: const Color(
-                                    0xFF1C1B1A,
-                                  ).withValues(alpha: 0.72),
-                                  borderRadius: BorderRadius.circular(5),
-                                ),
-                                child: Text(
-                                  item.ep,
-                                  maxLines: 1,
-                                  overflow: TextOverflow.ellipsis,
-                                  style: const TextStyle(
-                                    color: Colors.white,
-                                    fontSize: 9,
-                                    height: 1.2,
+                      if (item.ep.isNotEmpty && isVideoKind(item.kind))
+                        Positioned(
+                          left: 8,
+                          right: 8,
+                          bottom: 8,
+                          child: Align(
+                            alignment: Alignment.bottomRight,
+                            child: Text(
+                              item.ep,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: const TextStyle(
+                                color: Colors.white,
+                                fontSize: 10,
+                                height: 1.2,
+                                fontWeight: FontWeight.w600,
+                                shadows: [
+                                  Shadow(
+                                    color: Color(0xCC000000),
+                                    blurRadius: 2,
                                   ),
-                                ),
+                                ],
                               ),
                             ),
                           ),
-                      ],
-                    ),
+                        ),
+                    ],
                   ),
                 ),
               ),
             ),
             const SizedBox(height: 8),
             SizedBox(
-              height: scaler.scale(14) * 1.35 * 2,
+              height: scaler.scale(titleSize) * 1.35 * 2,
               child: Text(
                 item.title,
                 maxLines: 2,
                 overflow: TextOverflow.ellipsis,
                 style: TextStyle(
-                  fontSize: 14,
+                  fontSize: titleSize,
                   height: 1.35,
-                  fontWeight: FontWeight.w700,
+                  fontWeight: FontWeight.w600,
                   color: palette.ink,
                 ),
               ),
             ),
-            const SizedBox(height: 5),
-            Text(
-              item.author.isNotEmpty
-                  ? item.author
-                  : item.badge.isNotEmpty
-                  ? item.badge
-                  : homeKindLabel(item.kind),
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
-              style: TextStyle(fontSize: 11, height: 1.3, color: palette.muted),
-            ),
+            if (archiveCode != null) ...[
+              const SizedBox(height: 5),
+              Text(
+                archiveCode,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: homeCodeStyle(
+                  palette,
+                  size: homeCardCodeSize,
+                  color: palette.muted,
+                ),
+              ),
+            ],
+            if (meta.isNotEmpty) ...[
+              SizedBox(height: archiveCode != null ? 2 : 4),
+              Text(
+                meta,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(
+                  fontSize: homeCardMetaSize,
+                  height: 1.3,
+                  color: palette.muted,
+                ),
+              ),
+            ],
           ],
         ),
       ),
     );
   }
-}
 
-class HomeSectionHeader extends StatelessWidget {
-  final String title;
-  final String subtitle;
-  const HomeSectionHeader({
-    super.key,
-    required this.title,
-    required this.subtitle,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    final palette = HomePalette.of(context);
-    return Padding(
-      padding: const EdgeInsets.fromLTRB(20, 16, 20, 12),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Row(
-            children: [
-              Container(
-                width: 4,
-                height: 18,
-                decoration: BoxDecoration(
-                  color: HomePalette.accent,
-                  borderRadius: BorderRadius.circular(2),
-                ),
-              ),
-              const SizedBox(width: 8),
-              Expanded(
-                child: Text(
-                  title,
-                  style: TextStyle(
-                    fontSize: 20,
-                    height: 1.2,
-                    fontWeight: FontWeight.w800,
-                    letterSpacing: -0.4,
-                    color: palette.ink,
-                  ),
-                ),
-              ),
-              Icon(
-                LucideIcons.compass,
-                size: 19,
-                color: palette.muted,
-              ),
-            ],
-          ),
-          const SizedBox(height: 6),
-          Text(
-            subtitle,
-            style: TextStyle(fontSize: 12, height: 1.3, color: palette.muted),
-          ),
-        ],
-      ),
-    );
+  /// 作者 · 第一条推荐理由 · 评分。都是 11sp 的一行灰字，不抢书名。
+  static String _metaText(MediaItem item, {bool showLength = false}) {
+    final score = item.score;
+    final length = showLength ? mediaLengthLabel(item) : '';
+    return [
+      if (item.author.isNotEmpty) item.author,
+      if (item.recTags.isNotEmpty) item.recTags.first.text,
+      if (length.isNotEmpty) length,
+      if (score != null) homeScoreText(score),
+      if (item.author.isEmpty &&
+          item.recTags.isEmpty &&
+          score == null &&
+          item.kind != 'book')
+        homeKindLabel(item.kind),
+    ].join(' · ');
   }
 }
 

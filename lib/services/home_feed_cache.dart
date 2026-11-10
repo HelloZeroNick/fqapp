@@ -4,11 +4,20 @@ import 'package:hive_ce_flutter/hive_flutter.dart';
 
 import 'encrypted_hive.dart';
 
+import '../models/home_cell.dart';
 import '../models/media_item.dart';
 
 /// The last rendered page set of one home tab, as previously stored.
 class HomeFeedSnapshot {
   final List<MediaItem> items;
+
+  /// The page's block structure (see [HomeCell]), when the rendered page had
+  /// one. Without it a cold start seeds only [items], the home page can only
+  /// draw that flat grid, and flips to the block layout a second later when
+  /// the network answers. Empty for older records written before cells were
+  /// cached.
+  final List<HomeCell> cells;
+
   final bool hasMore;
   final DateTime savedAt;
 
@@ -20,6 +29,7 @@ class HomeFeedSnapshot {
 
   const HomeFeedSnapshot({
     required this.items,
+    this.cells = const [],
     required this.hasMore,
     required this.savedAt,
     this.lastVid,
@@ -62,8 +72,7 @@ class HomeFeedCache {
     final box = _box;
     if (box != null) return box;
     try {
-      return _box =
-          await (_opening ??= EncryptedHive.openBox(_hive, _boxName));
+      return _box = await (_opening ??= EncryptedHive.openBox(_hive, _boxName));
     } on Object {
       _opening = null;
       rethrow;
@@ -105,9 +114,7 @@ class HomeFeedCache {
     for (final entry in itemsRaw) {
       if (entry is Map) {
         try {
-          final item = MediaItemJson.fromJson(
-            Map<String, dynamic>.from(entry),
-          );
+          final item = MediaItemJson.fromJson(Map<String, dynamic>.from(entry));
           if (item != null) items.add(item);
         } catch (_) {
           // One unreadable card is skipped; the rest still render.
@@ -116,8 +123,25 @@ class HomeFeedCache {
     }
     if (items.isEmpty) return null;
     final lastVid = raw['lastVid'];
+    // Records written before cells were cached have no `cells` key; they
+    // restore with an empty list and the feed falls back to the flat items,
+    // exactly as it did before cells were stored.
+    final cells = <HomeCell>[];
+    final cellsRaw = raw['cells'];
+    if (cellsRaw is List) {
+      for (final entry in cellsRaw) {
+        if (entry is Map) {
+          try {
+            cells.add(HomeCell.fromMap(Map<String, dynamic>.from(entry)));
+          } catch (_) {
+            // One unreadable block is skipped; the rest still render.
+          }
+        }
+      }
+    }
     return HomeFeedSnapshot(
       items: items,
+      cells: cells,
       hasMore: raw['hasMore'] != false,
       savedAt: DateTime.fromMillisecondsSinceEpoch(savedAt),
       lastVid: lastVid is String && lastVid.isNotEmpty ? lastVid : null,
@@ -130,6 +154,7 @@ class HomeFeedCache {
     List<MediaItem> items, {
     required bool hasMore,
     String? lastVid,
+    List<HomeCell> cells = const [],
   }) async {
     if (!hiveReady || items.isEmpty) return;
     try {
@@ -140,10 +165,52 @@ class HomeFeedCache {
         'hasMore': hasMore,
         if (lastVid != null && lastVid.isNotEmpty) 'lastVid': lastVid,
         'items': items.take(maxItems).map((item) => item.toJson()).toList(),
+        // The block structure rides along so a cold start renders the block
+        // layout on the first frame instead of the legacy flat grid. Written
+        // only when present: a record without blocks stays readable by the
+        // previous format.
+        if (cells.isNotEmpty) 'cells': _boundedCellMaps(cells),
       });
     } catch (_) {
       // The next successful load overwrites this entry anyway.
     }
+  }
+
+  /// Serializes [cells] under the same card budget the flat [items] list gets.
+  ///
+  /// Every appended page lands in the stream block, so without a budget the
+  /// tree written on each snapshot grows for as long as the user keeps
+  /// scrolling. Block payloads (style, extra, url, name) are kept even after
+  /// the budget is spent so section headers still render; only cards are
+  /// dropped, and at most [maxItems] top-level blocks are written.
+  List<Map<String, dynamic>> _boundedCellMaps(List<HomeCell> cells) {
+    var remaining = maxItems;
+    List<HomeCell> trim(List<HomeCell> input) {
+      final out = <HomeCell>[];
+      for (final cell in input.take(maxItems)) {
+        final items = <MediaItem>[];
+        for (final item in cell.items) {
+          if (remaining <= 0) break;
+          remaining--;
+          items.add(item);
+        }
+        out.add(
+          HomeCell(
+            showType: cell.showType,
+            name: cell.name,
+            id: cell.id,
+            style: cell.style,
+            items: items,
+            children: trim(cell.children),
+            url: cell.url,
+            extra: cell.extra,
+          ),
+        );
+      }
+      return out;
+    }
+
+    return [for (final cell in trim(cells)) cell.toMap()];
   }
 
   /// Test seam: closes the memoized box so a later save reloads fresh storage.

@@ -3,7 +3,9 @@ import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
-import 'package:shared_preferences/shared_preferences.dart';
+import 'package:fqapp/models/text_replacement_rule.dart';
+import 'package:fqapp/services/text_replacement_engine.dart';
+import 'package:fqapp/services/text_replacement_store.dart';
 
 import 'package:fqapp/models/media_item.dart';
 import 'package:fqapp/pages/audio_page.dart';
@@ -13,6 +15,7 @@ import 'package:fqapp/services/reader_underline_store.dart';
 import 'package:fqapp/widgets/reader/reader_paged_view.dart';
 import 'package:fqapp/widgets/reader/reader_paragraph_menu.dart';
 import 'package:fqapp/widgets/reader/reader_text_selection.dart';
+import 'package:fqapp/widgets/wenku/wenku_ui.dart';
 
 import 'support/fakes.dart';
 
@@ -104,6 +107,7 @@ Widget _app(
   ReaderUnderlineStore store, {
   String? html,
   bool localOnly = false,
+  TextReplacementStore? replacementStore,
 }) => MaterialApp(
   home: ReaderPage(
     bookId: 'reader-test',
@@ -116,6 +120,7 @@ Widget _app(
     chapterLoader: (_) async =>
         parseChapterContent(html ?? _html).toCacheText(),
     underlineStore: store,
+    replacementStore: replacementStore,
   ),
 );
 
@@ -161,10 +166,106 @@ void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
 
   setUp(() {
-    SharedPreferences.setMockInitialValues({'reader_page_mode': 'scroll'});
+    setSingleChapterPrefs({'reader_page_mode': 'scroll'});
     TestWidgetsFlutterBinding.instance.handleAppLifecycleStateChanged(
       AppLifecycleState.resumed,
     );
+  });
+
+  testWidgets('long press finds a saved range after earlier text shrinks', (
+    tester,
+  ) async {
+    const html =
+        '<p idx="0">AAAAAAAAAAAAAAAAAAAA</p><p idx="1">abcdefghijk</p>';
+    final replacements = TextReplacementStore();
+    await replacements.save(
+      enabled: true,
+      rules: [
+        const TextReplacementRule(
+          id: 'a',
+          pattern: 'AAAAAAAAAAAAAAAAAAAA',
+          replacement: 'X',
+        ),
+      ],
+    );
+    await tester.runAsync(
+      () => TextReplacementEngine.instance.transform(
+        source: parseChapterContent(html),
+        chapterTitle: '第一章',
+        snapshot: replacements.snapshot,
+      ),
+    );
+    final store = _MemoryUnderlines();
+    // Title [0,3), separator; first paragraph [4,24), separator.
+    const record = ReaderRangeUnderline(
+      bookId: 'reader-test',
+      chapterId: 'c1',
+      start: 25,
+      end: 30,
+      text: 'abcde',
+    );
+    store.entries[record.key] = record.toMap();
+    await tester.pumpWidget(
+      _app(store, html: html, replacementStore: replacements),
+    );
+    await tester.pumpAndSettle();
+    final paragraph = find.byKey(const ValueKey('reader-paragraph-1'));
+    final rect = tester.getRect(paragraph);
+    await tester.longPressAt(Offset(rect.left + 45, rect.top + 12));
+    await tester.pumpAndSettle();
+    expect(find.text('删除划线'), findsOneWidget);
+    await tester.tap(find.byKey(const ValueKey('reader-action-underline')));
+    await tester.pumpAndSettle();
+    expect(store.entries, isEmpty);
+  });
+
+  testWidgets('a saved mark inside a replaced word stays deletable by identity', (
+    tester,
+  ) async {
+    const html = '<p idx="0">abcdefghijklmnop</p>';
+    final replacements = TextReplacementStore();
+    await replacements.save(
+      enabled: true,
+      rules: [
+        const TextReplacementRule(
+          id: 'a',
+          pattern: 'abcdefghijklmnop',
+          replacement: 'XYZ',
+        ),
+      ],
+    );
+    await tester.runAsync(
+      () => TextReplacementEngine.instance.transform(
+        source: parseChapterContent(html),
+        chapterTitle: '第一章',
+        snapshot: replacements.snapshot,
+      ),
+    );
+    final store = _MemoryUnderlines();
+    // The old mark covers only letters inside the original word, not all of it.
+    const record = ReaderRangeUnderline(
+      bookId: 'reader-test',
+      chapterId: 'c1',
+      start: 6,
+      end: 9,
+      text: 'cde',
+    );
+    store.entries[record.key] = record.toMap();
+    await tester.pumpWidget(
+      _app(store, html: html, replacementStore: replacements),
+    );
+    await tester.pumpAndSettle();
+    final rect = tester.getRect(
+      find.byKey(const ValueKey('reader-paragraph-0')),
+    );
+    await tester.longPressAt(Offset(rect.left + 45, rect.top + 12));
+    await tester.pumpAndSettle();
+    final undo = find.byKey(const ValueKey('reader-action-underline'));
+    // The restored displayed range happens to cover the whole transformed paragraph.
+    expect(find.text('取消划线'), findsOneWidget);
+    await tester.tap(undo);
+    await tester.pumpAndSettle();
+    expect(store.entries, isEmpty);
   });
 
   // `/api/content` answers with plain text and no `<p idx>`, so those chapters
@@ -178,7 +279,7 @@ void main() {
   // GestureDetector needs the callback forwarded from ReaderPagedView. Scroll
   // mode was the only path covered, so 翻页 readers got no menu at all.
   testWidgets('paged mode also opens the menu on a long press', (tester) async {
-    SharedPreferences.setMockInitialValues({'reader_page_mode': 'paged'});
+    setSingleChapterPrefs({'reader_page_mode': 'paged'});
     final store = _MemoryUnderlines();
     await tester.binding.setSurfaceSize(const Size(400, 800));
     addTearDown(() => tester.binding.setSurfaceSize(null));
@@ -194,27 +295,40 @@ void main() {
     expect(find.byKey(const ValueKey('reader-action-listen')), findsOneWidget);
   });
 
-  // The official bar takes u_ #FF303030 by day and s7 #FF1C1C1C at night
-  // (selection/m.java#o); the mapping used to be recorded the other way round.
-  testWidgets('the bar background is #FF303030 by day and #FF1C1C1C at night', (
-    tester,
-  ) async {
-    Future<Color?> barColor({required bool dark}) async {
+  // The Wenku8 port replaced the official Fanqie #FF303030 PopupWindow with one
+  // live glass bar. The bar no longer pins its own tint: it inherits the shared
+  // glass tint of the ambient theme, so day keeps the milk plate and night the
+  // near-black one and the white labels stay legible either way.
+  testWidgets('the bar keeps a day and night glass tint', (tester) async {
+    Future<Color> barTint({required bool dark}) async {
       await tester.pumpWidget(
         MaterialApp(
-          home: ReaderParagraphMenu(isDark: dark, onAction: (_) {}),
+          theme: ThemeData(
+            brightness: dark ? Brightness.dark : Brightness.light,
+          ),
+          home: Scaffold(
+            body: ReaderParagraphMenu(isDark: dark, onAction: (_) {}),
+          ),
         ),
       );
-      final containers = tester.widgetList<Container>(
-        find.byWidgetPredicate(
-          (widget) => widget is Container && widget.decoration is BoxDecoration,
-        ),
+      await tester.pumpAndSettle();
+      expect(
+        find.byKey(const ValueKey('reader-selection-glass-bar')),
+        findsOneWidget,
       );
-      return (containers.single.decoration! as BoxDecoration).color;
+      final context = tester.element(
+        find.byKey(const ValueKey('reader-selection-glass-bar')),
+      );
+      return GlassAppearance.tintOf(
+        context,
+        opacity: GlassAppearance.of(context).opacity,
+      );
     }
 
-    expect(await barColor(dark: false), const Color(0xFF303030));
-    expect(await barColor(dark: true), const Color(0xFF1C1C1C));
+    final day = await barTint(dark: false);
+    final night = await barTint(dark: true);
+    expect(day, const Color(0xFFFEFDF8));
+    expect(night.computeLuminance(), lessThan(0.1));
   });
 
   testWidgets('long press selects the paragraph with wash and handles', (
@@ -251,7 +365,7 @@ void main() {
   });
 
   testWidgets('paged mode floats the handles too', (tester) async {
-    SharedPreferences.setMockInitialValues({'reader_page_mode': 'paged'});
+    setSingleChapterPrefs({'reader_page_mode': 'paged'});
     final store = _MemoryUnderlines();
     await tester.binding.setSurfaceSize(const Size(400, 800));
     addTearDown(() => tester.binding.setSurfaceSize(null));
@@ -481,7 +595,9 @@ void main() {
     expect(tester.takeException(), isNull);
   });
 
-  testWidgets('local-only paragraph actions offer 从本段听 via system TTS', (tester) async {
+  testWidgets('local-only paragraph actions offer 从本段听 via system TTS', (
+    tester,
+  ) async {
     await tester.binding.setSurfaceSize(const Size(400, 800));
     addTearDown(() => tester.binding.setSurfaceSize(null));
     await tester.pumpWidget(_app(_MemoryUnderlines(), localOnly: true));
@@ -574,7 +690,7 @@ void main() {
     await tester.pumpAndSettle();
 
     // The listening page is pushed on top of the reader for this chapter.
-    await tester.tap(find.text('听书'));
+    await tester.tap(find.text('智能朗读'));
     await tester.pumpAndSettle();
     expect(find.byType(AudioPage), findsOneWidget);
     final audio = tester.widget<AudioPage>(find.byType(AudioPage));
@@ -604,7 +720,7 @@ void main() {
     await tester.tap(find.byKey(const ValueKey('reader-action-listen')));
     await tester.pumpAndSettle();
 
-    await tester.tap(find.text('听书'));
+    await tester.tap(find.text('智能朗读'));
     await tester.pumpAndSettle();
     final audio = tester.widget<AudioPage>(find.byType(AudioPage));
     expect(audio.startPosition, Duration.zero);
@@ -653,7 +769,7 @@ void main() {
 
       // Asking to listen from a paragraph pays for the timeline exactly once,
       // and the resulting position comes from the freshly parsed chapter.
-      await tester.tap(find.text('听书'));
+      await tester.tap(find.text('智能朗读'));
       await tester.pumpAndSettle();
       expect(requests.where((id) => id == 'c1'), hasLength(1));
       final audio = tester.widget<AudioPage>(find.byType(AudioPage));

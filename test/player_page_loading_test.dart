@@ -6,9 +6,13 @@ import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:fqapp/models/media_item.dart';
+import 'package:fqapp/models/playlet_comment.dart';
 import 'package:fqapp/pages/player_page.dart';
+import 'package:fqapp/services/episode_source_cache.dart';
 import 'package:fqapp/services/native_player.dart';
 import 'package:fqapp/services/player_load_diagnostics.dart';
+import 'package:fqapp/services/quality_memory.dart';
+import 'package:fqapp/widgets/player/playlet_danmaku_loader.dart';
 import 'package:fqapp/widgets/player/player_cover.dart';
 import 'package:fqapp/widgets/video_player_chrome.dart';
 
@@ -16,6 +20,7 @@ import 'support/controlled_player.dart';
 
 void main() {
   setUp(() {
+    QualityMemory.clearForTesting();
     SharedPreferences.setMockInitialValues({'player_playback_rate': 1.25});
     TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
         .setMockMethodCallHandler(
@@ -31,49 +36,49 @@ void main() {
         );
   });
 
-  testWidgets(
-    'cover stays above the mounted texture until first frame; timings split phases',
-    (tester) async {
-      final source = Completer<Map<String, dynamic>>();
-      final create = Completer<void>();
-      final session = _Session(
-        loader: (_) => source.future,
-        factory: () =>
-            ControlledNativePlayer(createGate: create, hasFirstFrame: false),
-      );
-      await _mount(tester, session);
-      expect(find.byKey(const ValueKey('player-cover')), findsOneWidget);
-      expect(find.byType(Texture), findsNothing);
-      session.elapsed = const Duration(milliseconds: 120);
-      source.complete(_source('1'));
-      await _flush(tester);
-      session.elapsed = const Duration(milliseconds: 200);
-      create.complete();
-      await _flush(tester);
-      expect(find.byType(Texture), findsOneWidget);
-      expect(find.byKey(const ValueKey('player-cover')), findsOneWidget);
-      expect(session.samples, isEmpty);
-      final textureElement = find.byType(Texture).evaluate().single;
-      session.elapsed = const Duration(milliseconds: 300);
-      session.players.single.emitFirstFrame();
-      await _flush(tester);
-      expect(find.byKey(const ValueKey('player-cover')), findsNothing);
-      expect(find.byType(Texture).evaluate().single, same(textureElement));
-      final sample = session.samples.single;
-      expect(sample.stagesMs['address'], 120);
-      expect(sample.stagesMs['create'], 80);
-      expect(sample.playToFirstFrameMs, 100);
-      expect(sample.totalMs, 300);
-      expect(sample.outcome, 'firstFrame');
-      // Later buffering keeps the last video frame; no poster flash or new sample.
-      session.players.single.emitBuffering(true);
-      session.players.single.emitFirstFrame();
-      await _flush(tester);
-      expect(find.byKey(const ValueKey('player-cover')), findsNothing);
-      expect(find.byType(CircularProgressIndicator), findsOneWidget);
-      expect(session.samples, hasLength(1));
-    },
-  );
+  testWidgets('no cover while the first frame is pending; timings split phases', (
+    tester,
+  ) async {
+    final source = Completer<Map<String, dynamic>>();
+    final create = Completer<void>();
+    final session = _Session(
+      loader: (_) => source.future,
+      factory: () =>
+          ControlledNativePlayer(createGate: create, hasFirstFrame: false),
+    );
+    await _mount(tester, session);
+    // 加载期只留黑底 + 加载圈：封面是竖图，铺进 16:9 盒里会被裁成一条。
+    expect(find.byKey(const ValueKey('player-cover')), findsNothing);
+    expect(find.byType(Texture), findsNothing);
+    session.elapsed = const Duration(milliseconds: 120);
+    source.complete(_source('1'));
+    await _flush(tester);
+    session.elapsed = const Duration(milliseconds: 200);
+    create.complete();
+    await _flush(tester);
+    expect(find.byType(Texture), findsOneWidget);
+    expect(find.byKey(const ValueKey('player-cover')), findsNothing);
+    expect(session.samples, isEmpty);
+    final textureElement = find.byType(Texture).evaluate().single;
+    session.elapsed = const Duration(milliseconds: 300);
+    session.players.single.emitFirstFrame();
+    await _flush(tester);
+    expect(find.byKey(const ValueKey('player-cover')), findsNothing);
+    expect(find.byType(Texture).evaluate().single, same(textureElement));
+    final sample = session.samples.single;
+    expect(sample.stagesMs['address'], 120);
+    expect(sample.stagesMs['create'], 80);
+    expect(sample.playToFirstFrameMs, 100);
+    expect(sample.totalMs, 300);
+    expect(sample.outcome, 'firstFrame');
+    // Later buffering keeps the last video frame; no poster flash or new sample.
+    session.players.single.emitBuffering(true);
+    session.players.single.emitFirstFrame();
+    await _flush(tester);
+    expect(find.byKey(const ValueKey('player-cover')), findsNothing);
+    expect(find.byType(CircularProgressIndicator), findsOneWidget);
+    expect(session.samples, hasLength(1));
+  });
 
   testWidgets('native failure logs phase and codes without exception text', (
     tester,
@@ -105,23 +110,23 @@ void main() {
   });
 
   testWidgets(
-    'a frame arriving during resume initialization waits behind the cover',
+    'a frame arriving during resume initialization waits behind the spinner',
     (tester) async {
-      final seek = Completer<void>();
+      final rate = Completer<void>();
       final session = _Session(
         store: ControlledReaderStore(entry: {'episodeId': '1', 'position': 45}),
         factory: () =>
-            ControlledNativePlayer(seekGate: seek, hasFirstFrame: false),
+            ControlledNativePlayer(rateGate: rate, hasFirstFrame: false),
       );
       await _mount(tester, session);
       expect(find.byType(Texture), findsOneWidget);
       session.elapsed = const Duration(milliseconds: 50);
       session.players.single.emitFirstFrame();
       await _flush(tester);
-      expect(find.byKey(const ValueKey('player-cover')), findsOneWidget);
+      expect(find.byKey(const ValueKey('player-cover')), findsNothing);
       expect(session.samples, isEmpty);
       session.elapsed = const Duration(milliseconds: 200);
-      seek.complete();
+      rate.complete();
       await _flush(tester);
       expect(find.byKey(const ValueKey('player-cover')), findsNothing);
       expect(session.players.single.position, const Duration(seconds: 45));
@@ -214,7 +219,7 @@ void main() {
       second.complete(_source('2'));
       await _flush(tester);
       expect(session.players, hasLength(2));
-      expect(find.byKey(const ValueKey('player-cover')), findsOneWidget);
+      expect(find.byKey(const ValueKey('player-cover')), findsNothing);
       session.players.last.emitFirstFrame();
       await _flush(tester);
       expect(session.samples.last.source, 'prefetchPending');
@@ -275,8 +280,9 @@ void main() {
           displayed ? 'firstFrame' : 'error',
         );
         expect(session.store.entry?['episodeId'], displayed ? '2' : '1');
-        expect(find.byType(CircularProgressIndicator), findsNothing);
-        await tester.tap(find.widgetWithText(OutlinedButton, '重试'));
+        final spinner = displayed ? findsNothing : findsOneWidget; // 静默重试中
+        expect(find.byType(CircularProgressIndicator), spinner);
+        if (displayed) await tester.tap(find.text('重试'));
         await tester.pump(const Duration(milliseconds: 350));
         await _flush(tester);
         expect(session.requests, ['1', '2', '2']);
@@ -287,7 +293,7 @@ void main() {
         session.players.last.emitFirstFrame();
         await _flush(tester);
         expect(session.samples.last.source, 'network');
-        expect(session.samples.last.trigger, 'retry');
+        expect(session.samples.last.trigger, displayed ? 'retry' : 'autoRetry');
         expect(session.players.last.isPlaying, true);
       },
     );
@@ -466,6 +472,117 @@ void main() {
     expect(session.requests, ['5']);
     expect(session.players, hasLength(1));
   });
+
+  testWidgets('quality choice carries to the next episode by name (#60)', (
+    tester,
+  ) async {
+    Map<String, dynamic> variantsSource(String id, {bool only720 = false}) => {
+      'video_url': 'https://example.invalid/$id-720.mp4',
+      'key_hex': '',
+      'variants': [
+        if (!only720)
+          {
+            'name': '1080P',
+            'url': 'https://example.invalid/$id-1080.mp4',
+            'key_hex': '',
+            'height': 1080,
+          },
+        {
+          'name': '720P',
+          'url': 'https://example.invalid/$id-720.mp4',
+          'key_hex': '',
+          'height': 720,
+        },
+      ],
+    };
+    final session = _Session(
+      shortSeries: true,
+      danmakuFetcher: (_) async => const PlayletCommentPage(),
+      loader: (chapter) => Future.value(
+        variantsSource(chapter.itemId, only720: chapter.itemId == '3'),
+      ),
+    );
+    await _mount(tester, session);
+    session.players.single.emitFirstFrame();
+    await _flush(tester);
+    expect(
+      session.players.single.calls.first,
+      'create:https://example.invalid/1-720.mp4',
+    );
+
+    // Switch to 1080P on episode 1 via the chrome callback.
+    _chrome(tester).onQualitySelected!(
+      const EpisodeVariant(
+        name: '1080P',
+        url: 'https://example.invalid/1-1080.mp4',
+        keyHex: '',
+        height: 1080,
+      ),
+    );
+    await _flush(tester);
+    await _flush(tester);
+    expect(
+      session.players.last.calls.first,
+      'create:https://example.invalid/1-1080.mp4',
+    );
+    // The choice is shared with the feed via QualityMemory.
+    expect(QualityMemory.nameFor('loading-book'), '1080P');
+
+    // Next episode keeps 1080P by NAME — its own URL, not episode 1's.
+    await _choose(tester, 1);
+    await _flush(tester);
+    expect(
+      session.players.last.calls.first,
+      'create:https://example.invalid/2-1080.mp4',
+    );
+
+    // Episode 3 has no 1080P: falls back to the default rendition.
+    await _choose(tester, 2);
+    await _flush(tester);
+    expect(
+      session.players.last.calls.first,
+      'create:https://example.invalid/3-720.mp4',
+    );
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('a choice remembered in the feed is honored on first load', (
+    tester,
+  ) async {
+    // Simulates the feed remembering 360P for this series before the
+    // full-page player opens: the player must NOT fall back to 720P.
+    QualityMemory.remember('loading-book', '360P');
+    final session = _Session(
+      shortSeries: true,
+      danmakuFetcher: (_) async => const PlayletCommentPage(),
+      loader: (chapter) => Future.value({
+        'video_url': 'https://example.invalid/${chapter.itemId}-720.mp4',
+        'key_hex': '',
+        'variants': [
+          {
+            'name': '720P',
+            'url': 'https://example.invalid/${chapter.itemId}-720.mp4',
+            'key_hex': '',
+            'height': 720,
+          },
+          {
+            'name': '360P',
+            'url': 'https://example.invalid/${chapter.itemId}-360.mp4',
+            'key_hex': '',
+            'height': 360,
+          },
+        ],
+      }),
+    );
+    await _mount(tester, session);
+    session.players.single.emitFirstFrame();
+    await _flush(tester);
+    expect(
+      session.players.single.calls.first,
+      'create:https://example.invalid/1-360.mp4',
+    );
+    expect(tester.takeException(), isNull);
+  });
 }
 
 Map<String, dynamic> _source(String id) => {
@@ -505,6 +622,9 @@ class _Session {
   final Future<Map<String, dynamic>> Function(Chapter)? loader;
   final ControlledNativePlayer Function()? factory;
   final int startIndex;
+  final bool shortSeries;
+  final Future<PlayletCommentPage> Function(DanmakuFetchRequest)?
+  danmakuFetcher;
   final players = <ControlledNativePlayer>[];
   final requests = <String>[];
   final samples = <PlayerLoadSample>[];
@@ -515,6 +635,8 @@ class _Session {
     this.loader,
     this.factory,
     this.startIndex = 0,
+    this.shortSeries = false,
+    this.danmakuFetcher,
   }) : store = store ?? ControlledReaderStore();
 
   Widget app() => MaterialApp(
@@ -527,6 +649,8 @@ class _Session {
       ],
       startIndex: startIndex,
       historyStore: store,
+      danmakuFetcher: danmakuFetcher,
+      shortSeries: shortSeries,
       loadDiagnostics: PlayerLoadDiagnostics(
         now: () => elapsed,
         report: samples.add,

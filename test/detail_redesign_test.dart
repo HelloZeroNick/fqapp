@@ -3,7 +3,6 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 
-import 'package:fqapp/models/chapter_summary.dart';
 import 'package:fqapp/models/media_item.dart';
 import 'package:fqapp/pages/detail_page.dart';
 import 'package:fqapp/pages/reader_page.dart';
@@ -94,7 +93,15 @@ void main() {
     await tester.enterText(search, '终卷');
     await tester.pumpAndSettle();
     expect(find.text('找到 73 章'), findsOneWidget);
-    expect(find.text('终卷 · 星河'), findsOneWidget);
+    // The ported page keeps the whole catalogue inline behind the sheet, so
+    // look the volume name up inside the sheet's own scroll view.
+    expect(
+      find.descendant(
+        of: find.byKey(const Key('detail_directory_scroll')),
+        matching: find.text('终卷 · 星河'),
+      ),
+      findsOneWidget,
+    );
     expect(tester.takeException(), isNull);
   });
 
@@ -129,8 +136,9 @@ void main() {
         entry: {'kind': 'book', 'chapterId': 'chapter-23', 'episode': 0},
       ),
     );
-    expect(find.text('继续阅读'), findsOneWidget);
-    expect(find.text('上次读到：第23章 故事的另一种可能'), findsOneWidget);
+    expect(find.textContaining('继续阅读'), findsOneWidget);
+    // 上次读到横条已删；进度在目录里写成 23 / 146。
+    expect(find.text('23 / 146'), findsOneWidget);
     await _openDirectory(tester);
     await tester.enterText(
       find.byKey(const Key('detail_directory_search')),
@@ -215,40 +223,6 @@ void main() {
     expect(tester.takeException(), isNull);
     expect(find.text('找到 1 章'), findsOneWidget);
   });
-
-  testWidgets('audio content markers never reach the preview excerpt', (
-    tester,
-  ) async {
-    await _pumpBook(
-      tester,
-      previewLoader: (ids) async => ChapterSummary.fromPayload({
-        'code': 0,
-        'data': {
-          'summary_item_data': [
-            {
-              'item_id': 'chapter-1',
-              'summary':
-                  '{!-- PGC_VOICE:{"content":"","duration":"664.79",'
-                  '"source_provider":"audiobook"}--}第一章的正文开头',
-            },
-            {'item_id': 'chapter-2', 'summary': '{!-- PGC_VOICE:{"content":""'},
-          ],
-        },
-      }),
-    );
-
-    expect(
-      find.byKey(const Key('detail_preview_excerpt_chapter-1')),
-      findsOneWidget,
-    );
-    expect(find.textContaining('PGC_VOICE'), findsNothing);
-    expect(find.textContaining('第一章的正文开头'), findsOneWidget);
-    // A marker-only preview is dropped instead of shown as raw JSON.
-    expect(
-      find.byKey(const Key('detail_preview_excerpt_chapter-2')),
-      findsNothing,
-    );
-  });
 }
 
 Future<void> _pumpBook(
@@ -260,7 +234,6 @@ Future<void> _pumpBook(
   int chapterCount = 146,
   MemoryReaderStore? store,
   NavigatorObserver? observer,
-  ChapterPreviewLoader? previewLoader,
 }) async {
   await tester.binding.setSurfaceSize(size);
   addTearDown(() => tester.binding.setSurfaceSize(null));
@@ -282,7 +255,6 @@ Future<void> _pumpBook(
       home: DetailPage(
         item: _book,
         readerStore: store ?? MemoryReaderStore(),
-        previewLoader: previewLoader,
         detailLoader: (id, {String tab = '小说'}) async => {
           'data': {'abstract': _description},
         },
@@ -303,9 +275,8 @@ Future<void> _pumpBook(
 }
 
 Future<void> _openDirectory(WidgetTester tester) async {
-  // The catalog entry lives in the page body. On small viewports with a large
-  // text scale the masthead fills the viewport, so the sliver is offstage and
-  // must be looked up with skipOffstage disabled before scrolling to it.
+  // The catalog entry lives in the page body; on small viewports it is offstage
+  // and must be looked up with skipOffstage disabled before scrolling to it.
   final button = find.byKey(
     const Key('detail_directory_button'),
     skipOffstage: false,
@@ -314,6 +285,16 @@ Future<void> _openDirectory(WidgetTester tester) async {
   // A single frame is enough to apply the jump; settling here would hang while
   // an unrelated pending action keeps its progress indicator spinning.
   await tester.pump();
+  // ensureVisible parks the row at the viewport top, which the ported frosted
+  // header covers. Drag the (already scrolled) body back down until the row is
+  // under the header's hitbox.
+  if (tester.getCenter(button).dy < 130) {
+    await tester.drag(
+      find.byKey(const Key('detail_scroll')),
+      const Offset(0, 160),
+    );
+    await tester.pump();
+  }
   await tester.tap(button);
   await tester.pumpAndSettle();
 }

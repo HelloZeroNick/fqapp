@@ -112,7 +112,8 @@ void main() {
       await tester.pumpAndSettle();
       await tester.tap(find.byKey(const ValueKey('player-clear-screen')));
       await tester.pump();
-      await tester.tap(find.byKey(const ValueKey('player-rate-text')));
+      // 清屏态：底栏「设置」进视频设置，底栏「倍速」开档位弹层。
+      await tester.tap(find.byKey(const ValueKey('player-settings-text')));
       await tester.pumpAndSettle();
       player.calls.clear();
       await tester.tap(find.byKey(const ValueKey('player-more-fill-row')));
@@ -127,14 +128,20 @@ void main() {
       );
       expect(await PlayerPanelPreferences.loadFillScreen(), isTrue);
       expect(PlayerPanelPreferences.defaultMute, isFalse);
-      await tester.tap(find.byKey(const ValueKey('player-more-rate-1.75')));
+      // 档位不铺在面板里：收面板后走底栏的档位弹层。
+      expect(find.byKey(const ValueKey('player-more-rate-row')), findsNothing);
+      await tester.tap(find.byKey(const ValueKey('player-more-cancel')));
       await tester.pumpAndSettle();
-      expect(player.calls, ['volume:1.0', 'rate:1.75']);
+      await tester.tap(find.byKey(const ValueKey('player-rate-text')));
+      await tester.pumpAndSettle();
+      await tester.tap(find.byKey(const ValueKey('player-rate-sheet-4')));
+      await tester.pumpAndSettle();
+      expect(player.calls, ['volume:1.0', 'rate:2.0']);
       expect(player.isPlaying, isFalse);
       expect(player.position, const Duration(seconds: 35));
       expect(find.text('恢复'), findsOneWidget);
-      expect(await PlayerPreferences.loadPlaybackRate(), 1.75);
-      await tester.tap(find.byKey(const ValueKey('player-rate-text')));
+      expect(await PlayerPreferences.loadPlaybackRate(), 2);
+      await tester.tap(find.byKey(const ValueKey('player-settings-text')));
       await tester.pumpAndSettle();
       expect(
         tester
@@ -311,18 +318,22 @@ void main() {
     });
   }
 
-  testWidgets('the full-page texture stays covered until its size is known', (
+  testWidgets('an unknown size fills the screen until the decoder reports', (
     tester,
   ) async {
     final player = await _mount(tester, videoSize: Size.zero, settle: false);
-    expect(find.byKey(const ValueKey('player-cover')), findsOneWidget);
+    // 首帧前没有解码尺寸：盒子直接铺满（= 屏幕分辨率），不再盖封面。
+    expect(find.byKey(const ValueKey('player-cover')), findsNothing);
+    final texture = find.byKey(const ValueKey('player-texture'));
+    final before = tester.getRect(texture);
 
     // Native playback may report its first frame before the video-size event.
-    // The cover must remain until the layout has the real rendition geometry.
+    // 尺寸到达后画面按真实比例收窄，仍不出现封面。
     player.emitVideoSize(1920, 1080);
     await tester.pump();
     expect(find.byKey(const ValueKey('player-cover')), findsNothing);
-    expect(find.byKey(const ValueKey('player-texture')), findsOneWidget);
+    expect(texture, findsOneWidget);
+    expect(tester.getRect(texture).height, lessThan(before.height));
     expect(tester.takeException(), isNull);
   });
 

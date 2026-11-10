@@ -1,146 +1,116 @@
 import 'package:flutter/material.dart';
-import 'package:flutter_lucide/flutter_lucide.dart';
 
+import '../../services/app_style_tokens.dart';
+import 'classic_home_tab_bar.dart';
 import 'home_design.dart';
 
 class HomeCategory {
   final String label;
-  final IconData icon;
 
-  const HomeCategory(this.label, this.icon);
+  const HomeCategory(this.label);
 }
 
 const homeCategories = [
-  HomeCategory('推荐', LucideIcons.sparkles),
-  HomeCategory('小说', LucideIcons.book_open),
-  HomeCategory('短剧', LucideIcons.clapperboard),
-  HomeCategory('漫剧', LucideIcons.film),
-  HomeCategory('漫画', LucideIcons.image),
-  HomeCategory('听书', LucideIcons.headphones),
+  HomeCategory('推荐'),
+  HomeCategory('小说'),
+  HomeCategory('短剧'),
+  HomeCategory('漫剧'),
+  HomeCategory('漫画'),
+  HomeCategory('听书'),
 ];
 
-class HomeTabBarDelegate extends SliverPersistentHeaderDelegate {
+/// 六个媒介分类固定在顶部；保留名称和下划线，不再重复分区的编号层级。
+class HomeTabBar extends StatelessWidget {
+  static const double sidePadding = 16;
+  static const double tabSpacing = 22;
+  static const double selectedSize = 15;
+  static const double unselectedSize = 15;
+
   final int selectedIndex;
   final ValueChanged<int> onSelect;
-  final double extent;
-  final bool dark;
+  final List<HomeCategory> categories;
 
-  HomeTabBarDelegate({
+  const HomeTabBar({
+    super.key,
     required this.selectedIndex,
     required this.onSelect,
-    this.extent = 54,
-    this.dark = false,
+    this.categories = homeCategories,
   });
 
   @override
-  double get minExtent => extent;
-
-  @override
-  double get maxExtent => extent;
-
-  @override
-  Widget build(
-    BuildContext context,
-    double shrinkOffset,
-    bool overlapsContent,
-  ) {
+  Widget build(BuildContext context) {
+    if (AppStyleTokens.of(context).isClassic) {
+      return ClassicHomeTabBar(
+        selectedIndex: selectedIndex,
+        onSelect: onSelect,
+        categories: categories,
+      );
+    }
     final palette = HomePalette.of(context);
-    final duration = MediaQuery.disableAnimationsOf(context)
+    final duration = palette.eink || MediaQuery.disableAnimationsOf(context)
         ? Duration.zero
-        : const Duration(milliseconds: 200);
-
-    return DecoratedBox(
+        : const Duration(milliseconds: 180);
+    return Container(
       decoration: BoxDecoration(
         color: palette.canvas,
-        border: Border(
-          bottom: BorderSide(
-            color: palette.line.withValues(alpha: 0.5),
-            width: 0.6,
-          ),
-        ),
+        border: Border(bottom: BorderSide(color: palette.line, width: 1)),
       ),
-      child: Center(
-        child: SizedBox(
-          height: 38,
-          child: ListView.separated(
-            padding: const EdgeInsets.symmetric(horizontal: 16),
-            scrollDirection: Axis.horizontal,
-            itemCount: homeCategories.length,
-            separatorBuilder: (_, _) => const SizedBox(width: 6),
-            itemBuilder: (context, index) {
-              final selected = index == selectedIndex;
-              final category = homeCategories[index];
-              return Semantics(
-                selected: selected,
-                button: true,
-                label: category.label,
-                excludeSemantics: true,
-                onTap: () => onSelect(index),
-                child: Material(
-                  color: Colors.transparent,
-                  child: InkWell(
-                    key: ValueKey('home_category_$index'),
-                    onTap: () => onSelect(index),
-                    borderRadius: BorderRadius.circular(19),
-                    child: AnimatedContainer(
-                      duration: duration,
-                      curve: Curves.easeOutCubic,
-                      padding: const EdgeInsets.symmetric(horizontal: 14),
-                      alignment: Alignment.center,
-                      decoration: BoxDecoration(
-                        color: selected
-                            ? HomePalette.accent
-                            : palette.soft.withValues(alpha: 0.7),
-                        borderRadius: BorderRadius.circular(19),
-                        boxShadow: selected
-                            ? [
-                                BoxShadow(
-                                  color: HomePalette.accent.withValues(alpha: 0.28),
-                                  blurRadius: 8,
-                                  offset: const Offset(0, 2),
-                                ),
-                              ]
-                            : null,
-                      ),
-                      child: Row(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          Icon(
-                            category.icon,
-                            size: 14,
-                            color: selected ? Colors.white : palette.muted,
-                          ),
-                          const SizedBox(width: 5),
-                          AnimatedDefaultTextStyle(
-                            duration: duration,
-                            style: TextStyle(
-                              fontSize: 13,
-                              fontWeight:
-                                  selected ? FontWeight.w700 : FontWeight.w500,
-                              color: selected ? Colors.white : palette.ink,
-                              letterSpacing: 0.2,
-                            ),
-                            child: Text(category.label),
-                          ),
-                        ],
-                      ),
-                    ),
-                  ),
-                ),
-              );
-            },
-          ),
+      child: SingleChildScrollView(
+        scrollDirection: Axis.horizontal,
+        padding: const EdgeInsets.symmetric(horizontal: sidePadding),
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.end,
+          children: [
+            for (var index = 0; index < categories.length; index++) ...[
+              if (index > 0) const SizedBox(width: tabSpacing),
+              _tab(index, duration, palette),
+            ],
+          ],
         ),
       ),
     );
   }
 
-  // Note: pinned header 必须把主题算进 shouldRebuild — 见
-  // .agents/notes/implemented/bug-fix/2026-09-18-home-geometry-and-backup.md
-  @override
-  bool shouldRebuild(HomeTabBarDelegate oldDelegate) =>
-      selectedIndex != oldDelegate.selectedIndex ||
-      extent != oldDelegate.extent ||
-      onSelect != oldDelegate.onSelect ||
-      dark != oldDelegate.dark;
+  Widget _tab(int index, Duration duration, HomePalette palette) {
+    final selected = index == selectedIndex;
+    final category = categories[index];
+    return Semantics(
+      selected: selected,
+      child: HomePressable(
+        key: ValueKey('home_category_$index'),
+        onTap: () => onSelect(index),
+        borderRadius: BorderRadius.zero,
+        // Stack follows the label width inside the horizontal scroll view.
+        child: Stack(
+          children: [
+            Padding(
+              padding: const EdgeInsets.symmetric(vertical: 12),
+              child: AnimatedDefaultTextStyle(
+                duration: duration,
+                curve: Curves.easeOutCubic,
+                style: TextStyle(
+                  fontSize: selected ? selectedSize : unselectedSize,
+                  height: 1.1,
+                  fontWeight: selected ? FontWeight.w600 : FontWeight.w400,
+                  color: selected ? palette.ink : palette.muted,
+                ),
+                child: Text(category.label, maxLines: 1),
+              ),
+            ),
+            Positioned(
+              left: 0,
+              right: 0,
+              bottom: 0,
+              height: 2,
+              child: AnimatedContainer(
+                duration: duration,
+                curve: Curves.easeOutCubic,
+                color: selected ? palette.mark : Colors.transparent,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
 }

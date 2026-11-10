@@ -128,6 +128,45 @@ void main() {
     expect(reopened.get('a'), isNull);
   });
 
+  test('lost key keeps the unreadable box and opens a fresh one', () async {
+    final box = await EncryptedHive.openBox<dynamic>(
+      Hive,
+      'shelf',
+      keys: keys,
+    );
+    await box.put('a', {'title': 'Book A'});
+    await box.close();
+    final original = File('${dir.path}/shelf_enc.hive');
+    expect(original.existsSync(), isTrue);
+    final originalBytes = original.readAsBytesSync();
+
+    // A transient Keystore hiccup hands back a key that cannot open the box.
+    // Its ciphertext must survive: renamed out of Hive's lookup names, never
+    // deleted, with a fresh empty box taking its place.
+    final lostKeys = SecureKeyProvider(
+      storage: InMemorySecureKeyStorage(),
+    );
+    final reopened = await EncryptedHive.openBox<dynamic>(
+      Hive,
+      'shelf',
+      keys: lostKeys,
+    );
+    expect(reopened.isEmpty, isTrue);
+    await reopened.put('b', {'title': 'Book B'});
+    expect((reopened.get('b') as Map)['title'], 'Book B');
+
+    final preserved = dir
+        .listSync()
+        .whereType<File>()
+        .where((file) => file.path.contains('.unreadable-'))
+        .toList();
+    expect(preserved, hasLength(1));
+    expect(preserved.single.path, contains('shelf_enc.unreadable-'));
+    expect(preserved.single.readAsBytesSync(), originalBytes);
+    // The new empty box lives at the normal name again.
+    expect(await Hive.boxExists('shelf_enc'), isTrue);
+  });
+
   test('malformed stored key is replaced with a fresh 32-byte key', () async {
     await storage.write(
       SecureKeyProvider.hiveBoxKeyName,
@@ -168,6 +207,23 @@ void main() {
       throwsStateError,
     );
   });
+
+  test('no key with an existing encrypted box fails closed', () async {
+    // An earlier session encrypted this box, so the records are still on disk.
+    final box = await EncryptedHive.openBox<dynamic>(Hive, 'shelf', keys: keys);
+    await box.put('a', {'title': 'Book A'});
+    await box.close();
+
+    // Next launch, secure storage is unavailable. Degrading to the legacy
+    // plaintext box would show an empty shelf, hide the real records and start
+    // writing plaintext beside them, so opening must fail instead.
+    final noKeys = SecureKeyProvider(storage: _ThrowingStorage());
+    await expectLater(
+      EncryptedHive.openBox<dynamic>(Hive, 'shelf', keys: noKeys),
+      throwsStateError,
+    );
+    expect(await Hive.boxExists('shelf_enc'), isTrue, reason: '真数据必须还在');
+  });
 }
 
 class _ThrowingStorage implements SecureKeyStorage {
@@ -178,6 +234,11 @@ class _ThrowingStorage implements SecureKeyStorage {
 
   @override
   Future<void> write(String key, String value) async {
+    throw StateError('secure storage unavailable');
+  }
+
+  @override
+  Future<void> delete(String key) async {
     throw StateError('secure storage unavailable');
   }
 }

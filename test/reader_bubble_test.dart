@@ -12,11 +12,13 @@ import 'package:fqapp/models/book_comment.dart';
 import 'package:fqapp/models/chapter_ideas.dart';
 import 'package:fqapp/models/media_item.dart';
 import 'package:fqapp/pages/reader_page.dart';
+import 'package:fqapp/widgets/wenku/wenku_segments.dart';
 import 'package:fqapp/services/chapter_text_formatter.dart';
 import 'package:fqapp/services/reader_preferences.dart';
 import 'package:fqapp/widgets/reader/reader_bubble.dart';
 
 import 'support/fakes.dart';
+import 'support/reader_settings_nav.dart';
 
 /// Paragraph ids live in `<p idx="N">`; the idea map is keyed by exactly those.
 const _html =
@@ -350,8 +352,12 @@ void main() {
       ChapterIdeas? ideas,
       ReaderPageMode mode = ReaderPageMode.paged,
       TextScaler scaler = TextScaler.noScaling,
+      bool showBubbles = true,
     }) async {
-      SharedPreferences.setMockInitialValues({'reader_page_mode': '$mode'});
+      SharedPreferences.setMockInitialValues({
+        'reader_page_mode': '$mode',
+        'reader_show_paragraph_bubbles': showBubbles,
+      });
       await tester.binding.setSurfaceSize(const Size(400, 800));
       addTearDown(() => tester.binding.setSurfaceSize(null));
       await tester.pumpWidget(
@@ -392,6 +398,63 @@ void main() {
     testWidgets('draws no bubble without ideas', (tester) async {
       await pumpReader(tester);
       expect(find.byType(ReaderParagraphBubble), findsNothing);
+      expect(tester.takeException(), isNull);
+    });
+
+    testWidgets('hides bubbles when the paragraph-bubble switch is off', (
+      tester,
+    ) async {
+      // Ideas still load (段评 stays reachable from the paragraph menu and
+      // the chapter end); only the in-text bubbles go away, with no empty
+      // gap left where the bubble placeholder was.
+      await pumpReader(tester, ideas: _ideas(), showBubbles: false);
+      expect(find.byType(ReaderParagraphBubble), findsNothing);
+      for (final text in ['第一段话。', '第二段话。', '第三段话。']) {
+        expect(find.textContaining(text, findRichText: true), findsOneWidget);
+      }
+      expect(tester.takeException(), isNull);
+    });
+
+    testWidgets('flipping the switch in the appearance sheet re-measures', (
+      tester,
+    ) async {
+      await pumpReader(tester, ideas: _ideas());
+      expect(find.byType(ReaderParagraphBubble), findsNWidgets(2));
+
+      // Open the appearance sheet: centre tap → controls → 外观.
+      await tester.tapAt(
+        tester
+            .getRect(find.byKey(const ValueKey('reader-page-surface')))
+            .center,
+      );
+      await tester.pumpAndSettle();
+      await tester.tap(find.byKey(const ValueKey('reader-settings')));
+      await tester.pumpAndSettle();
+      expect(
+        find.byKey(const ValueKey('reader-settings-category-grid')),
+        findsOneWidget,
+      );
+      // 段评气波开关在「屏幕」分类的显示区块里。
+      await openReaderSettingsCategory(tester, 'page');
+      final toggleRow = find
+          .ancestor(of: find.text('段评气泡'), matching: find.byType(Row))
+          .first;
+      final bubbleSwitch = find.descendant(
+        of: toggleRow,
+        matching: find.byType(AppGlassSwitch),
+      );
+      await tester.ensureVisible(bubbleSwitch);
+      await tester.tap(bubbleSwitch);
+      await tester.pumpAndSettle();
+      // The cached layout is not reused across the toggle: bubbles leave
+      // without a stale placeholder gap.
+      expect(find.byType(ReaderParagraphBubble), findsNothing);
+
+      await tester.tap(bubbleSwitch);
+      await tester.pumpAndSettle();
+      expect(find.byType(ReaderParagraphBubble), findsNWidgets(2));
+      await closeReaderSettingsSheet(tester);
+      expect((await ReaderPreferences.load()).showParagraphBubbles, isTrue);
       expect(tester.takeException(), isNull);
     });
 

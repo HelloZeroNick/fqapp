@@ -5,7 +5,10 @@ import 'package:hive_ce_flutter/hive_flutter.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'encrypted_hive.dart';
+import 'reader_bookmark_store.dart';
 import 'reader_underline_store.dart';
+
+part 'history_trim.dart';
 
 abstract interface class ReaderStore {
   Future<Map<String, dynamic>?> historyEntry(String id);
@@ -109,6 +112,17 @@ class LibraryStore implements ReaderStore {
   late Box<dynamic> _watchedBox;
   Future<void> _writes = Future<void>.value();
 
+  /// Non-imported history records, or null when a bulk write left the count
+  /// unknown and the next trim check must recount. Imported records are
+  /// exempt from the 50-entry trim, so the box length alone cannot tell
+  /// whether local history is over the trim threshold.
+  int? _localHistoryCount;
+
+  /// Full snapshot builds, so the regression test can assert that adding a
+  /// record while imported history keeps the box above 100 does not rebuild.
+  @visibleForTesting
+  int historySnapshotBuilds = 0;
+
   Future<void> _serialize(Future<void> Function() action) {
     final write = _writes.then<void>((_) => action());
     // Return a failure to its caller without poisoning subsequent mutations.
@@ -132,11 +146,13 @@ class LibraryStore implements ReaderStore {
 
   Future<void> init() async {
     _writes = Future<void>.value();
+    _localHistoryCount = null;
     _histBox = await EncryptedHive.openBox(Hive, _histBoxName);
     _readTimeBox = await EncryptedHive.openBox(Hive, _readTimeBoxName);
     _watchedBox = await EncryptedHive.openBox(Hive, _watchedBoxName);
     // Hive has a directory now, so optional boxes may be opened too.
     ReaderUnderlineStore.hiveReady = true;
+    ReaderBookmarkStore.hiveReady = true;
     await _migrateFromSp();
     // Copy typed legacy media before a novel can reuse its original key.
     // The originals remain available if a write fails or migration is retried.
@@ -276,6 +292,7 @@ class LibraryStore implements ReaderStore {
   }
 
   List<Map<String, dynamic>> historySnapshot() {
+    historySnapshotBuilds++;
     final byIdentity = <(String, String), Map<String, dynamic>>{};
     for (final key in _histBox.keys) {
       final record = _historyRecord(_histBox.get(key), id: key.toString());
@@ -351,6 +368,7 @@ class LibraryStore implements ReaderStore {
         identities.add((kind, id));
         addedHistory++;
       }
+      _localHistoryCount = null;
       var addedEpisodes = 0;
       for (final entry in watched.entries) {
         final current = _watchedRecord(_watchedBox.get(entry.key));
@@ -383,6 +401,64 @@ class LibraryStore implements ReaderStore {
     };
   }
 
+  /// Import only novels. Older history-only imports receive missing metadata
+  /// and chapter IDs; a newer local reading position always wins.
+  Future<int> mergeFanqie(List<Map<String, dynamic>> records) {
+    final guard = ReadingDataWriteGuard(this);
+    return _serializeResult(() async {
+      if (!guard.canWriteHistory) throw StateError('历史已清理，请重新导入');
+      var changed = 0;
+      for (final incoming in records) {
+        final id = incoming['id'] as String;
+        final previous = _historyRecord(_histBox.get(id), id: id);
+        if (previous != null && previous['kind'] != 'book') continue;
+        final next = <String, dynamic>{...?previous};
+        final hasPosition =
+            previous?['chapterId'] != null ||
+            previous?['episode'] != null ||
+            previous?['positionVersion'] != null;
+        final newerLocal =
+            hasPosition &&
+            ((previous?['time'] as num?) ?? 0) >= (incoming['time'] as int);
+        for (final entry in incoming.entries) {
+          if (const ['title', 'cover', 'author', 'ep'].contains(entry.key)) {
+            if (entry.key == 'ep' && newerLocal) continue;
+            if (entry.value is String && (entry.value as String).isNotEmpty) {
+              next[entry.key] = entry.value;
+            }
+          } else if (!newerLocal ||
+              const [
+                'id',
+                'bookId',
+                'kind',
+                'fanqieImported',
+              ].contains(entry.key)) {
+            next[entry.key] = entry.value;
+          }
+        }
+        if (!newerLocal && incoming['chapterId'] != null) {
+          // Official paragraph offsets have different semantics from local
+          // rendered offsets. Resume at the imported chapter's beginning.
+          for (final field in [
+            'position',
+            'maxScroll',
+            'textOffset',
+            'positionVersion',
+          ]) {
+            next.remove(field);
+          }
+        }
+        final clean = _historyRecord(next, id: id);
+        if (clean == null) continue;
+        await _histBox.put(id, clean);
+        changed++;
+      }
+      _localHistoryCount = null;
+      await _histBox.flush();
+      return changed;
+    });
+  }
+
   @override
   Future<Map<String, dynamic>?> historyEntry(String id) async {
     final entry = _histBox.get(id);
@@ -393,6 +469,13 @@ class LibraryStore implements ReaderStore {
   Future<void> addHistory(Map<String, dynamic> entry) {
     return _serialize(() => _addHistoryInWrite(entry));
   }
+
+  /// Bound for imported history. Imported records are kept until the user
+  /// deletes them, but without a cap a 10k-record import would leave the
+  /// history box unbounded. The import service already refuses more than
+  /// 10000 history records, so this cap never deletes a legitimate import;
+  /// it only bounds what can accumulate through restores or direct writes.
+  static const _importedHistoryCap = 10000;
 
   Future<void> _addHistoryInWrite(Map<String, dynamic> entry) async {
     final record = _historyRecord(entry);
@@ -406,24 +489,13 @@ class LibraryStore implements ReaderStore {
       await _preserveLegacyMediaInWrite(previous);
     }
 
-    await _histBox.put(id, record);
-
-    // Trim history to 50 entries once it grows past 100 (leaves headroom so
-    // we don't prune on every single write).
-    if (_histBox.length > 100) {
-      // Legacy backups must not make fifty books look like a hundred books.
-      final retained = historySnapshot().take(50).map(_historyIdentity).toSet()
-        // Never trim the record this write just inserted, even without a time.
-        ..add(_historyIdentity(record));
-      final oldestKeys = <dynamic>[];
-      for (final key in _histBox.keys) {
-        final record = _historyRecord(_histBox.get(key), id: key.toString());
-        if (record == null || !retained.contains(_historyIdentity(record))) {
-          oldestKeys.add(key);
-        }
-      }
-      await _histBox.deleteAll(oldestKeys);
+    final existing = _histBox.get(id);
+    if (existing is Map && existing['fanqieImported'] == true) {
+      record['fanqieImported'] = true;
     }
+    await _histBox.put(id, record);
+    _noteHistoryWrite(existing, record);
+    await _trimHistory(id, record);
   }
 
   @override
@@ -506,6 +578,7 @@ class LibraryStore implements ReaderStore {
       }
       if (keys.isEmpty) return false;
       await _histBox.deleteAll(keys);
+      _localHistoryCount = null;
       return true;
     });
   }
@@ -528,6 +601,7 @@ class LibraryStore implements ReaderStore {
       }
       if (keys.isEmpty) return 0;
       await _histBox.deleteAll(keys);
+      _localHistoryCount = null;
       return keys.length;
     });
   }
@@ -539,6 +613,7 @@ class LibraryStore implements ReaderStore {
       final preferences = await SharedPreferences.getInstance();
       await _removeLegacySource(preferences, 'hist');
       await _histBox.clear();
+      _localHistoryCount = null;
       // 已看集也来自观看历史：清历史必须一并清掉，「删除历史」不能在
       // 选集面板里留下已看标记。
       await _watchedBox.clear();
@@ -558,6 +633,7 @@ class LibraryStore implements ReaderStore {
       await _removeLegacySource(preferences, 'hist');
       await _removeLegacySource(preferences, 'read_time_map');
       await _histBox.clear();
+      _localHistoryCount = null;
       await _readTimeBox.clear();
       await _watchedBox.clear();
     });
@@ -713,6 +789,9 @@ class LibraryStore implements ReaderStore {
     (record['contentId'] ?? record['id']).toString(),
   );
 
+  static num _historyTime(Map<String, dynamic> record) =>
+      (record['time'] as num?) ?? 0;
+
   static String? _legacyMediaKey(Map<String, dynamic> record) {
     final kind = record['kind'];
     if (record['contentId'] != null || (kind != 'audio' && kind != 'manga')) {
@@ -732,6 +811,7 @@ class LibraryStore implements ReaderStore {
     final id = record['id'] as String;
     if (!_histBox.containsKey(target)) {
       await _histBox.put(target, {...record, 'id': target, 'contentId': id});
+      _localHistoryCount = null;
     }
     final current = _readTimeBox.get(target);
     final previous = _legacyTimeAllocation(current);

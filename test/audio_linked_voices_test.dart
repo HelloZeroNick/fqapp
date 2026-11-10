@@ -74,7 +74,14 @@ void main() {
     await _mount(tester, session);
     await _showVoices(tester);
     expect(find.text('真人讲书'), findsWidgets);
-    expect(find.text('智能朗读'), findsOneWidget);
+    // 页头页签也叫「智能朗读」，这里只看音色面板里的分组标题。
+    expect(
+      find.descendant(
+        of: find.byKey(const Key('voice_settings_surface')),
+        matching: find.text('智能朗读'),
+      ),
+      findsOneWidget,
+    );
     for (final tone in AudioToneSet.fromPayload(_payload()).ttsTones) {
       expect(find.byKey(ValueKey('voice_option_${tone.id}')), findsOneWidget);
     }
@@ -97,16 +104,25 @@ void main() {
     await _flush(tester);
     await tester.tap(find.byKey(const ValueKey('audio-speed')));
     await tester.pumpAndSettle();
-    await tester.tap(find.text('1.5×'));
+    // 语速面板改成 0.1 一档的滑条，没有固定档位按钮可点。
+    tester
+        .widget<Slider>(find.byKey(const ValueKey('audio-speed-slider')))
+        .onChanged!(1.5);
     await _flush(tester);
+    await tester.pumpAndSettle();
+    // 滑条面板选完不会自动关，先关掉再选音色，否则点击落在遮罩上。
+    await tester.tapAt(const Offset(20, 20));
+    await tester.pumpAndSettle();
     await _chooseVoice(tester, '115');
 
     expect(session.directories, [_novelBook]);
     expect(session.requests, ['$_audioChapter:0', '$_novelChapter:115']);
     expect(find.byType(AudioPage), findsOneWidget);
     expect(find.byKey(ValueKey('audio_session_$_novelBook')), findsOneWidget);
-    expect(find.text('全球冰封：我打造了末日安全屋'), findsOneWidget);
-    expect(find.text('听书'), findsOneWidget);
+    // 官方 bio.xml 的书名行 b1g 默认 gone、页头中央是「智能朗读 │ 真人讲书」
+    // 而不是「听书」标题，所以这两条旧断言换成新版式下稳定存在的信号。
+    expect(find.byKey(const Key('audio_chapter_title')), findsOneWidget);
+    expect(find.byKey(const Key('audio_mode_tts')), findsOneWidget);
     expect(session.players.first.disposed, isTrue);
     expect(session.players.last.isPlaying, isTrue);
     expect(session.players.last.position, Duration.zero);
@@ -175,7 +191,8 @@ void main() {
       await tester.tap(find.byKey(const ValueKey('voice_option_96')));
       await _flush(tester);
       expect(find.text('声音设置'), findsOneWidget);
-      expect(find.text('冰河末世，我囤积了百亿物资'), findsWidgets);
+      // 书名行按官方默认隐藏，改用面板仍在 + 播放器未释放来断言「停住」。
+      expect(find.byKey(const ValueKey('voice_option_96')), findsOneWidget);
       expect(session.players, hasLength(1));
       expect(session.players.single.disposed, isFalse);
 
@@ -188,8 +205,9 @@ void main() {
       expect(find.text('声音设置'), findsNothing);
       expect(find.byType(AudioPage), findsOneWidget);
       expect(find.byKey(ValueKey('audio_session_$_novelBook')), findsOneWidget);
-      expect(find.text('全球冰封：我打造了末日安全屋'), findsOneWidget);
-      expect(find.text('听书'), findsOneWidget);
+      // 官方书名行 b1g 默认 gone、页头中央是模式分段而非「听书」标题。
+      expect(find.byKey(const Key('audio_chapter_title')), findsOneWidget);
+      expect(find.byKey(const Key('audio_mode_tts')), findsOneWidget);
     },
   );
 }

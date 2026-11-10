@@ -13,6 +13,10 @@ class MainActivity : FlutterActivity() {
     // 过渡事件漏发导致的 HardwareKeyboard 派发丢失影响。
     private var volumeKeyEnabled = false
     private var volumeChannel: MethodChannel? = null
+    private var hapticsChannel: MethodChannel? = null
+
+    /** Read by the AI foreground-service bridge; a FGS may only start while this is true. */
+    internal var isResumed = false
 
     override fun getFlutterShellArgs(): FlutterShellArgs = super.getFlutterShellArgs().also {
         // Runs before the engine/FlutterLoader starts; configureFlutterEngine is
@@ -26,15 +30,40 @@ class MainActivity : FlutterActivity() {
         // Native ExoPlayer host for DRM short dramas (CENC streaming decrypt).
         flutterEngine.plugins.add(NativePlayerPlugin())
         flutterEngine.plugins.add(ReaderDevicePlugin())
+        // 全屏播放用 WindowInsetsController 隐藏系统栏；immersiveSticky 在
+        // target SDK 36 的 edge-to-edge 下已不生效（issue #176）。
+        flutterEngine.plugins.add(PlayerSystemUiPlugin())
         flutterEngine.plugins.add(SystemTtsPlugin())
         flutterEngine.plugins.add(LocalBookPickerPlugin())
         flutterEngine.plugins.add(LibraryBackupPlugin())
+        flutterEngine.plugins.add(FanqieAccountPlugin())
         // 官方系统分享是 Intent.ACTION_SEND；没有可分享的应用时回 false。
         flutterEngine.plugins.add(SharePlugin())
         // 整本 TXT 导出：MediaStore.Downloads 或应用外部目录，见 DownloadsPlugin。
         flutterEngine.plugins.add(DownloadsPlugin())
         // 海信墨水屏整屏刷新（压残影）：反射调用厂商 EPD 接口。
         flutterEngine.plugins.add(EinkRefreshPlugin())
+        // 小米澎湃 OS 公平运行内存：收 TRIM/KILL 广播，转发 Dart 处理后回系统。
+        flutterEngine.plugins.add(FairMemoryPlugin())
+        flutterEngine.plugins.add(AiRequestPlugin())
+
+        hapticsChannel = MethodChannel(
+            flutterEngine.dartExecutor.binaryMessenger,
+            "fqapp/haptics",
+        ).also { channel ->
+            channel.setMethodCallHandler { call, result ->
+                if (call.method != "setEnabled") {
+                    result.notImplemented()
+                } else if (call.arguments !is Boolean) {
+                    result.error("BAD_ARGUMENT", "Expected a boolean", null)
+                } else {
+                    // Flutter's platform haptics target this view, including
+                    // Material long presses that bypass our Dart cue helper.
+                    window.decorView.isHapticFeedbackEnabled = call.arguments as Boolean
+                    result.success(true)
+                }
+            }
+        }
 
         // 音量键翻页通道：Dart -> 原生 setEnabled 控制是否拦截；原生 -> Dart
         // volumeKey 回调翻页方向（+1 下一页 / -1 上一页）。
@@ -52,6 +81,22 @@ class MainActivity : FlutterActivity() {
                 }
             }
         }
+    }
+
+    override fun cleanUpFlutterEngine(flutterEngine: FlutterEngine) {
+        hapticsChannel?.setMethodCallHandler(null)
+        hapticsChannel = null
+        super.cleanUpFlutterEngine(flutterEngine)
+    }
+
+    override fun onResume() {
+        super.onResume()
+        isResumed = true
+    }
+
+    override fun onPause() {
+        isResumed = false
+        super.onPause()
     }
 
     override fun dispatchKeyEvent(event: KeyEvent?): Boolean {

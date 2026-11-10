@@ -5,7 +5,8 @@
 //! .agents/notes/implemented/architecture/2026-09-23-rust-native-core-migration.md
 //!
 //! There is exactly one business implementation: Flutter reaches it over
-//! flutter_rust_bridge and the built-in Web UI reaches it over loopback HTTP.
+//! flutter_rust_bridge and external HTTP clients (Legado book sources, local
+//! tooling) reach it over the loopback adapter.
 
 use std::path::{Path, PathBuf};
 
@@ -44,6 +45,18 @@ pub enum ResponseBody {
         offset: u64,
         length: u64,
         total: u64,
+    },
+    /// A byte range of a CENC-encrypted cache file, to be transformed with
+    /// the file's index and content key while it is materialised/streamed
+    /// (P1-7): the bytes on disk stay encrypted, the decrypted view exists
+    /// only in the response.
+    FileDecrypted {
+        path: PathBuf,
+        offset: u64,
+        length: u64,
+        total: u64,
+        index: std::sync::Arc<crate::endpoints::video::CencIndex>,
+        key: Vec<u8>,
     },
 }
 
@@ -98,6 +111,23 @@ impl Response {
                 }
                 read_range(&path, offset, length).await
             }
+            ResponseBody::FileDecrypted {
+                path,
+                offset,
+                length,
+                index,
+                key,
+                ..
+            } => {
+                if length > crate::static_files::FFI_BODY_LIMIT {
+                    return Err(format!(
+                        "resource too large for the in-process transport: {length} bytes"
+                    ));
+                }
+                let mut buf = read_range(&path, offset, length).await?;
+                crate::endpoints::video::apply_cenc_index(&mut buf, offset, &index, &key)?;
+                Ok(buf)
+            }
         }
     }
 }
@@ -117,6 +147,24 @@ async fn read_range(path: &Path, offset: u64, length: u64) -> Result<Vec<u8>, St
     Ok(out)
 }
 
+/// Routes whose handler reads the POST body rather than URL/query arguments.
+const ACCOUNT_HISTORY_PATH: &str = "/api/v1/account/fanqie/history";
+const ACCOUNT_LIBRARY_PATH: &str = "/api/v1/account/fanqie/library";
+
+/// Largest body the account routes accept. Both handlers reject anything
+/// above this, so the loopback adapter refuses it before buffering.
+pub const ACCOUNT_REQUEST_BODY_LIMIT: usize = 16 * 1024;
+
+/// Routes that read the request body. The loopback adapter retains and
+/// forwards the body for exactly these paths; every other route ignores
+/// bodies, so draining them is enough.
+pub fn request_body_limit(path: &str) -> Option<usize> {
+    match path {
+        ACCOUNT_HISTORY_PATH | ACCOUNT_LIBRARY_PATH => Some(ACCOUNT_REQUEST_BODY_LIMIT),
+        _ => None,
+    }
+}
+
 /// APIs that submit user actions under the device identity (comments add /
 /// digg / reply; the danmaku add route reuses `playlet_comment_add`). The
 /// loopback adapter is callable by other local HTTP clients, so a GET must
@@ -131,23 +179,32 @@ const DEVICE_BOUND_WRITE_APIS: &[&str] = &[
     "playlet_comment_reply",
 ];
 
+/// Whether `path` addresses a device-bound write route.
+///
+/// Read routes answer any local client without the capability, so that external
+/// readers (Legado book sources, local tooling) can consume them. These routes
+/// stay behind the capability: they submit actions as this installation's
+/// device identity, and a sibling app on the same phone must not be able to
+/// post comments or danmaku on the user's behalf.
+pub fn requires_capability(path: &str) -> bool {
+    let params = Params::parse("");
+    match router::match_rest_path(path, &params) {
+        Some(m) => DEVICE_BOUND_WRITE_APIS.contains(&m.api),
+        None => false,
+    }
+}
+
 pub async fn dispatch(server: &Server, req: &Request) -> Response {
     let path = req.path.as_str();
     let ctx = &server.ctx;
 
-    // --- Web UI static files and API bridge ---
-    if path.starts_with("/api/") && !path.starts_with("/api/v1/") {
-        return crate::endpoints::webui::handle(server, path, &Params::parse(&req.query)).await;
+    // Account credentials belong in a bounded POST body, never in route/query
+    // parameters, endpoint error logs, or the anonymous rotating device pool.
+    if path == ACCOUNT_HISTORY_PATH {
+        return crate::endpoints::account_history::handle(ctx, req).await;
     }
-
-    if let Some(rest) = path.strip_prefix("/assets/") {
-        let root = Path::new(&ctx.web_dir).join("assets");
-        return crate::static_files::serve(&root, rest, req).await;
-    }
-
-    if path == "/" || path.ends_with(".html") || path.ends_with(".ico") {
-        let rel = path.trim_start_matches('/');
-        return crate::static_files::serve(Path::new(&ctx.web_dir), rel, req).await;
+    if path == ACCOUNT_LIBRARY_PATH {
+        return crate::endpoints::account_library::handle(ctx, req).await;
     }
 
     if path == "/health" {
@@ -155,9 +212,14 @@ pub async fn dispatch(server: &Server, req: &Request) -> Response {
         return Response::json(200, &json!({ "status": "ok", "devices": devices }));
     }
 
-    // static image server for decrypted manga images
+    // static file server for the runtime cache directory (manga images,
+    // clear media, and — via the video hook — CENC-encrypted videos whose
+    // ranges are decrypted on demand, P1-7)
     if !ctx.src_dir.is_empty() && (path == "/src" || path.starts_with("/src/")) {
         let rest = path.strip_prefix("/src/").unwrap_or("");
+        if let Some(resp) = crate::endpoints::video::serve_src_file(&ctx.src_dir, rest, req).await {
+            return resp;
+        }
         return crate::static_files::serve(Path::new(&ctx.src_dir), rest, req).await;
     }
 

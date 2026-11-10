@@ -1,9 +1,12 @@
+import 'platform_channel.dart';
 import 'dart:async';
 import 'dart:convert';
 
 import 'package:flutter/services.dart';
 
 import 'app_log.dart';
+import 'audio_preferences.dart';
+import 'player_preferences.dart';
 
 // Codec metadata only: never log the whole platform payload or exception text.
 final _decoderToken = RegExp(r'^[A-Za-z0-9_.+/-]{1,160}$');
@@ -56,8 +59,10 @@ class NativePlaybackException implements Exception {
 
 /// Flutter-side wrapper of the native ExoPlayer host.
 class NativePlayer {
-  static const _channel = MethodChannel('fqapp/native_player');
-  static const _events = EventChannel('fqapp/native_player/events');
+  NativePlayer({this.audioOnly = false});
+
+  static const _channel = AppMethodChannel('fqapp/native_player');
+  static const _events = AppEventChannel('fqapp/native_player/events');
   static const _methodTimeout = Duration(seconds: 10);
   static const _createTimeout = Duration(seconds: 25);
 
@@ -75,6 +80,49 @@ class NativePlayer {
 
   static void Function(String action)? _onRemoteAction;
   static VoidCallback? _onBecomingNoisy;
+  static int? _floatingHandlerOwner;
+  static void Function(String action)? _onFloatingAction;
+  static final Map<int, ({NativePlayer player, bool stopped})>
+  _startingFloating = {};
+  static ({int owner, NativePlayer player})? _floatingBinding;
+  static int _floatingMove = 0;
+
+  bool get isFloating =>
+      identical(_floatingBinding?.player, this) ||
+      _startingFloating.values.any(
+        (start) => !start.stopped && identical(start.player, this),
+      );
+
+  static void _bindFloating(int owner, int playerId) {
+    final current = _floatingBinding;
+    if (current != null && current.owner > owner) return;
+    final player = _instances[playerId];
+    if (player != null) _floatingBinding = (owner: owner, player: player);
+  }
+
+  static void _clearFloatingBinding(int owner) {
+    if (_floatingBinding?.owner != owner) return;
+    ++_floatingMove;
+    _floatingBinding = null;
+  }
+
+  static void setFloatingCommandHandler({
+    required int owner,
+    required void Function(String action) onAction,
+  }) {
+    if (_floatingHandlerOwner case final int current when current > owner) {
+      return;
+    }
+    _floatingHandlerOwner = owner;
+    _onFloatingAction = onAction;
+    _channel.setMethodCallHandler(_handleMethodCall);
+  }
+
+  static void clearFloatingCommandHandler(int owner) {
+    if (_floatingHandlerOwner != owner) return;
+    _floatingHandlerOwner = null;
+    _onFloatingAction = null;
+  }
 
   static void setRemoteCommandHandler({
     void Function(String action)? onAction,
@@ -140,6 +188,24 @@ class NativePlayer {
         }
       case 'onAudioBecomingNoisy':
         _onBecomingNoisy?.call();
+      case 'onFloatingAction':
+        final raw = call.arguments;
+        if (raw is Map &&
+            raw['owner'] == _floatingHandlerOwner &&
+            raw['owner'] is int &&
+            raw['action'] is String) {
+          _onFloatingAction?.call(raw['action'] as String);
+        }
+      case 'onFloatingStopped':
+        final raw = call.arguments;
+        final owner = raw is Map ? raw['owner'] : null;
+        if (owner is int) {
+          _clearFloatingBinding(owner);
+          if (_startingFloating[owner] case final start?) {
+            _startingFloating[owner] = (player: start.player, stopped: true);
+          }
+          if (_floatingHandlerOwner == owner) _onFloatingAction?.call('stop');
+        }
     }
     return null;
   }
@@ -193,7 +259,13 @@ class NativePlayer {
   int _appliedSeekGeneration = 0;
   int _playWhenReadyGeneration = 0;
 
+  /// 是否纯音频（听书）。原生侧据此决定倍速用哪种变速实现：视频/短剧
+  /// 仍用 Media3 内建的 Sonic，否则视频倍速会跟着变（音频处理与视频渲染
+  /// 必须同步走同一套计时）。见 issue #129。
+  final bool audioOnly;
+
   int? get textureId => _textureId;
+  int? get playerId => _playerId;
   bool get isCreated => _textureId != null && !_disposed;
 
   Duration _position = Duration.zero;
@@ -252,24 +324,36 @@ class NativePlayer {
 
   final _createdCompleter = Completer<int>();
 
-  Future<int> create(String cdnUrl, String keyHex) {
+  /// 起播位置（毫秒）：> 0 才下发；原生在 prepare() 前应用，不是装载后再 seek。
+  Future<int> create(String cdnUrl, String keyHex, {int? startMs}) {
     if (_disposed) {
       return Future<int>.error(StateError('NativePlayer is disposed'));
     }
-    return _createFuture ??= _create(cdnUrl, keyHex);
+    return _createFuture ??= _create(cdnUrl, keyHex, startMs);
   }
 
-  Future<int> _create(String cdnUrl, String keyHex) async {
+  Future<int> _create(String cdnUrl, String keyHex, int? startMs) async {
     _ensureGlobalListener();
-    // Disposal or an early native error can finish this future before the
-    // method reply supplies an id. Observe errors now; the await below still
-    // propagates them to create's caller.
+    // An early native error can finish this future before the reply supplies an
+    // id; observe it now, the await below still rethrows to create's caller.
     _createdCompleter.future.ignore();
     try {
       final reply = _channel
           .invokeMapMethod<String, dynamic>('create', {
             'cdnUrl': cdnUrl,
             'keyHex': keyHex,
+            // 起播位置：原生在 prepare() 前应用，省一次「先按 0 开流再 seek」。
+            if (startMs != null && startMs > 0) 'startPositionMs': startMs,
+            // 解码器偏好必须是**已解析的值**：create 在起播关键路径上，await 读盘会让没有
+            // 初始化插件的测试与冷启动挂住；由 `DecoderPreferenceCache` 在启动/变更时维护。
+            'videoDecoder': DecoderPreferenceCache.current.name,
+            // 纯音频播放器才带上变速引擎：视频用内建 Sonic（音频与视频必须同步计时），
+            // 只有听书能选系统混音器变速（issue #129）。值同样取内存里的偏好（启动时
+            // load 过），理由与解码器偏好相同：起播路径上不能 await 读盘。
+            if (audioOnly) ...{
+              'audioOnly': true,
+              'audioRateEngine': AudioRateEngineCache.current.name,
+            },
           })
           .then((result) async {
             final rawPlayerId = result?['playerId'];
@@ -303,13 +387,15 @@ class NativePlayer {
       if (_disposed) {
         throw StateError('NativePlayer was disposed during creation');
       }
-      // _textureId is maintained by the event handler, not by the completer's
-      // value: a textureChanged that arrived with the pending replay (native
-      // posts created → decoderInitialized → textureChanged in order) already
-      // superseded the created id, and assigning the completer's stale value
-      // here would resurrect the dead texture.
+      // _textureId comes from the event handler, not the completer: a replayed
+      // textureChanged already superseded the created id, so assigning the stale
+      // completer value here would resurrect the dead texture.
       if (_textureId == null) {
         throw StateError('Native player returned no texture id');
+      }
+      if (startMs != null && startMs > 0) {
+        _position = Duration(milliseconds: startMs);
+        _positionCtrl.add(_position);
       }
       return _textureId!;
     } catch (_) {
@@ -350,9 +436,8 @@ class NativePlayer {
   Future<void> seek(Duration position) async {
     final generation = ++_seekGeneration;
     await _invoke('seek', {'positionMs': position.inMilliseconds});
-    // Record every natively acknowledged seek, not just the newest call. If a
-    // later overlapping seek fails, the position ExoPlayer actually accepted
-    // must survive instead of reverting to the stale pre-seek value.
+    // Record every acknowledged seek: if a later overlapping seek fails, the
+    // position ExoPlayer actually accepted must survive the stale pre-seek value.
     if (_disposed || generation <= _appliedSeekGeneration) return;
     _appliedSeekGeneration = generation;
     // ExoPlayer acknowledges seek before its next position tick. Preserve the
@@ -387,9 +472,15 @@ class NativePlayer {
 
   /// [positionMs] / [durationMs] / [speed] 喂给系统媒体卡片：位置 + 倍速由系统外推，
   /// 总时长决定卡片两侧的时间。缺省 0/0/1 时卡片显示 00:00，所以调用方要尽量给真实值。
+  ///
+  /// [coverUrl] 是当前在读/在听内容的封面地址。官方（`dn2/i.java`
+  /// `PlayNotificationImpl`）把它下载成 Bitmap 后同时写进通知的
+  /// `setLargeIcon` 与媒体会话的 `METADATA_KEY_ALBUM_ART`，系统媒体卡片、
+  /// 锁屏与通知左上角显示的都是它；拿不到或下载失败时退回应用图标。
   static Future<void> startListenForeground({
     required String title,
     required String episode,
+    String coverUrl = '',
     bool playing = true,
     bool hasPrev = true,
     bool hasNext = true,
@@ -405,6 +496,7 @@ class NativePlayer {
       await _channel.invokeMethod<void>('startListenForeground', {
         'title': title,
         'episode': episode,
+        'coverUrl': coverUrl,
         'playing': playing,
         'hasPrev': hasPrev,
         'hasNext': hasNext,
@@ -423,6 +515,178 @@ class NativePlayer {
       await _channel.invokeMethod<void>('stopListenForeground');
     } catch (_) {
       // Best effort when channel/platform is unavailable or testing.
+    }
+  }
+
+  /// 悬浮窗权限：Android 需要用户在系统设置里允许“显示在其他应用的上层”。
+  static Future<bool> canDrawOverlays() async {
+    try {
+      final granted = await _channel
+          .invokeMethod<bool>('canDrawOverlays')
+          .timeout(_methodTimeout);
+      return granted ?? false;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /// 打开系统悬浮窗权限设置页。返回 false 表示当前平台不需要或无法打开。
+  static Future<bool> requestOverlayPermission() async {
+    try {
+      final opened = await _channel.invokeMethod<bool>(
+        'requestOverlayPermission',
+      );
+      return opened ?? false;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  // Allocation precedes permissions and acquires no focus/service/surface.
+  static Future<int> allocateFloatingOwner() async {
+    _channel.setMethodCallHandler(_handleMethodCall);
+    var abandoned = false;
+    final operation = _channel.invokeMethod<int>('allocateFloatingOwner');
+    unawaited(
+      operation.then<void>((owner) {
+        if (abandoned && owner != null && owner > 0) {
+          unawaited(stopFloating(owner));
+        }
+      }, onError: (Object _) {}),
+    );
+    try {
+      final owner = await operation.timeout(_methodTimeout);
+      if (owner == null || owner <= 0) {
+        throw StateError('Invalid floating owner');
+      }
+      return owner;
+    } catch (_) {
+      abandoned = true;
+      rethrow;
+    }
+  }
+
+  static Future<void> startFloating({
+    required int owner,
+    required int playerId,
+    required String title,
+    required String episode,
+    bool playing = true,
+    bool hasPrev = true,
+    bool hasNext = true,
+    int positionMs = 0,
+    int durationMs = 0,
+    double speed = 1,
+    int videoWidth = 0,
+    int videoHeight = 0,
+  }) async {
+    final player = _instances[playerId];
+    if (player == null) throw StateError('Floating player unavailable');
+    // Keep the submitted player's lifecycle intent until the bounded native
+    // reply settles. The page pauses it on failure if it is still backgrounded.
+    _startingFloating[owner] = (player: player, stopped: false);
+    try {
+      await _channel
+          .invokeMethod<void>('startFloating', {
+            'owner': owner,
+            'playerId': playerId,
+            'title': title,
+            'episode': episode,
+            'playing': playing,
+            'hasPrev': hasPrev,
+            'hasNext': hasNext,
+            'positionMs': positionMs,
+            'durationMs': durationMs,
+            'speed': speed,
+            'videoWidth': videoWidth,
+            'videoHeight': videoHeight,
+          })
+          .timeout(_methodTimeout);
+      if (_startingFloating[owner]?.stopped != false) {
+        throw StateError('Floating start retired');
+      }
+      if (_floatingBinding == null || _floatingBinding!.owner <= owner) {
+        ++_floatingMove;
+        _bindFloating(owner, playerId);
+      }
+    } catch (_) {
+      await stopFloating(owner);
+      rethrow;
+    } finally {
+      _startingFloating.remove(owner);
+    }
+  }
+
+  static Future<void> showFloating(int owner) async {
+    try {
+      await _channel
+          .invokeMethod<void>('showFloating', {'owner': owner})
+          .timeout(_methodTimeout);
+    } catch (_) {
+      // Retirement fences any late command on native, even after a timeout.
+    }
+  }
+
+  static Future<void> updateFloating({
+    required int owner,
+    String? title,
+    String? episode,
+    bool? playing,
+    bool? hasPrev,
+    bool? hasNext,
+    int? positionMs,
+    int? durationMs,
+    double? speed,
+  }) async {
+    try {
+      await _channel
+          .invokeMethod<void>('updateFloating', {
+            'owner': owner,
+            'title': title,
+            'episode': episode,
+            'playing': playing,
+            'hasPrev': hasPrev,
+            'hasNext': hasNext,
+            'positionMs': positionMs,
+            'durationMs': durationMs,
+            'speed': speed,
+          })
+          .timeout(_methodTimeout);
+    } catch (_) {
+      // State updates cannot cross native ownership retirement.
+    }
+  }
+
+  static Future<void> stopFloating(int owner) async {
+    if (_startingFloating[owner] case final start?) {
+      _startingFloating[owner] = (player: start.player, stopped: true);
+    }
+    _clearFloatingBinding(owner);
+    try {
+      await _channel
+          .invokeMethod<void>('stopFloating', {'owner': owner})
+          .timeout(_methodTimeout);
+    } catch (_) {
+      // An old stop never clears another owner's binding or service.
+    }
+  }
+
+  static Future<void> swapFloatingPlayer({
+    required int owner,
+    required int playerId,
+  }) async {
+    if (_floatingBinding?.owner != owner) {
+      throw StateError('Floating owner retired');
+    }
+    final move = ++_floatingMove;
+    await _channel
+        .invokeMethod<void>('swapFloatingPlayer', {
+          'owner': owner,
+          'playerId': playerId,
+        })
+        .timeout(_methodTimeout);
+    if (_floatingBinding?.owner == owner && _floatingMove == move) {
+      _bindFloating(owner, playerId);
     }
   }
 
@@ -451,21 +715,25 @@ class NativePlayer {
   Future<void> _releaseNative() {
     final playerId = _playerId;
     if (playerId == null) return Future<void>.value();
-    return _nativeRelease ??= () {
-      _instances.remove(playerId);
-      _retire(playerId);
-      return _disposeNative(playerId);
-    }();
+    return _nativeRelease ??= _disposeNative(playerId);
   }
 
-  static Future<void> _disposeNative(int playerId) async {
+  Future<void> _disposeNative(int playerId) async {
+    _instances.remove(playerId);
+    _retire(playerId);
     try {
       await _channel
           .invokeMethod<void>('dispose', {'id': playerId})
           .timeout(_methodTimeout);
-    } catch (_) {
-      // Local state is already retired; native teardown is best effort when
-      // the engine/channel itself is shutting down.
+    } catch (error) {
+      // 本地状态已摘除，原生 teardown 仍尽力而为：失败不吞掉诊断（日志里
+      // 只留类型，异常文本可能带原生载荷），并清掉记忆化，让下一次释放
+      // （dispose 重入、迟到的 create 回复）还能重试。
+      AppLog.w(
+        'player-native',
+        'dispose failed playerId=$playerId (${error.runtimeType})',
+      );
+      _nativeRelease = null;
     }
   }
 

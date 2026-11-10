@@ -1,6 +1,6 @@
 //! `homepage_recommend` and `series_feed` endpoints.
-//! The private `reading724Params` builder below duplicates logic that the
-//! Rust `content_util` module does not expose.
+//! The `reading724Params` bag lives in `endpoints::base`; the wrapper below
+//! only adapts it to `Params` for this module and `search`.
 
 use futures::future::BoxFuture;
 use serde_json::Value;
@@ -16,38 +16,23 @@ const HOMEPAGE_RECOMMEND_PATH: &str = "/reading/bookapi/bookmall/tab/v";
 const SERIES_FEED_PATH: &str = "/reading/bookapi/bookmall/cell/change/v";
 const SERIES_RELATED_PATH: &str = "/reading/bookapi/plan/v";
 
-/// Go's `reading724Params` (content_util.go).
-fn reading724_params() -> Params {
-    let mut p = Params::new();
-    p.set("iid", "{install_id}");
-    p.set("device_id", "{device_id}");
-    p.set("ac", "wifi");
-    p.set("channel", "xiaomi_1967_64");
-    p.set("aid", "1967");
-    p.set("app_name", "novelapp");
-    p.set("version_code", "72432");
-    p.set("version_name", "7.2.4.32");
-    p.set("device_platform", "android");
-    p.set("os", "android");
-    p.set("ssmix", "a");
-    p.set("device_type", "25053RT47C");
-    p.set("device_brand", "Redmi");
-    p.set("language", "zh");
-    p.set("os_api", "36");
-    p.set("os_version", "16");
-    p.set("manifest_version_code", "72432");
-    p.set("resolution", "1280*2620");
-    p.set("dpi", "520");
-    p.set("update_version_code", "72432");
-    p.set("host_abi", "arm64-v8a");
-    p.set("dragon_device_type", "phone");
-    p.set("pv_player", "72432");
-    p.set("compliance_status", "0");
-    p.set("need_personal_recommend", "1");
-    p.set("player_so_load", "1");
-    p.set("is_android_pad_screen", "0");
-    p.set("rom_version", "miui_V816_OS3.0.9.0.WOLCNXM");
-    p
+/// Go's `reading724Params` (content_util.go), in `Params` form.
+pub(crate) fn reading724_params() -> Params {
+    Params::from_pairs(crate::endpoints::base::reading724_params())
+}
+/// 顶栏选中下标 `(tab_index, last_tab_index)`。
+///
+/// 上游按 `tab_index` 决定回哪个 tab 的 `cell_data`，只带 `tab_type` 不够：
+/// 这里曾经把它写死成 `"0"`，于是任何分类都拿回推荐流的区块——客户端表现为
+/// 「听书」里显示推荐榜/猜你喜欢。官方请求模型里 `tabIndex` / `lastTabIndex`
+/// 是正式字段（J:rpc/model/BookstoreTabRequest.java:130,182），选中下标由
+/// `m0.java:3091` 的 `setBookMallTabDataList(arrayList, i)` 维护。
+///
+/// 缺省时两者都退化成 "0"（老调用方只发 `tab_type`，与改动前一致）。
+fn strip_indexes(params: &Params) -> (String, String) {
+    let tab_index = default_val(&params.get_str("tab_index"), "0");
+    let last_tab_index = default_val(&params.get_str("last_tab_index"), tab_index.as_str());
+    (tab_index, last_tab_index)
 }
 
 fn homepage_recommend<'a>(ctx: &'a Ctx, params: &'a Params) -> BoxFuture<'a, ApiResult<Value>> {
@@ -55,13 +40,14 @@ fn homepage_recommend<'a>(ctx: &'a Ctx, params: &'a Params) -> BoxFuture<'a, Api
         let client_template = default_val(&params.get_str("client_template"), "0");
         let tab_type = default_val(&params.get_str("tab_type"), "2");
         let offset = default_val(&params.get_str("offset"), "0");
+        let (tab_index, last_tab_index) = strip_indexes(params);
         let session_id = params.get_str("session_id");
 
         let mut p = reading724_params();
         p.set("last_search_query_from_rec", "false");
         p.set("ClickedContent", "");
         p.set("client_template", client_template);
-        p.set("last_tab_index", "0");
+        p.set("last_tab_index", last_tab_index);
         p.set("screen_width_px", "1281");
         p.set("classic_tab_style", "v3");
         p.set("tab_type", tab_type);
@@ -83,7 +69,7 @@ fn homepage_recommend<'a>(ctx: &'a Ctx, params: &'a Params) -> BoxFuture<'a, Api
         p.set("cold_start_is_double_gd", "false");
         p.set("page_entry_time", "0");
         p.set("cold_start_session", "1");
-        p.set("tab_index", "0");
+        p.set("tab_index", tab_index);
         p.set("lore_tab_style", "v5");
         p.set("device_level", "3");
         p.set("unlimited_short_series_change_type", "0");
@@ -361,4 +347,47 @@ pub fn register(s: &mut Server) {
     s.add_route("channel_tabs", channel_tabs);
     s.add_route("series_feed", series_feed);
     s.add_route("series_related", series_related);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::strip_indexes;
+    use crate::endpoints::Params;
+
+    fn params(pairs: &[(&str, &str)]) -> Params {
+        Params::from_pairs(
+            pairs
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn audio_tab_reports_its_own_index() {
+        // 「听书」在本地六分类里是第 5 项。以前这里写死 "0"，上游就回推荐流
+        // 的区块，「听书」里画出推荐榜——真机复现过的那条路径。
+        let (tab_index, last_tab_index) =
+            strip_indexes(&params(&[("tab_type", "5"), ("tab_index", "5")]));
+        assert_eq!(tab_index, "5");
+        assert_eq!(last_tab_index, "5", "没带 last 时跟上当前下标");
+    }
+
+    #[test]
+    fn the_previous_index_is_forwarded_as_sent() {
+        let (tab_index, last_tab_index) = strip_indexes(&params(&[
+            ("tab_type", "5"),
+            ("tab_index", "5"),
+            ("last_tab_index", "0"),
+        ]));
+        assert_eq!(tab_index, "5");
+        assert_eq!(last_tab_index, "0");
+    }
+
+    #[test]
+    fn legacy_callers_still_land_on_the_first_tab() {
+        let (tab_index, last_tab_index) = strip_indexes(&params(&[("tab_type", "2")]));
+        assert_eq!(tab_index, "0");
+        assert_eq!(last_tab_index, "0");
+    }
 }

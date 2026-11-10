@@ -1,85 +1,82 @@
+import 'package:flutter/cupertino.dart';
 import 'package:flutter/material.dart';
-import 'package:flutter_lucide/flutter_lucide.dart';
 
 import '../../models/search_discovery.dart';
-import '../home/home_design.dart';
+import '../wenku/wenku_ui.dart';
 
-/// Suggestion list shown while the query is being typed.
-///
-/// Renders nothing when there is nothing to suggest, so the field simply has no
-/// dropdown rather than an empty panel.
+const double _searchGutter = 24;
+
+/// Query suggestions follow the archive's plain 48dp result rows.
 class SearchSuggestionList extends StatelessWidget {
   final List<SearchSuggestion> suggestions;
   final ValueChanged<String> onSelect;
+  final double topInset;
 
   const SearchSuggestionList({
     super.key,
     required this.suggestions,
     required this.onSelect,
+    this.topInset = 0,
   });
 
   @override
   Widget build(BuildContext context) {
-    final palette = HomePalette.of(context);
     if (suggestions.isEmpty) return const SizedBox.shrink();
-    return Material(
-      color: palette.surface,
-      child: ListView.separated(
-        key: const Key('search_suggestions'),
-        shrinkWrap: true,
-        padding: const EdgeInsets.symmetric(vertical: 4),
-        itemCount: suggestions.length,
-        separatorBuilder: (context, _) =>
-            Divider(height: 1, color: palette.line, indent: 52),
-        itemBuilder: (context, index) {
-          final suggestion = suggestions[index];
-          return InkWell(
-            key: ValueKey('search_suggestion_${suggestion.text}'),
-            onTap: () => onSelect(suggestion.text),
+    final scheme = Theme.of(context).colorScheme;
+    return ListView.separated(
+      key: const Key('search_suggestions'),
+      padding: EdgeInsets.only(top: topInset),
+      itemCount: suggestions.length,
+      separatorBuilder: (context, _) => Divider(
+        height: 1,
+        thickness: .7,
+        indent: _searchGutter,
+        endIndent: _searchGutter,
+      ),
+      itemBuilder: (context, index) {
+        final suggestion = suggestions[index];
+        return JellyTapSurface(
+          key: ValueKey('search_suggestion_${suggestion.text}'),
+          onTap: () => onSelect(suggestion.text),
+          child: SizedBox(
+            height: 48,
             child: Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+              padding: const EdgeInsets.symmetric(horizontal: _searchGutter),
               child: Row(
                 children: [
-                  Container(
-                    width: 26,
-                    height: 26,
-                    decoration: BoxDecoration(
-                      color: palette.soft,
-                      shape: BoxShape.circle,
-                    ),
-                    alignment: Alignment.center,
-                    child: Icon(LucideIcons.search, size: 13, color: palette.muted),
+                  ArchiveIcon(
+                    CupertinoIcons.search,
+                    size: 15,
+                    color: scheme.onSurfaceVariant,
                   ),
                   const SizedBox(width: 12),
-                  Expanded(
-                    child: _SuggestionText(
-                      suggestion: suggestion,
-                      palette: palette,
-                    ),
-                  ),
+                  Expanded(child: _SuggestionText(suggestion: suggestion)),
                 ],
               ),
             ),
-          );
-        },
-      ),
+          ),
+        );
+      },
     );
   }
 }
 
-/// The upstream marks the matched part with `<em>`; keep that emphasis rather
-/// than dropping it, since it shows why a suggestion matched.
+/// Keeps the upstream `<em>` match emphasis without introducing a second accent.
 class _SuggestionText extends StatelessWidget {
   final SearchSuggestion suggestion;
-  final HomePalette palette;
 
-  const _SuggestionText({required this.suggestion, required this.palette});
+  const _SuggestionText({required this.suggestion});
 
   @override
   Widget build(BuildContext context) {
-    final base = TextStyle(color: palette.ink, fontSize: 14);
+    final scheme = Theme.of(context).colorScheme;
+    final base = TextStyle(
+      color: scheme.onSurfaceVariant,
+      fontSize: 14,
+      height: 1.4,
+    );
     final marked = base.copyWith(
-      color: palette.accentText,
+      color: scheme.onSurface,
       fontWeight: FontWeight.w600,
     );
     final parts = _splitHighlight(suggestion.highlighted);
@@ -105,7 +102,6 @@ class _SuggestionText extends StatelessWidget {
     );
   }
 
-  /// Splits `<em>x</em>` into (text, isHighlighted) runs; the tags are dropped.
   static List<(String, bool)> _splitHighlight(String raw) {
     if (raw.isEmpty || !raw.contains('<em>')) return const [];
     final out = <(String, bool)>[];
@@ -129,8 +125,10 @@ class _SuggestionText extends StatelessWidget {
   }
 }
 
-/// The hot search board, shown when the query is empty.
+/// The hot board keeps fqapp's live discovery data in the upstream index style.
 class HotSearchBoard extends StatelessWidget {
+  static const maxRows = 10;
+
   final HotSearch hot;
   final ValueChanged<String> onSelect;
 
@@ -138,66 +136,108 @@ class HotSearchBoard extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final palette = HomePalette.of(context);
     if (hot.isEmpty) return const SizedBox.shrink();
-    return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 16),
-      child: Container(
-        padding: const EdgeInsets.fromLTRB(16, 14, 16, 16),
-        decoration: BoxDecoration(
-          color: palette.surface,
-          borderRadius: BorderRadius.circular(20),
-          border: Border.all(
-            color: palette.line,
-            width: 0.6,
-          ),
-          boxShadow: [
-            BoxShadow(
-              color: palette.ink.withValues(alpha: palette.dark ? 0.12 : 0.03),
-              blurRadius: 8,
-              offset: const Offset(0, 2),
-            ),
+    final entries = hot.entries.take(maxRows).toList(growable: false);
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        const ArchiveSection(
+          title: '热搜榜',
+          code: '02 / TRENDING INDEX',
+          subtitle: '按当前热度排列',
+        ),
+        const SizedBox(height: 10),
+        Column(
+          key: const Key('search_hot_words'),
+          children: [
+            for (var index = 0; index < entries.length; index++)
+              _HotRow(
+                entry: entries[index],
+                rank: index + 1,
+                onTap: () => onSelect(entries[index].title),
+              ),
           ],
         ),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
+      ],
+    );
+  }
+}
+
+class _HotRow extends StatelessWidget {
+  final HotSearchEntry entry;
+  final int rank;
+  final VoidCallback onTap;
+
+  const _HotRow({required this.entry, required this.rank, required this.onTap});
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    final top = rank <= 3;
+    return JellyTapSurface(
+      key: ValueKey('search_hot_${entry.title}'),
+      onTap: onTap,
+      child: SizedBox(
+        height: 44,
+        child: Row(
           children: [
-            Row(
-              children: [
-                Container(
-                  padding: const EdgeInsets.all(6),
-                  decoration: BoxDecoration(
-                    color: HomePalette.accent.withValues(alpha: 0.12),
-                    borderRadius: BorderRadius.circular(8),
-                  ),
-                  child: Icon(LucideIcons.flame, size: 15, color: HomePalette.accent),
+            SizedBox(
+              width: 22,
+              child: Text(
+                '$rank',
+                style: TextStyle(
+                  color: top ? scheme.onSurface : scheme.onSurfaceVariant,
+                  fontSize: top ? 14 : 12.5,
+                  height: 1.2,
+                  fontWeight: top ? FontWeight.w700 : FontWeight.w500,
+                  fontFeatures: const [FontFeature.tabularFigures()],
                 ),
-                const SizedBox(width: 8),
-                Text(
-                  '热搜榜',
+              ),
+            ),
+            Expanded(
+              child: Text(
+                entry.title,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(
+                  color: scheme.onSurface,
+                  fontSize: 13.5,
+                  height: 1.4,
+                  fontWeight: top ? FontWeight.w600 : FontWeight.w400,
+                ),
+              ),
+            ),
+            if (entry.badge.isNotEmpty) ...[
+              const SizedBox(width: 8),
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 2),
+                decoration: BoxDecoration(
+                  color: scheme.onSurface.withValues(alpha: .055),
+                  borderRadius: BorderRadius.circular(4),
+                ),
+                child: Text(
+                  entry.badge,
                   style: TextStyle(
-                    color: palette.ink,
-                    fontSize: 15,
-                    fontWeight: FontWeight.w700,
+                    color: scheme.onSurfaceVariant,
+                    fontSize: 9.5,
+                    height: 1.2,
+                    fontWeight: FontWeight.w600,
                   ),
                 ),
-              ],
-            ),
-            const SizedBox(height: 12),
-            Wrap(
-              key: const Key('search_hot_words'),
-              spacing: 8,
-              runSpacing: 8,
-              children: [
-                for (var i = 0; i < hot.words.length; i++)
-                  _HotChip(
-                    word: hot.words[i],
-                    rank: i + 1,
-                    hot: i < 3,
-                    onTap: () => onSelect(hot.words[i]),
-                  ),
-              ],
-            ),
+              ),
+            ],
+            if (entry.hotValue.isNotEmpty) ...[
+              const SizedBox(width: 8),
+              Text(
+                entry.hotValue,
+                style: TextStyle(
+                  color: scheme.onSurfaceVariant,
+                  fontSize: 11,
+                  height: 1.2,
+                  fontFeatures: const [FontFeature.tabularFigures()],
+                ),
+              ),
+            ],
           ],
         ),
       ),
@@ -205,77 +245,145 @@ class HotSearchBoard extends StatelessWidget {
   }
 }
 
-class _HotChip extends StatelessWidget {
-  final String word;
-  final int rank;
-  final bool hot;
-  final VoidCallback onTap;
+/// Search landing content: the upstream `RecentSearches` block first (omitted
+/// when empty, as upstream), then fqapp's live hot index.
+class SearchDiscoveryView extends StatelessWidget {
+  final HotSearch hot;
+  final List<String> history;
+  final bool historyLoading;
+  final String filter;
+  final ValueChanged<String> onSearch;
+  final VoidCallback onClearHistory;
+  final ValueChanged<String> onRemoveHistory;
+  final double topInset;
 
-  const _HotChip({
-    required this.word,
-    required this.rank,
+  const SearchDiscoveryView({
+    super.key,
     required this.hot,
-    required this.onTap,
+    required this.history,
+    required this.historyLoading,
+    required this.filter,
+    required this.onSearch,
+    required this.onClearHistory,
+    required this.onRemoveHistory,
+    this.topInset = 0,
   });
 
   @override
   Widget build(BuildContext context) {
-    final palette = HomePalette.of(context);
-    return HomePressable(
-      key: ValueKey('search_hot_$word'),
-      semanticLabel: '搜索 $word',
-      onTap: onTap,
-      borderRadius: BorderRadius.circular(999),
-      child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 7),
-        decoration: BoxDecoration(
-          color: hot
-              ? HomePalette.accent.withValues(alpha: palette.dark ? 0.16 : 0.08)
-              : palette.soft,
-          borderRadius: BorderRadius.circular(999),
-          border: Border.all(
-            color: hot
-                ? HomePalette.accent.withValues(alpha: 0.28)
-                : palette.line,
-            width: 0.5,
+    final visible = filter.isEmpty
+        ? history
+        : history
+              .where((item) => item.toLowerCase().contains(filter))
+              .toList(growable: false);
+    final showHot = filter.isEmpty && hot.isNotEmpty;
+    return ListView(
+      padding: EdgeInsets.fromLTRB(
+        _searchGutter,
+        topInset,
+        _searchGutter,
+        // Search covers the dock, so only the safe area is cleared (upstream
+        // `InlineSearchResults`).
+        MediaQuery.paddingOf(context).bottom + 24,
+      ),
+      keyboardDismissBehavior: ScrollViewKeyboardDismissBehavior.onDrag,
+      children: [
+        if (!historyLoading && visible.isNotEmpty)
+          _RecentSearches(
+            queries: visible,
+            onRecall: onSearch,
+            onClear: onClearHistory,
+            onRemove: onRemoveHistory,
           ),
-        ),
-        child: Row(
-          mainAxisSize: MainAxisSize.min,
+        if (showHot)
+          HotSearchBoard(hot: hot, onSelect: onSearch)
+        else if (!historyLoading && visible.isEmpty)
+          AppText(
+            filter.isEmpty ? '搜索名称或作品 ID，开始寻找故事。' : '没有匹配的搜索记录',
+            style: TextStyle(
+              color: Theme.of(context).colorScheme.onSurfaceVariant,
+            ),
+          ),
+      ],
+    );
+  }
+}
+
+/// Upstream `recent_searches.dart`. fqapp keeps per-query removal: a long
+/// press removes one entry instead of a permanent × on every chip.
+class _RecentSearches extends StatelessWidget {
+  const _RecentSearches({
+    required this.queries,
+    required this.onRecall,
+    required this.onClear,
+    required this.onRemove,
+  });
+
+  final List<String> queries;
+  final ValueChanged<String> onRecall;
+  final VoidCallback onClear;
+  final ValueChanged<String> onRemove;
+
+  @override
+  Widget build(BuildContext context) => Padding(
+    padding: const EdgeInsets.only(bottom: 22),
+    child: Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Row(
           children: [
-            if (hot) ...[
-              Container(
-                width: 15,
-                height: 15,
-                alignment: Alignment.center,
-                decoration: BoxDecoration(
-                  color: HomePalette.accent,
-                  shape: BoxShape.circle,
-                ),
-                child: Text(
-                  '$rank',
-                  style: const TextStyle(
-                    color: Colors.white,
-                    fontSize: 9.5,
-                    fontWeight: FontWeight.w700,
-                    height: 1,
-                  ),
-                ),
+            const Expanded(
+              child: AppText(
+                '最近搜索',
+                style: TextStyle(fontWeight: FontWeight.w600),
               ),
-              const SizedBox(width: 5),
-            ],
-            Text(
-              word,
-              style: TextStyle(
-                color: hot ? palette.accentText : palette.ink,
-                fontSize: 12.5,
-                fontWeight: hot ? FontWeight.w600 : FontWeight.w400,
-                height: 1.3,
-              ),
+            ),
+            GlassIconButton(
+              icon: CupertinoIcons.trash,
+              label: '清空最近搜索',
+              onPressed: onClear,
             ),
           ],
         ),
-      ),
-    );
-  }
+        Wrap(
+          spacing: 8,
+          runSpacing: 6,
+          children: [
+            for (final query in queries)
+              Semantics(
+                onLongPressHint: '删除这条记录',
+                child: GestureDetector(
+                  onLongPress: () {
+                    AppHaptics.play(context, HapticCue.action);
+                    onRemove(query);
+                  },
+                  child: JellyTapSurface(
+                    key: ValueKey('search_history_$query'),
+                    onTap: () => onRecall(query),
+                    child: Container(
+                      constraints: const BoxConstraints(minHeight: 44),
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 14,
+                        vertical: 11,
+                      ),
+                      decoration: BoxDecoration(
+                        color: Theme.of(
+                          context,
+                        ).colorScheme.onSurface.withValues(alpha: .055),
+                        borderRadius: BorderRadius.circular(18),
+                      ),
+                      child: AppText(
+                        query,
+                        maxLines: 2,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+          ],
+        ),
+      ],
+    ),
+  );
 }

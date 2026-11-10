@@ -1,6 +1,7 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
+import 'package:flutter_lucide/flutter_lucide.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:fqapp/models/audio_extra.dart';
 import 'package:fqapp/models/chapter_media.dart';
@@ -71,13 +72,13 @@ void main() {
     final player = session.players.single;
     expect(player.isPlaying, isTrue);
 
-    await tester.tap(find.byTooltip('定时'));
+    await tester.tap(find.byKey(const Key('audio_sleep')));
     await tester.pumpAndSettle();
     await tester.tap(find.text('15 分钟后'));
     await tester.pumpAndSettle();
 
     // Reopen the sheet and dismiss it without picking an option.
-    await tester.tap(find.byTooltip('定时'));
+    await tester.tap(find.byKey(const Key('audio_sleep')));
     await tester.pumpAndSettle();
     await tester.tapAt(const Offset(5, 5));
     await tester.pumpAndSettle();
@@ -138,7 +139,7 @@ void main() {
     final tile = find.byKey(const ValueKey('voice_option_96'));
     expect(tile, findsOneWidget);
     expect(
-      find.descendant(of: tile, matching: find.byIcon(Icons.check)),
+      find.descendant(of: tile, matching: find.byIcon(LucideIcons.check)),
       findsOneWidget,
     );
   });
@@ -158,9 +159,7 @@ void main() {
       ),
       directory: (bookId) async {
         opened.add(bookId);
-        return [
-          Chapter(itemId: 'ab-1', title: '001 第一章', volumeName: ''),
-        ];
+        return [Chapter(itemId: 'ab-1', title: '001 第一章', volumeName: '')];
       },
     );
     await _mount(tester, session);
@@ -176,8 +175,9 @@ void main() {
       session.requests.where((r) => r.endsWith(':7239243941252598845')),
       isEmpty,
     );
-    // The page title stays the same when a narrator version is opened.
-    expect(find.text('听书'), findsOneWidget);
+    // The shared listening header keeps the same page identity after switching.
+    expect(find.byKey(const Key('audio_mode_tts')), findsOneWidget);
+    expect(find.byKey(const Key('audio_mode_narrator')), findsOneWidget);
   });
 
   testWidgets('a narrator version numbered only by episode stays aligned', (
@@ -282,7 +282,7 @@ void main() {
     final tile = find.byKey(const ValueKey('voice_option_96'));
     expect(tile, findsOneWidget);
     expect(
-      find.descendant(of: tile, matching: find.byIcon(Icons.check)),
+      find.descendant(of: tile, matching: find.byIcon(LucideIcons.check)),
       findsNothing,
     );
   });

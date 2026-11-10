@@ -1,10 +1,13 @@
 import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
+import 'package:flutter_lucide/flutter_lucide.dart';
 import 'package:cached_network_image/cached_network_image.dart';
 import 'package:lottie/lottie.dart';
 
 import '../../models/media_item.dart';
+import '../home/home_design.dart';
+import 'player_toast.dart';
 
 /// 官方选集格子（`bbw.xml` + `hj3/r0.java` + colors.xml）：
 /// 当前集 文字 `@color/aok`=#FFFA6725、底 `@color/aom`=#1AFA6725、粗体；
@@ -20,9 +23,10 @@ const _watchedText = Color(0x66000000);
 /// = @color/skin_color_black_light = #FF000000。
 ///
 /// 注意别拿成深色皮肤的 `…_normal_dark` = #CCFFFFFF（白字）——那是配官方
-/// 深色面板的。本面板固定浅色（白底，见 `_panelSheet` 的 Colors.white），
-/// 错用深肤变体就是「浅灰格上白字」，数字几乎不可见（2026-09-27 真机截图
-/// 复盘；官方取值见 apktool `res/values/colors.xml:37,3293`）。
+/// 深色面板的。浅色下本面板仍是白底，错用深肤变体就是「浅灰格上白字」，
+/// 数字几乎不可见（2026-09-27 真机截图复盘；官方取值见 apktool
+/// `res/values/colors.xml:37,3293`）。深色 / OLED 由 [_episodeTextColor]
+/// 换成色板色，不再经过这个常量。
 const _normalText = Color(0xFF000000);
 
 /// 官方不可播格文字 `..._text_disable_light` = #33000000。
@@ -39,8 +43,12 @@ const _tileBg = Color(0x08000000);
 /// - 不可播：字 `..._text_disable_light`=#33000000，点击 Toast「该选集暂时无法播放」
 /// - 已看：字 `..._text_played_light`=#66000000
 /// - 普通：字 `..._text_normal_light`=@color/skin_color_black_light=#FF000000
-///   （深肤变体 `…_normal_dark`=#CCFFFFFF 配的是深色面板，本面板是浅色）
+///   （深肤变体 `…_normal_dark`=#CCFFFFFF 配的是深色面板；本仓库深色另走
+///   色板，见 [_episodeTextColor]）
 /// - 普通格底 `skin_color_gray_03_light`=#08000000
+///
+/// 取值只在浅色皮肤下直接生效；深色 / OLED 的格子字色与底色由
+/// [_episodeTextColor] 与 [_episodeTileBackground] 按色板换算。
 enum EpisodeTileState {
   normal,
   current,
@@ -58,6 +66,8 @@ enum EpisodeTileState {
     return EpisodeTileState.normal;
   }
 
+  /// 浅色皮肤下的格子字色（官方颜色，见上面的对照表）。深色 / OLED 由
+  /// [_episodeTextColor] 换成色板色。
   Color get textColor => switch (this) {
     EpisodeTileState.current => _currentText,
     EpisodeTileState.disabled => _disabledText,
@@ -65,6 +75,7 @@ enum EpisodeTileState {
     EpisodeTileState.normal => _normalText,
   };
 
+  /// 浅色皮肤下的格子底色。
   Color get backgroundColor =>
       this == EpisodeTileState.current ? _currentBg : _tileBg;
 
@@ -72,15 +83,32 @@ enum EpisodeTileState {
       this == EpisodeTileState.current ? FontWeight.bold : FontWeight.normal;
 }
 
+/// 深色主题下格子字色跟随色板；浅色保持官方浅肤取值。
+Color _episodeTextColor(EpisodeTileState state, HomePalette palette) {
+  if (!palette.dark) return state.textColor;
+  return switch (state) {
+    EpisodeTileState.current => _currentText,
+    EpisodeTileState.disabled => const Color(0x40FFFFFF),
+    EpisodeTileState.watched => palette.muted,
+    EpisodeTileState.normal => palette.ink,
+  };
+}
+
+/// 普通格底色 `#08000000` 在深色面板上不可见，换成一层亮 overlay。
+Color _episodeTileBackground(bool current, HomePalette palette) =>
+    current ? _currentBg : (palette.dark ? const Color(0x14FFFFFF) : _tileBg);
+
 /// 官方选集格子文案（`hj3/r0.java:413-419`）：预告 -> 「预告」（`epd`）、
 /// 推荐流插入项 -> 「高光」（`esr`），其余是纯序号。
 String episodeTileLabel({
   required int index,
   bool trailer = false,
   bool highlight = false,
+  bool hasKnownIndex = true,
 }) {
   if (trailer) return '预告';
   if (highlight) return '高光';
+  if (!hasKnownIndex) return '当前';
   return '${index + 1}';
 }
 
@@ -115,15 +143,21 @@ class _HeaderCoverFallback extends StatelessWidget {
   const _HeaderCoverFallback();
 
   @override
-  Widget build(BuildContext context) => Container(
-    width: 64,
-    height: 86,
-    decoration: BoxDecoration(
-      color: const Color(0xFFEDEDF0),
-      borderRadius: BorderRadius.circular(6),
-    ),
-    child: const Icon(Icons.movie_creation_outlined, color: Color(0xFF9499A0)),
-  );
+  Widget build(BuildContext context) {
+    final palette = HomePalette.of(context);
+    return Container(
+      width: 64,
+      height: 86,
+      decoration: BoxDecoration(
+        color: palette.dark ? palette.soft : const Color(0xFFEDEDF0),
+        borderRadius: BorderRadius.circular(6),
+      ),
+      child: Icon(
+        Icons.movie_creation_outlined,
+        color: palette.dark ? palette.muted : const Color(0xFF9499A0),
+      ),
+    );
+  }
 }
 
 /// 官方头部集数/状态文案（`a1.java:554-568` 的 `A2()` 与 `:2034-2056` 的 `o1()`）。
@@ -173,7 +207,7 @@ class SeriesStatus {
 /// 官方长剧分页（`gj3/o.java:731` `setGroupByCount(30)`）：每 30 集一组
 /// 「1-30/31-60/…」，>30 集出现、滚动联动，≤30 隐藏。
 const _pageSize = 30;
-const _columns = 6;
+const _defaultColumns = 6;
 
 class StoryPlayerPanel extends StatefulWidget {
   final ScrollController scrollController;
@@ -209,6 +243,14 @@ class StoryPlayerPanel extends StatefulWidget {
   final GestureDragEndCallback onDragEnd;
   final GestureDragCancelCallback onDragCancel;
 
+  /// 嵌进播放页分屏时置 true：去掉 grabber、sheet 背景与内部标题行，
+  /// 头部与背景由外层 [PlayerSplitPanel] 提供；网格、分页与当前集定位
+  /// 逻辑保持不变。
+  final bool embedded;
+
+  /// 选集网格列数：竖屏 sheet 6 列，横屏右侧分栏 4 列。
+  final int columns;
+
   const StoryPlayerPanel({
     super.key,
     required this.scrollController,
@@ -230,6 +272,8 @@ class StoryPlayerPanel extends StatefulWidget {
     required this.onDragUpdate,
     required this.onDragEnd,
     required this.onDragCancel,
+    this.embedded = false,
+    this.columns = _defaultColumns,
   });
 
   @override
@@ -265,10 +309,14 @@ class _StoryPlayerPanelState extends State<StoryPlayerPanel> {
     super.dispose();
   }
 
+  int get _columns => widget.columns;
+
   /// 头部剧信息区只有在宿主给了剧名或集数文案时才出现（官方该区块常显，
-  /// 本地没有数据源时不显示，避免出现空壳封面）。
+  /// 本地没有数据源时不显示，避免出现空壳封面）。embedded 由外层
+  /// [PlayerSplitPanel] 展示剧信息，这里不再重复。
   bool get _hasHeader =>
-      widget.seriesTitle.isNotEmpty || widget.episodeLabel.isNotEmpty;
+      !widget.embedded &&
+      (widget.seriesTitle.isNotEmpty || widget.episodeLabel.isNotEmpty);
 
   double get _headerHeight => 12 + 96;
 
@@ -277,7 +325,7 @@ class _StoryPlayerPanelState extends State<StoryPlayerPanel> {
   /// 收藏 `ddg`。免费角标：文 `@string/c3q`「免费观看」、
   /// 字色 `skin_color_green_brand_light`=#FF00AE83、
   /// 底 `skin_color_green_brand_10_light`=#1A00AE83（`colors.xml`）。
-  Widget _seriesHeader() => Padding(
+  Widget _seriesHeader(HomePalette palette) => Padding(
     padding: const EdgeInsets.fromLTRB(16, 4, 16, 0),
     child: Row(
       children: [
@@ -311,20 +359,20 @@ class _StoryPlayerPanelState extends State<StoryPlayerPanel> {
                         widget.seriesTitle.isEmpty ? '短剧' : widget.seriesTitle,
                         maxLines: 1,
                         overflow: TextOverflow.ellipsis,
-                        style: const TextStyle(
+                        style: TextStyle(
                           fontSize: 16,
                           fontWeight: FontWeight.bold,
-                          color: Color(0xFF1B1B1B),
+                          color: palette.ink,
                         ),
                       ),
                     ),
                     if (widget.onOpenSeries != null)
-                      const Padding(
-                        padding: EdgeInsets.only(left: 2),
+                      Padding(
+                        padding: const EdgeInsets.only(left: 2),
                         child: Icon(
                           Icons.chevron_right_rounded,
                           size: 18,
-                          color: Color(0xFF9499A0),
+                          color: palette.muted,
                         ),
                       ),
                   ],
@@ -359,10 +407,7 @@ class _StoryPlayerPanelState extends State<StoryPlayerPanel> {
                       key: const ValueKey('story-panel-episode-label'),
                       maxLines: 1,
                       overflow: TextOverflow.ellipsis,
-                      style: const TextStyle(
-                        fontSize: 13,
-                        color: Color(0xFF9499A0),
-                      ),
+                      style: TextStyle(fontSize: 13, color: palette.muted),
                     ),
                 ],
               ),
@@ -469,9 +514,7 @@ class _StoryPlayerPanelState extends State<StoryPlayerPanel> {
     if (index >= 0 &&
         index < widget.episodes.length &&
         widget.episodes[index].disabled) {
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(const SnackBar(content: Text('该选集暂时无法播放')));
+      PlayerToast.show(context, '该选集暂时无法播放');
       return;
     }
     widget.onSelectEpisode(index);
@@ -479,6 +522,7 @@ class _StoryPlayerPanelState extends State<StoryPlayerPanel> {
 
   @override
   Widget build(BuildContext context) {
+    final palette = HomePalette.of(context);
     final scale = MediaQuery.textScalerOf(context);
     final tabHeight = math.max(
       widget.onOpenRelatedSeries == null ? 40.0 : 48.0,
@@ -493,151 +537,169 @@ class _StoryPlayerPanelState extends State<StoryPlayerPanel> {
     // A sheet-height change only needs layout. Keep the existing header and
     // lazy list children; state/data/text-scale changes create a fresh build.
     Widget? contents;
-    return Theme(
-      data: ThemeData.light(useMaterial3: true),
-      child: Material(
-        key: const ValueKey('story-panel'),
-        color: Colors.white,
-        // 官方 `skin_bg_short_series_episode_dialog`：顶部圆角 16dp。
-        borderRadius: const BorderRadius.vertical(top: Radius.circular(16)),
-        clipBehavior: Clip.antiAlias,
-        child: LayoutBuilder(
-          builder: (context, constraints) {
-            _tileHeight = math.max(
-              44.0,
-              ((constraints.maxWidth - 24 - (_columns - 1) * 8) / _columns) *
-                  52 /
-                  53,
-            );
-            _locateEpisode();
-            // While the sheet closes, clip the fixed header instead of
-            // squeezing its controls into a zero-height Column.
-            return OverflowBox(
-              alignment: Alignment.topCenter,
-              minHeight: math.max(headerHeight, constraints.maxHeight),
-              maxHeight: math.max(headerHeight, constraints.maxHeight),
-              child: contents ??= Column(
-                children: [
-                  GestureDetector(
-                    key: const ValueKey('story-panel-drag'),
-                    behavior: HitTestBehavior.opaque,
-                    onVerticalDragStart: widget.onDragStart,
-                    onVerticalDragUpdate: widget.onDragUpdate,
-                    onVerticalDragEnd: widget.onDragEnd,
-                    onVerticalDragCancel: widget.onDragCancel,
-                    child: Column(
-                      children: [
-                        SizedBox(
-                          height: 12,
-                          child: Center(
-                            child: Container(
-                              // 官方 grabber：36×4dp、`@drawable/yt` 圆角 2、
-                              // `#1A000000`（`aa8.xml:6`）。
-                              width: 36,
-                              height: 4,
-                              decoration: BoxDecoration(
-                                color: const Color(0x1A000000),
-                                borderRadius: BorderRadius.circular(2),
+    final body = LayoutBuilder(
+      builder: (context, constraints) {
+        _tileHeight = math.max(
+          44.0,
+          ((constraints.maxWidth - 24 - (_columns - 1) * 8) / _columns) *
+              52 /
+              53,
+        );
+        _locateEpisode();
+        if (widget.embedded) {
+          // 分屏面板已有固定头部与 Tab 行，这里只保留分页条和网格；
+          // 外层 Expanded 给出有界高度，不需要 sheet 的 OverflowBox。
+          return Column(
+            children: [
+              if (showPaging) _pagingStrip(palette),
+              Expanded(child: _episodes(palette)),
+            ],
+          );
+        }
+        // While the sheet closes, clip the fixed header instead of
+        // squeezing its controls into a zero-height Column.
+        return OverflowBox(
+          alignment: Alignment.topCenter,
+          minHeight: math.max(headerHeight, constraints.maxHeight),
+          maxHeight: math.max(headerHeight, constraints.maxHeight),
+          child: contents ??= Column(
+            children: [
+              GestureDetector(
+                key: const ValueKey('story-panel-drag'),
+                behavior: HitTestBehavior.opaque,
+                onVerticalDragStart: widget.onDragStart,
+                onVerticalDragUpdate: widget.onDragUpdate,
+                onVerticalDragEnd: widget.onDragEnd,
+                onVerticalDragCancel: widget.onDragCancel,
+                child: Column(
+                  children: [
+                    SizedBox(
+                      height: 12,
+                      child: Center(
+                        child: Container(
+                          // 官方 grabber：36×4dp、`@drawable/yt` 圆角 2、
+                          // `#1A000000`（`aa8.xml:6`）。
+                          width: 36,
+                          height: 4,
+                          decoration: BoxDecoration(
+                            color: palette.dark
+                                ? const Color(0x33FFFFFF)
+                                : const Color(0x1A000000),
+                            borderRadius: BorderRadius.circular(2),
+                          ),
+                        ),
+                      ),
+                    ),
+                    if (_hasHeader)
+                      SizedBox(
+                        key: const ValueKey('story-panel-series-header'),
+                        height: _headerHeight,
+                        child: _seriesHeader(palette),
+                      ),
+                    // 官方关联原著条（`aa8.xml:17` 的 `gnh`；左右各 16dp、
+                    // 底 24dp 外边距）。配置默认关，宿主不给数据就不显示。
+                    if (widget.relateBook != null)
+                      Padding(
+                        key: const ValueKey('story-panel-relate-book'),
+                        padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
+                        child: _relateBookRow(widget.relateBook!, palette),
+                      ),
+                    SizedBox(
+                      height: tabHeight,
+                      child: Row(
+                        children: [
+                          // 官方单 tab「选集」：14sp 粗体 `#FF1B1B1B`、
+                          // padding 20/13、无下划线指示器（`hj3/p.java:97-124`）。
+                          Padding(
+                            padding: const EdgeInsets.only(left: 20),
+                            child: Text(
+                              '选集',
+                              style: TextStyle(
+                                fontSize: 14,
+                                height: 1.0,
+                                fontWeight: FontWeight.bold,
+                                color: palette.ink,
+                                leadingDistribution:
+                                    TextLeadingDistribution.even,
                               ),
                             ),
                           ),
-                        ),
-                        if (_hasHeader)
-                          SizedBox(
-                            key: const ValueKey('story-panel-series-header'),
-                            height: _headerHeight,
-                            child: _seriesHeader(),
-                          ),
-                        // 官方关联原著条（`aa8.xml:17` 的 `gnh`；左右各 16dp、
-                        // 底 24dp 外边距）。配置默认关，宿主不给数据就不显示。
-                        if (widget.relateBook != null)
-                          Padding(
-                            key: const ValueKey('story-panel-relate-book'),
-                            padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
-                            child: _relateBookRow(widget.relateBook!),
-                          ),
-                        SizedBox(
-                          height: tabHeight,
-                          child: Row(
-                            children: [
-                              // 官方单 tab「选集」：14sp 粗体 `#FF1B1B1B`、
-                              // padding 20/13、无下划线指示器（`hj3/p.java:97-124`）。
-                              Padding(
-                                padding: const EdgeInsets.only(left: 20),
-                                child: Text(
-                                  '选集',
-                                  style: TextStyle(
-                                    fontSize: 14,
-                                    height: 1.0,
-                                    fontWeight: FontWeight.bold,
-                                    color: const Color(0xFF1B1B1B),
-                                    leadingDistribution:
-                                        TextLeadingDistribution.even,
-                                  ),
-                                ),
+                          const Spacer(),
+                          if (widget.onOpenRelatedSeries != null)
+                            TextButton(
+                              key: const ValueKey('story-panel-related-series'),
+                              onPressed: widget.onOpenRelatedSeries,
+                              // 按钮色走 palette：原来面板自建 ThemeData 丢掉
+                              // 了外层 colorScheme，这个按钮会落到 Material
+                              // 默认主色（紫蓝）。
+                              style: TextButton.styleFrom(
+                                foregroundColor: palette.accentText,
                               ),
-                              const Spacer(),
-                              if (widget.onOpenRelatedSeries != null)
-                                TextButton(
-                                  key: const ValueKey(
-                                    'story-panel-related-series',
-                                  ),
-                                  onPressed: widget.onOpenRelatedSeries,
-                                  child: const Text('同系列'),
-                                ),
-                            ],
-                          ),
-                        ),
-                      ],
+                              child: const Text('同系列'),
+                            ),
+                        ],
+                      ),
                     ),
-                  ),
-                  if (showPaging) _pagingStrip(),
-                  Expanded(child: _episodes()),
-                ],
+                  ],
+                ),
               ),
-            );
-          },
-        ),
-      ),
+              if (showPaging) _pagingStrip(palette),
+              Expanded(child: _episodes(palette)),
+            ],
+          ),
+        );
+      },
+    );
+    // 面板跟随外层主题（不再自建 ThemeData，否则丢 colorScheme 与深色预设）。
+    if (widget.embedded) {
+      return KeyedSubtree(key: const ValueKey('story-panel'), child: body);
+    }
+    return Material(
+      key: const ValueKey('story-panel'),
+      // 官方 `skin_bg_short_series_episode_dialog`：顶部圆角 16dp；
+      // 深色 / OLED 取浮层色，和听书/评论弹层同一规则。
+      color: homeSheetColor(palette),
+      shape: homeSheetShape(palette, top: 16),
+      clipBehavior: Clip.antiAlias,
+      child: body,
     );
   }
 
   /// 官方关联原著条：封面 + 书名，右侧箭头（`aa8.xml:17` 的 `gnh`）。
-  Widget _relateBookRow(EpisodeRelateBook book) => GestureDetector(
-    behavior: HitTestBehavior.opaque,
-    onTap: widget.onOpenRelateBook,
-    child: Container(
-      height: 56,
-      padding: const EdgeInsets.symmetric(horizontal: 8),
-      decoration: BoxDecoration(
-        color: const Color(0x0A000000),
-        borderRadius: BorderRadius.circular(8),
-      ),
-      child: Row(
-        children: [
-          ClipRRect(
-            borderRadius: BorderRadius.circular(4),
-            child: _relateCover(book.cover),
+  Widget _relateBookRow(EpisodeRelateBook book, HomePalette palette) =>
+      GestureDetector(
+        behavior: HitTestBehavior.opaque,
+        onTap: widget.onOpenRelateBook,
+        child: Container(
+          height: 56,
+          padding: const EdgeInsets.symmetric(horizontal: 8),
+          decoration: BoxDecoration(
+            color: palette.dark
+                ? const Color(0x14FFFFFF)
+                : const Color(0x0A000000),
+            borderRadius: BorderRadius.circular(8),
           ),
-          const SizedBox(width: 10),
-          Expanded(
-            child: Text(
-              book.title,
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
-              style: const TextStyle(fontSize: 14, color: Color(0xFF1B1B1B)),
-            ),
+          child: Row(
+            children: [
+              ClipRRect(
+                borderRadius: BorderRadius.circular(4),
+                child: _relateCover(book.cover),
+              ),
+              const SizedBox(width: 10),
+              Expanded(
+                child: Text(
+                  book.title,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(fontSize: 14, color: palette.ink),
+                ),
+              ),
+              if (widget.onOpenRelateBook != null)
+                Icon(LucideIcons.chevron_right, size: 18, color: palette.muted),
+            ],
           ),
-          if (widget.onOpenRelateBook != null)
-            const Icon(
-              Icons.chevron_right_rounded,
-              size: 18,
-              color: Color(0xFF9499A0),
-            ),
-        ],
-      ),
-    ),
-  );
+        ),
+      );
 
   /// 原著封面；没有封面图时用统一的占位块。
   Widget _relateCover(String cover) {
@@ -651,7 +713,7 @@ class _StoryPlayerPanelState extends State<StoryPlayerPanel> {
     );
   }
 
-  Widget _pagingStrip() => SizedBox(
+  Widget _pagingStrip(HomePalette palette) => SizedBox(
     key: const ValueKey('story-episode-pages'),
     height: 36,
     child: ListView(
@@ -673,9 +735,7 @@ class _StoryPlayerPanelState extends State<StoryPlayerPanel> {
                     fontWeight: page == _page
                         ? FontWeight.bold
                         : FontWeight.normal,
-                    color: page == _page
-                        ? const Color(0xFF1B1B1B)
-                        : const Color(0x66000000),
+                    color: page == _page ? palette.ink : palette.muted,
                   ),
                 ),
               ),
@@ -685,11 +745,11 @@ class _StoryPlayerPanelState extends State<StoryPlayerPanel> {
     ),
   );
 
-  Widget _episodes() {
+  Widget _episodes(HomePalette palette) {
     if (widget.episodes.isEmpty) {
-      return const Center(
-        key: ValueKey('story-episodes'),
-        child: Text('暂无剧集', style: TextStyle(color: Color(0xFF9499A0))),
+      return Center(
+        key: const ValueKey('story-episodes'),
+        child: Text('暂无剧集', style: TextStyle(color: palette.muted)),
       );
     }
     return CustomScrollView(
@@ -720,6 +780,7 @@ class _StoryPlayerPanelState extends State<StoryPlayerPanel> {
   }
 
   Widget _episodeTile(int index) {
+    final palette = HomePalette.of(context);
     final episode = widget.episodes[index];
     final active = index == (widget.playingIndex ?? widget.currentIndex);
     final state = EpisodeTileState.of(
@@ -735,14 +796,17 @@ class _StoryPlayerPanelState extends State<StoryPlayerPanel> {
     );
     return Semantics(
       key: ValueKey('story-episode-$index'),
-      label: '第 ${index + 1} 集',
+      label: episode.hasKnownIndex ? '第 ${index + 1} 集' : '当前视频',
       value: active ? (widget.playing ? '正在播放' : '当前剧集') : null,
       button: true,
       selected: active,
       excludeSemantics: true,
       onTap: () => _select(index),
       child: Material(
-        color: state.backgroundColor,
+        color: _episodeTileBackground(
+          state == EpisodeTileState.current,
+          palette,
+        ),
         shape: const RoundedRectangleBorder(
           borderRadius: BorderRadius.all(Radius.circular(8)),
         ),
@@ -757,13 +821,14 @@ class _StoryPlayerPanelState extends State<StoryPlayerPanel> {
                     index: index,
                     trailer: episode.trailer,
                     highlight: episode.highlight,
+                    hasKnownIndex: episode.hasKnownIndex,
                   ),
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
                   style: TextStyle(
                     fontSize: 14,
                     fontWeight: state.weight,
-                    color: state.textColor,
+                    color: _episodeTextColor(state, palette),
                   ),
                 ),
               ),
@@ -882,7 +947,10 @@ class _StoryEpisodeDrawerState extends State<StoryEpisodeDrawer> {
     return Material(
       key: const ValueKey('story-episode-drawer'),
       color: const Color(0xFF141414),
+      // 抽屉贴在右缘：横向只该让开**右侧**的安全区（右挖孔机型），左边
+      // 那条是另一侧屏幕边缘的挖孔，套进来会把标题和格子整体推右。
       child: SafeArea(
+        left: false,
         child: Column(
           children: [
             SizedBox(
@@ -941,11 +1009,14 @@ class _StoryEpisodeDrawerState extends State<StoryEpisodeDrawer> {
                         ),
                     itemCount: widget.episodes.length,
                     itemBuilder: (context, index) {
+                      final episode = widget.episodes[index];
                       final active = index == playingIndex;
                       final watched = !active && widget.watched.contains(index);
                       return Semantics(
                         key: ValueKey('story-episode-$index'),
-                        label: '第 ${index + 1} 集',
+                        label: episode.hasKnownIndex
+                            ? '第 ${index + 1} 集'
+                            : '当前视频',
                         value: active
                             ? (widget.playing ? '正在播放' : '当前剧集')
                             : null,
@@ -967,7 +1038,9 @@ class _StoryEpisodeDrawerState extends State<StoryEpisodeDrawer> {
                               children: [
                                 Center(
                                   child: Text(
-                                    '${index + 1}',
+                                    episode.hasKnownIndex
+                                        ? '${index + 1}'
+                                        : '当前',
                                     style: TextStyle(
                                       fontSize: 14,
                                       fontWeight: active

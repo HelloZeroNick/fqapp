@@ -1,1124 +1,781 @@
+// Wenku8_Flutter ebcd7f1 ReaderTools category navigation and adjustment preview.
+// fqapp remains authoritative for preferences, reading engines and device I/O.
 import 'dart:async';
 
+import 'package:flutter/cupertino.dart';
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
 import 'package:flutter_lucide/flutter_lucide.dart';
 
 import '../../services/reader_device.dart';
 import '../../services/reader_preferences.dart';
-import '../../services/reader_tap_zones.dart';
-import 'reader_tap_zone_sheet.dart';
+import '../wenku/wenku_ui.dart';
 import 'reader_theme.dart';
+import 'reader_value_slider.dart';
+import 'settings/reader_font_picker_sheet.dart';
+import 'settings/reader_more_settings_sheet.dart';
+import 'settings/reader_settings_categories.dart';
+import 'settings/reader_settings_state.dart';
+import 'settings/reader_settings_widgets.dart';
+import 'settings/reader_turn_settings.dart';
+import 'settings/reader_typography_settings.dart';
 
-/// The reader typesetting bottom sheet, laid out after the official panel
-/// (`res/layout` rows akd/aki/akj/aho + `MultipleOptionsView`): 16dp side
-/// margins, ~40dp rows with 12sp-13sp leading labels, 32dp circular background
-/// swatches with a selected ring, evenly divided option chips (≥55dp), and a
-/// centred 28dp pill for 恢复默认. Row order and data plumbing are ours; the
-/// geometry and visual language are the official panel's.
+enum ReaderSettingsSection { all, appearance, operations, listening }
+
+Future<void> showReaderSettingsSheet({
+  required BuildContext context,
+  required ReaderPreferences initialValue,
+  required ValueChanged<ReaderPreferences> onChanged,
+  required Future<ReaderFont?> Function() onPickFont,
+  required bool deviceAvailable,
+  required double? systemBrightness,
+  required ValueChanged<double> onBrightness,
+  required VoidCallback onBrightnessEnd,
+  required VoidCallback onFollowSystem,
+  required bool autoTurnActive,
+  required VoidCallback? onAutoTurn,
+  bool einkOverride = false,
+  bool oledOverride = false,
+  VoidCallback? onTextReplacement,
+  VoidCallback? onListeningSource,
+  ReaderSettingsSection initialSection = ReaderSettingsSection.all,
+  ValueChanged<bool>? onPreviewChanged,
+  VoidCallback? onMarks,
+}) {
+  final noMotion =
+      einkOverride ||
+      initialValue.themePreset == ReaderThemePreset.eink ||
+      MediaQuery.disableAnimationsOf(context) ||
+      PerformanceScope.reduceMotionOf(context) ||
+      !PerformanceScope.of(context).motion;
+  return showModalBottomSheet<void>(
+    context: context,
+    isScrollControlled: true,
+    useSafeArea: true,
+    backgroundColor: Colors.transparent,
+    barrierColor: Colors.transparent,
+    // Dragging a value must not compete with the route's dismiss gesture.
+    enableDrag: false,
+    sheetAnimationStyle: noMotion ? AnimationStyle.noAnimation : null,
+    builder: (context) => ReaderAppearanceSheet(
+      initialValue: initialValue,
+      onChanged: onChanged,
+      onPickFont: onPickFont,
+      deviceAvailable: deviceAvailable,
+      systemBrightness: systemBrightness,
+      onBrightness: onBrightness,
+      onBrightnessEnd: onBrightnessEnd,
+      onFollowSystem: onFollowSystem,
+      autoTurnActive: autoTurnActive,
+      onAutoTurn: onAutoTurn,
+      einkOverride: einkOverride,
+      oledOverride: oledOverride,
+      onTextReplacement: onTextReplacement,
+      onListeningSource: onListeningSource,
+      initialSection: initialSection,
+      onPreviewChanged: onPreviewChanged,
+      onMarks: onMarks,
+    ),
+  );
+}
+
 class ReaderAppearanceSheet extends StatefulWidget {
-  final ReaderPreferences initialValue;
-  final ValueChanged<ReaderPreferences> onChanged;
-  final Future<ReaderFont?> Function() onPickFont;
-
-  /// 全局墨水屏模式已开启时，阅读背景跟随全局，不由本面板的色块决定。
-  /// 此时面板显示墨水屏为选中，色块点按禁用，避免点 夜间/米白 却毫无变化。
-  final bool einkOverride;
-
   const ReaderAppearanceSheet({
     super.key,
     required this.initialValue,
     required this.onChanged,
     required this.onPickFont,
+    required this.deviceAvailable,
+    required this.systemBrightness,
+    required this.onBrightness,
+    required this.onBrightnessEnd,
+    required this.onFollowSystem,
+    required this.autoTurnActive,
+    required this.onAutoTurn,
     this.einkOverride = false,
+    this.oledOverride = false,
+    this.onTextReplacement,
+    this.onListeningSource,
+    this.initialSection = ReaderSettingsSection.all,
+    this.onPreviewChanged,
+    this.onMarks,
   });
+
+  final ReaderPreferences initialValue;
+  final ValueChanged<ReaderPreferences> onChanged;
+  final Future<ReaderFont?> Function() onPickFont;
+  final bool deviceAvailable;
+  final double? systemBrightness;
+  final ValueChanged<double> onBrightness;
+  final VoidCallback onBrightnessEnd;
+  final VoidCallback onFollowSystem;
+  final bool autoTurnActive;
+  final VoidCallback? onAutoTurn;
+  final bool einkOverride;
+  final bool oledOverride;
+  final VoidCallback? onTextReplacement;
+  final VoidCallback? onListeningSource;
+  final ReaderSettingsSection initialSection;
+  final ValueChanged<bool>? onPreviewChanged;
+  final VoidCallback? onMarks;
 
   @override
   State<ReaderAppearanceSheet> createState() => _ReaderAppearanceSheetState();
 }
 
-class _ReaderAppearanceSheetState extends State<ReaderAppearanceSheet> {
-  late ReaderPreferences _value = widget.initialValue;
+class _ReaderAppearanceSheetState
+    extends ReaderSettingsState<ReaderAppearanceSheet>
+    with SingleTickerProviderStateMixin {
+  @override
+  ReaderPreferences get initialPreferences => widget.initialValue;
+  @override
+  ValueChanged<ReaderPreferences> get onPreferencesChanged => widget.onChanged;
 
-  /// 面板显示用的预设：全局墨水屏开启时强制墨水屏，与保存的预设分开，
-  /// 其它排版改动仍写保存的预设，关闭全局模式后恢复。
-  ReaderThemePreset get _displayPreset =>
-      widget.einkOverride ? ReaderThemePreset.eink : _value.themePreset;
-  bool _importing = false;
-  String? _fontError;
+  late final AnimationController _expand = AnimationController(
+    vsync: this,
+    duration: const Duration(milliseconds: 320),
+    value: 1,
+  );
+  final _bodyKey = GlobalKey();
+  final _contentsKey = GlobalKey();
+  final _behaviorKey =
+      GlobalKey<ReaderSettingsState<ReaderMoreSettingsSheet>>();
+  String? _category;
+  Rect? _categoryOrigin;
+  Key? _activeAdjustment;
+  bool _closing = false;
+  bool _brightnessPending = false;
 
-  /// Applies the pending value to the reader page. The reader re-measures the
-  /// whole chapter synchronously on the UI isolate, so a slider firing
-  /// `onChanged` per tick used to re-typeset the chapter ten-plus times per
-  /// drag and dropped frames all the way down. The sheet keeps its own thumb
-  /// and label instant, coalesces the page updates (120ms trailing), and
-  /// flushes the final value on release/dispose so nothing is lost.
-  Timer? _notifyDebounce;
-  bool _notifyPending = false;
-
-  void _update(ReaderPreferences value) {
-    setState(() => _value = value.normalized());
-    _notifyPending = true;
-    _notifyDebounce?.cancel();
-    _notifyDebounce = Timer(const Duration(milliseconds: 120), _notifyParent);
+  @override
+  void initState() {
+    super.initState();
+    _category = switch (widget.initialSection) {
+      ReaderSettingsSection.operations => 'operations',
+      ReaderSettingsSection.listening => 'listening',
+      _ => null,
+    };
   }
 
-  void _notifyParent() {
-    _notifyDebounce = null;
-    if (!mounted || !_notifyPending) return;
-    _notifyPending = false;
-    widget.onChanged(_value);
+  ReaderThemePreset get _displayPreset => widget.einkOverride
+      ? ReaderThemePreset.eink
+      : widget.oledOverride
+      ? ReaderThemePreset.dark
+      : value.themePreset;
+  bool get _backgroundLocked => widget.einkOverride || widget.oledOverride;
+  bool get _reduceMotion =>
+      _displayPreset.isEink ||
+      MediaQuery.disableAnimationsOf(context) ||
+      PerformanceScope.reduceMotionOf(context) ||
+      !PerformanceScope.of(context).motion;
+
+  /// 分类内容总能退回分类网格：坞上只有「外观」「操作」两个入口，面板会
+  /// 直达某个分类，网格里的其余分类（听书、书签等）也得走得到。
+  bool get _nested => _category != null;
+  bool get _alive => mounted && !_closing;
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    if (_reduceMotion) _expand.value = 1;
   }
 
-  void _flushNotify() {
-    _notifyDebounce?.cancel();
-    _notifyDebounce = null;
-    if (!mounted || !_notifyPending) return;
-    _notifyPending = false;
-    widget.onChanged(_value);
+  void _apply(ReaderPreferences next) {
+    if (!_alive) return;
+    commitPreferences(next);
+    if (_displayPreset.isEink) _expand.value = 1;
+  }
+
+  void _flushAll() {
+    _behaviorKey.currentState?.flushPreferences();
+    flushPreferences();
+    if (_brightnessPending) {
+      _brightnessPending = false;
+      widget.onBrightnessEnd();
+    }
+  }
+
+  void _preview(Key key, bool active) {
+    if (!_alive || (!active && _activeAdjustment != key)) return;
+    setState(() => _activeAdjustment = active ? key : null);
+    widget.onPreviewChanged?.call(active);
+  }
+
+  void _endPreview() {
+    if (_activeAdjustment == null) return;
+    _activeAdjustment = null;
+    widget.onPreviewChanged?.call(false);
+  }
+
+  void _close([VoidCallback? action]) {
+    if (!_alive) return;
+    _flushAll();
+    _endPreview();
+    _closing = true;
+    Navigator.pop(context);
+    action?.call();
+  }
+
+  void _returnCategories() {
+    if (!_alive) return;
+    _flushAll();
+    _expand.stop();
+    _endPreview();
+    setState(() => _category = null);
+  }
+
+  void _openCategory(String category, Rect? origin) {
+    if (!_alive) return;
+    if (category == 'bookmarks') {
+      _close(widget.onMarks);
+      return;
+    }
+    _flushAll();
+    _endPreview();
+    setState(() {
+      _categoryOrigin = origin;
+      _category = category;
+    });
+    if (_reduceMotion) {
+      _expand.value = 1;
+    } else {
+      _expand.forward(from: 0);
+    }
+  }
+
+  Future<void> _openFontPicker() async {
+    _flushAll();
+    final selection = await showReaderFontPicker(
+      context: context,
+      preset: _displayPreset,
+      currentPath: value.fontPath,
+      currentName: value.fontName,
+      onPickFont: widget.onPickFont,
+    );
+    if (!_alive || selection == null) return;
+    _apply(value.copyWith(fontPath: selection.path, fontName: selection.name));
   }
 
   @override
   void dispose() {
-    // The sheet may close mid-drag; the last value must still reach the
-    // reader page or the saved preference would trail the visible one.
-    _flushNotify();
+    _flushAll();
+    _closing = true;
+    if (_activeAdjustment != null) {
+      final preview = widget.onPreviewChanged;
+      scheduleMicrotask(() => preview?.call(false));
+    }
+    _expand.dispose();
     super.dispose();
   }
 
-  /// 点击区域行摘要：左列 / 中列 / 右列的动作（每列三格相同是常见配置，
-  /// 不同时只展示“已自定义”）。
-  String get _tapZonesSummary {
-    final zones = _value.tapZones;
-    String columnSummary(int column) {
-      final actions = <ReaderTapZoneAction>{
-        zones[column],
-        zones[3 + column],
-        zones[6 + column],
-      };
-      if (actions.length == 1) return actions.single.label;
-      return '已自定义';
-    }
-
-    return '左 ${columnSummary(0)} · 中 ${columnSummary(1)} · 右 ${columnSummary(2)}';
-  }
-
-  Future<void> _editTapZones() async {
-    final zones = await showReaderTapZoneEditor(
-      context: context,
-      initialZones: _value.tapZones,
+  Widget _adjustment(Widget child, [Key? key]) {
+    final active = _activeAdjustment != null;
+    final visible = !active || key == _activeAdjustment;
+    return Visibility(
+      visible: visible,
+      maintainSize: true,
+      maintainAnimation: true,
+      maintainState: true,
+      child: CustomPaint(
+        painter: ReaderAdjustmentPlate(
+          active && visible
+              ? _displayPreset.sheetColor.withValues(alpha: .98)
+              : Colors.transparent,
+        ),
+        child: child,
+      ),
     );
-    if (zones != null && mounted) {
-      _update(_value.copyWith(tapZones: zones));
-    }
   }
 
-  Future<void> _importFont() async {
-    setState(() {
-      _importing = true;
-      _fontError = null;
-    });
-    try {
-      final font = await widget.onPickFont();
-      if (!mounted || font == null) return;
-      _update(_value.copyWith(fontPath: font.path, fontName: font.name));
-    } catch (error) {
-      if (!mounted) return;
-      setState(
-        () => _fontError = error is PlatformException
-            ? error.message ?? '字体导入失败，请重新选择'
-            : '无法载入字体，请选择有效的 TTF、OTF 或 TTC 文件',
-      );
-    } finally {
-      if (mounted) setState(() => _importing = false);
+  Widget _slider({
+    required String id,
+    required String label,
+    required double current,
+    required double min,
+    required double max,
+    required int divisions,
+    required String Function(double) format,
+    required ReaderPreferences Function(ReaderPreferences, double) apply,
+  }) {
+    final key = ValueKey(id);
+    final category = _category;
+    void update(double next, {bool finish = false}) {
+      if (!_alive || category != _category) return;
+      _apply(apply(value, next));
+      if (finish) flushPreferences();
     }
+
+    return _adjustment(
+      ReaderValueSlider(
+        sliderKey: key,
+        label: label,
+        value: current,
+        min: min,
+        max: max,
+        divisions: divisions,
+        format: format,
+        preset: _displayPreset,
+        onPreview: update,
+        onCommitted: (next) => update(next, finish: true),
+        onInteractionChanged: (active) => _preview(key, active),
+      ),
+      key,
+    );
   }
+
+  List<ReaderSettingsCategory> get _categories => [
+    ReaderSettingsCategory(
+      'font',
+      '字体',
+      CupertinoIcons.textformat,
+      '${value.fontSize.round()} pt · ${value.fontWeight} 字重',
+    ),
+    ReaderSettingsCategory(
+      'paragraph',
+      '段落',
+      CupertinoIcons.text_alignleft,
+      '${value.lineHeight.toStringAsFixed(1)} 倍行距',
+    ),
+    const ReaderSettingsCategory(
+      'page',
+      '屏幕',
+      CupertinoIcons.rectangle,
+      '页边距 · 状态栏 · 阅读信息',
+    ),
+    ReaderSettingsCategory(
+      'theme',
+      '主题',
+      CupertinoIcons.paintbrush,
+      _displayPreset.label,
+    ),
+    // 翻页属于外观层面，坞上只有「外观」「操作」两个入口，所以它必须留在
+    // 外观网格里，否则翻页动画与自动翻页没有入口。
+    ReaderSettingsCategory(
+      'turn',
+      '翻页',
+      CupertinoIcons.arrow_left_right,
+      value.pageMode == ReaderPageMode.scroll ? '滚动 · 跨章设置' : '翻页动画 · 自动翻页',
+    ),
+    if (widget.initialSection != ReaderSettingsSection.appearance) ...[
+      const ReaderSettingsCategory(
+        'listening',
+        '听书',
+        CupertinoIcons.headphones,
+        '跟随翻页 · 朗读高亮',
+      ),
+      const ReaderSettingsCategory(
+        'operations',
+        '操作',
+        CupertinoIcons.hand_draw,
+        '点击区域 · 音量键 · 正文替换',
+      ),
+      if (widget.onMarks != null)
+        const ReaderSettingsCategory(
+          'bookmarks',
+          '书签',
+          CupertinoIcons.bookmark,
+          '保存阅读位置与摘录',
+        ),
+    ],
+  ];
+
+  String get _title => _category == null
+      ? widget.initialSection == ReaderSettingsSection.appearance
+            ? '外观'
+            : '阅读设置'
+      : _categories.where((item) => item.id == _category).firstOrNull?.title ??
+            '阅读设置';
+
+  Widget _typography(ReaderTypographyCategory category) =>
+      ReaderTypographySettings(
+        value: value,
+        onChanged: _apply,
+        backgroundLocked: _backgroundLocked,
+        category: category,
+        sliderBuilder: _slider,
+        decorate: _adjustment,
+      );
+
+  Widget _behavior(ReaderBehaviorCategory category) => _adjustment(
+    ReaderMoreSettingsSheet(
+      key: _behaviorKey,
+      initialValue: value,
+      onChanged: _apply,
+      einkOverride: widget.einkOverride,
+      oledOverride: widget.oledOverride,
+      backgroundLocked: _backgroundLocked,
+      showListeningSource: widget.onListeningSource != null,
+      category: category,
+      embedded: true,
+      onAction: (action) => _close(switch (action) {
+        ReaderMoreSettingsResult.textReplacement => widget.onTextReplacement,
+        ReaderMoreSettingsResult.listeningSource => widget.onListeningSource,
+      }),
+    ),
+  );
+
+  List<Widget> _items(BuildContext context) => switch (_category) {
+    null => [
+      ReaderSettingsCategoryGrid(
+        categories: _categories,
+        onSelected: _openCategory,
+        reduceMotion: _reduceMotion,
+      ),
+    ],
+    'font' => [
+      _adjustment(
+        ReaderSettingsNavRow(
+          key: const ValueKey('reader-font-picker'),
+          label: value.fontName.isEmpty ? '字体' : '字体 · ${value.fontName}',
+          onTap: _openFontPicker,
+        ),
+      ),
+      _typography(ReaderTypographyCategory.font),
+    ],
+    'paragraph' => [
+      _adjustment(_spacingRow()),
+      _typography(ReaderTypographyCategory.paragraph),
+    ],
+    'page' => [
+      _typography(ReaderTypographyCategory.page),
+      if (widget.deviceAvailable) ...[
+        _brightnessSlider(),
+        _adjustment(_followSystem()),
+      ],
+      _behavior(ReaderBehaviorCategory.page),
+    ],
+    'theme' => [
+      _adjustment(_backgroundChoices()),
+      if (_backgroundLocked)
+        _adjustment(
+          Text(
+            widget.einkOverride
+                ? '全局墨水屏模式已开启，背景跟随全局设置'
+                : '全局 OLED 纯黑已开启，背景跟随全局设置',
+            style: TextStyle(
+              color: _displayPreset.mutedTextColor,
+              fontSize: 12,
+            ),
+          ),
+        ),
+      _behavior(ReaderBehaviorCategory.theme),
+    ],
+    'turn' => [
+      _adjustment(ReaderTurnSettings(value: value, onChanged: _apply)),
+      _autoTurn(),
+      _behavior(ReaderBehaviorCategory.turn),
+    ],
+    'listening' => [_behavior(ReaderBehaviorCategory.listening)],
+    _ => [
+      _adjustment(ReaderTurnSettings(value: value, onChanged: _apply)),
+      _autoTurn(),
+      _behavior(ReaderBehaviorCategory.operations),
+    ],
+  };
 
   @override
   Widget build(BuildContext context) {
     final preset = _displayPreset;
-    return Theme(
-      data: preset.theme(Theme.of(context)),
-      child: AnimatedContainer(
-        // 墨水屏：任何插值动画都会在屏上留残影，排版面板直接跳变。
-        duration: preset.isEink
-            ? Duration.zero
-            : const Duration(milliseconds: 160),
-        decoration: BoxDecoration(
-          color: preset.sheetColor,
-          borderRadius: const BorderRadius.vertical(top: Radius.circular(22)),
-          border: Border(
-            top: BorderSide(
-              color: preset.isDark
-                  ? Colors.white.withValues(alpha: 0.08)
-                  : Colors.black.withValues(alpha: 0.06),
-              width: 0.8,
-            ),
+    final noMotion = _reduceMotion;
+    final media = MediaQuery.of(context);
+    Widget panel = ReaderSettingsTheme(
+      preset: preset,
+      child: Theme(
+        data: preset.theme(Theme.of(context)),
+        child: MediaQuery(
+          data: media.copyWith(
+            disableAnimations: noMotion,
+            highContrast: media.highContrast || preset.isEink,
           ),
-        ),
-        constraints: BoxConstraints(
-          maxHeight: MediaQuery.sizeOf(context).height * 0.82,
-        ),
-        child: Material(
-          type: MaterialType.transparency,
-          child: Padding(
-            padding: EdgeInsets.only(
-              bottom:
-                  MediaQuery.viewInsetsOf(context).bottom +
-                  MediaQuery.paddingOf(context).bottom,
-            ),
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Container(
-                  margin: const EdgeInsets.only(top: 10, bottom: 4),
-                  width: 36,
-                  height: 4,
-                  decoration: BoxDecoration(
-                    color: preset.mutedTextColor.withValues(alpha: 0.25),
-                    borderRadius: BorderRadius.circular(2),
-                  ),
+          child: Builder(
+            builder: (context) {
+              final body = SingleChildScrollView(
+                key: ValueKey('reader-settings-scroll-${_category ?? 'grid'}'),
+                primary: false,
+                // Freeze scrolling as well as layout while a value owns the pointer.
+                physics: _activeAdjustment == null
+                    ? null
+                    : const NeverScrollableScrollPhysics(),
+                padding: const EdgeInsets.fromLTRB(24, 4, 24, 24),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  mainAxisSize: MainAxisSize.min,
+                  children: _items(context),
                 ),
-                Padding(
-                  padding: const EdgeInsets.fromLTRB(20, 0, 8, 4),
-                  child: Row(
-                    children: [
-                      Expanded(
-                        child: Text(
-                          '排版设置',
-                          style: TextStyle(
-                            color: preset.textColor,
-                            fontSize: 19,
-                            fontWeight: FontWeight.w600,
-                          ),
-                        ),
-                      ),
-                      IconButton(
-                        tooltip: '关闭排版设置',
-                        onPressed: () => Navigator.pop(context),
-                        icon: const Icon(LucideIcons.x, size: 20),
-                      ),
-                    ],
-                  ),
-                ),
-                Flexible(
-                  child: SingleChildScrollView(
-                    key: const ValueKey('reader-appearance-scroll'),
-                    padding: const EdgeInsets.fromLTRB(0, 0, 0, 16),
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.stretch,
-                      children: [
-                        // 全局墨水屏开启时背景跟随全局，色块仅作展示。
-                        if (widget.einkOverride)
-                          Padding(
-                            padding: const EdgeInsets.fromLTRB(
-                              16,
-                              0,
-                              16,
-                              12,
-                            ),
+              );
+              final contents = Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  _adjustment(
+                    Padding(
+                      padding: const EdgeInsets.fromLTRB(14, 8, 14, 8),
+                      child: Row(
+                        children: [
+                          if (_nested)
+                            GlassIconButton(
+                              key: const ValueKey('reader-settings-back'),
+                              icon: CupertinoIcons.chevron_back,
+                              label:
+                                  widget.initialSection ==
+                                      ReaderSettingsSection.appearance
+                                  ? '返回外观分类'
+                                  : '返回阅读设置分类',
+                              onPressed: _returnCategories,
+                            )
+                          else
+                            const SizedBox(width: 10),
+                          Expanded(
                             child: Text(
-                              '全局墨水屏模式已开启，背景跟随全局设置',
-                              style: TextStyle(
-                                color: preset.mutedTextColor,
-                                fontSize: 12,
+                              _title,
+                              style: const TextStyle(
+                                fontSize: 18,
+                                fontWeight: FontWeight.w600,
                               ),
                             ),
                           ),
-                        // 背景: official aki row — 32dp circular swatches,
-                        // the selected one wrapped in a 1.3dp accent ring.
-                        // 5 个预设时固定 38dp 在窄屏 (280dp, 2.0 字号) 下溢出
-                        // 18px (5×38=190 > 可用 172)，见 CI run 38597871819。
-                        // 直径随可用宽度自适应，正常宽度仍为 38dp。
-                        _row(
-                          label: '背景',
-                          child: Expanded(
-                            child: LayoutBuilder(
-                              builder: (context, constraints) {
-                                final count =
-                                    ReaderThemePreset.values.length;
-                                final diameter =
-                                    (constraints.maxWidth / count - 4)
-                                        .clamp(24.0, 38.0);
-                                return Row(
-                                  mainAxisAlignment:
-                                      MainAxisAlignment.spaceEvenly,
-                                  children: [
-                                    for (final choice
-                                        in ReaderThemePreset.values)
-                                      _swatch(preset, choice, diameter),
-                                  ],
-                                );
-                              },
+                          GlassIconButton(
+                            key: const ValueKey('reader-settings-close'),
+                            icon: CupertinoIcons.xmark,
+                            label: '关闭$_title',
+                            onPressed: _close,
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                  Flexible(
+                    child: SizedBox(
+                      key: _bodyKey,
+                      child: AnimatedBuilder(
+                        animation: _expand,
+                        child: body,
+                        builder: (context, child) {
+                          final progress = _category == null || noMotion
+                              ? 1.0
+                              : Curves.easeOutCubic.transform(_expand.value);
+                          return ClipPath(
+                            key: const ValueKey(
+                              'reader-settings-category-reveal',
                             ),
-                          ),
-                        ),
-                        // 字号: official akd row — A− / A+ pill areas with
-                        // the current size between them.
-                        _row(
-                          label: '字号',
-                          child: Expanded(
-                            child: _stepper(
-                              key: const ValueKey('reader-font-size'),
-                              value: _value.fontSize,
-                              min: 14,
-                              max: 32,
-                              format: (value) => value.round().toString(),
-                              onStep: (value) => _update(
-                                _value.copyWith(fontSize: value),
-                              ),
+                            clipper: ReaderCategoryRevealClipper(
+                              _categoryOrigin,
+                              _bodyKey,
+                              progress,
                             ),
-                          ),
-                        ),
-                        // 行距 / 段距 / 边距: official akj/aho rows — label +
-                        // evenly divided option chips (≥55dp each).
-                        _optionsRow(
-                          '行距',
-                          _chips<double>(
-                            key: 'reader-line-height',
-                            options: {1.5: '紧凑', 1.8: '标准', 2.1: '宽松'},
-                            selected: _value.lineHeight,
-                            format: (value) => value.toStringAsFixed(1),
-                            onSelected: (value) =>
-                                _update(_value.copyWith(lineHeight: value)),
-                          ),
-                        ),
-                        _optionsRow(
-                          '段距',
-                          _chips<int>(
-                            key: 'reader-paragraph-spacing',
-                            options: const {6: '紧凑', 12: '标准', 20: '宽松'},
-                            selected: _value.paragraphSpacing.round(),
-                            format: (value) => '$value',
-                            onSelected: (value) => _update(
-                              _value.copyWith(paragraphSpacing: value.toDouble()),
+                            child: Opacity(
+                              opacity: .35 + progress * .65,
+                              child: child,
                             ),
-                          ),
-                        ),
-                        _optionsRow(
-                          '左右边距',
-                          _chips<double>(
-                            key: 'reader-horizontal-padding',
-                            options: {12.0: '窄', 20.0: '标准', 32.0: '宽'},
-                            selected: _value.horizontalPadding,
-                            format: (value) => '$value',
-                            onSelected: (value) => _update(
-                              _value.copyWith(horizontalPadding: value),
+                          );
+                        },
+                      ),
+                    ),
+                  ),
+                ],
+              );
+              final retainedContents = KeyedSubtree(
+                key: _contentsKey,
+                child: contents,
+              );
+              return DecoratedBox(
+                decoration: BoxDecoration(
+                  color: _activeAdjustment == null
+                      ? preset.sheetColor
+                      : Colors.transparent,
+                  borderRadius: const BorderRadius.vertical(
+                    top: Radius.circular(24),
+                  ),
+                ),
+                child: ConstrainedBox(
+                  constraints: BoxConstraints(
+                    maxHeight: media.size.height * .82,
+                  ),
+                  child: Material(
+                    type: MaterialType.transparency,
+                    child: Padding(
+                      padding: EdgeInsets.only(
+                        bottom: media.padding.bottom + media.viewInsets.bottom,
+                      ),
+                      // A zero-duration RenderAnimatedSize notifies from its
+                      // own layout on this SDK. Bypass it for reduced motion;
+                      // a GlobalKey retains active slider state if that policy
+                      // changes at runtime. Preview preserves every layout slot
+                      // and therefore does not need a new size transition.
+                      child: noMotion
+                          ? retainedContents
+                          : AnimatedSize(
+                              duration: const Duration(milliseconds: 320),
+                              alignment: Alignment.topCenter,
+                              curve: Curves.easeOutCubic,
+                              child: retainedContents,
                             ),
-                          ),
-                        ),
-                        _optionsRow(
-                          '上下边距',
-                          _chips<double>(
-                            key: 'reader-vertical-padding',
-                            options: {8.0: '窄', 16.0: '标准', 28.0: '宽'},
-                            selected: _value.verticalPadding,
-                            format: (value) => '$value',
-                            onSelected: (value) => _update(
-                              _value.copyWith(verticalPadding: value),
-                            ),
-                          ),
-                        ),
-                        // 阅读方式 + 翻页方式: two official option rows.
-                        _row(
-                          label: '阅读方式',
-                          child: Expanded(
-                            child: Row(
-                              children: [
-                                for (final mode in ReaderPageMode.values)
-                                  Expanded(
-                                    child: _chip(
-                                      key: ValueKey(
-                                        'reader-mode-${mode.name}',
-                                      ),
-                                      label: mode == ReaderPageMode.paged
-                                          ? '左右翻页'
-                                          : '上下滚动',
-                                      selected: _value.pageMode == mode,
-                                      onTap: () => _update(
-                                        _value.copyWith(pageMode: mode),
-                                      ),
-                                    ),
-                                  ),
-                              ],
-                            ),
-                          ),
-                        ),
-                        _row(
-                          label: '翻页方式',
-                          child: Expanded(
-                            child: Row(
-                              children: [
-                                for (final style in ReaderPageTurnStyle.values)
-                                  Expanded(
-                                    child: _chip(
-                                      label: switch (style) {
-                                        ReaderPageTurnStyle.cover => '覆盖',
-                                        ReaderPageTurnStyle.slide => '平移',
-                                        ReaderPageTurnStyle.curl => '仿真',
-                                        ReaderPageTurnStyle.none => '无',
-                                      },
-                                      selected: _value.pageTurnStyle == style,
-                                      onTap: () => _update(
-                                        _value.copyWith(pageTurnStyle: style),
-                                      ),
-                                    ),
-                                  ),
-                              ],
-                            ),
-                          ),
-                        ),
-                        _toggle(
-                          '滑动直翻（无过渡动画）',
-                          subtitle:
-                              '分页模式：滑动越过阈值直接翻页，不显示翻页过渡与动画；开启后翻页方式强制为“无”。适合墨水屏',
-                          value: _value.instantSwipeTurn,
-                          onChanged: (value) => _update(
-                            _value.copyWith(instantSwipeTurn: value),
-                          ),
-                        ),
-                        _row(
-                          label: '点击区域',
-                          child: Expanded(
-                            child: Row(
-                              children: [
-                                Expanded(
-                                  child: Text(
-                                    _tapZonesSummary,
-                                    textAlign: TextAlign.right,
-                                    style: const TextStyle(fontSize: 13),
-                                  ),
-                                ),
-                                const SizedBox(width: 8),
-                                OutlinedButton(
-                                  onPressed: _editTapZones,
-                                  child: const Text('设置'),
-                                ),
-                              ],
-                            ),
-                          ),
-                        ),
-                        _row(
-                          label: '自动翻页',
-                          child: Expanded(
-                            child: Row(
-                              children: [
-                                for (final seconds in const [3, 5, 10, 20, 30])
-                                  Expanded(
-                                    child: _chip(
-                                      label: '$seconds秒',
-                                      selected:
-                                          _value.autoTurnSeconds == seconds,
-                                      onTap: () => _update(
-                                        _value.copyWith(
-                                          autoTurnSeconds: seconds,
-                                        ),
-                                      ),
-                                    ),
-                                  ),
-                              ],
-                            ),
-                          ),
-                        ),
-                        // 字体: import + weight chips, official 字体 row shape.
-                        _row(
-                          label: '字体',
-                          child: Expanded(
-                            child: Column(
-                              crossAxisAlignment: CrossAxisAlignment.start,
-                              children: [
-                                Row(
-                                  children: [
-                                    Expanded(
-                                      child: _chip(
-                                        label: '系统字体',
-                                        selected: _value.fontPath.isEmpty,
-                                        onTap: () => _update(
-                                          _value.copyWith(
-                                            fontPath: '',
-                                            fontName: '',
-                                          ),
-                                        ),
-                                      ),
-                                    ),
-                                    const SizedBox(width: 2),
-                                    Expanded(
-                                      child: _chip(
-                                        label: _value.fontPath.isEmpty
-                                            ? '导入字体'
-                                            : _value.fontName,
-                                        selected: _value.fontPath.isNotEmpty,
-                                        onTap: _importing ? null : _importFont,
-                                      ),
-                                    ),
-                                  ],
-                                ),
-                                if (_fontError != null)
-                                  Padding(
-                                    padding: const EdgeInsets.only(top: 4),
-                                    child: Text(
-                                      _fontError!,
-                                      style: TextStyle(
-                                        color: Theme.of(
-                                          context,
-                                        ).colorScheme.error,
-                                        fontSize: 12,
-                                      ),
-                                    ),
-                                  ),
-                              ],
-                            ),
-                          ),
-                        ),
-                        _row(
-                          label: '字重',
-                          child: Expanded(
-                            child: Row(
-                              children: [
-                                for (final entry in const {
-                                  300: '细',
-                                  400: '标准',
-                                  500: '适中',
-                                  600: '偏粗',
-                                  700: '粗',
-                                }.entries)
-                                  Expanded(
-                                    child: _chip(
-                                      label: entry.value,
-                                      selected:
-                                          _value.fontWeight == entry.key,
-                                      onTap: () => _update(
-                                        _value.copyWith(
-                                          fontWeight: entry.key,
-                                        ),
-                                      ),
-                                    ),
-                                  ),
-                              ],
-                            ),
-                          ),
-                        ),
-                        // Toggles: official switch rows — label left,
-                        // switch right, ~40dp row.
-                        _toggle(
-                          '听书跟随翻页',
-                          subtitle: '听书页播放本章时，阅读器按播放进度自动翻页',
-                          value: _value.listeningFollow,
-                          onChanged: (value) => _update(
-                            _value.copyWith(listeningFollow: value),
-                          ),
-                        ),
-                        _toggle(
-                          '朗读句高亮',
-                          subtitle: '朗读时给正在读的句子加背景色，与跟随翻页独立',
-                          value: _value.narrationHighlight,
-                          onChanged: (value) => _update(
-                            _value.copyWith(narrationHighlight: value),
-                          ),
-                        ),
-                        _toggle(
-                          '音量键翻页',
-                          subtitle: '音量下 = 下一页，音量上 = 上一页',
-                          value: _value.volumeKeyTurn,
-                          onChanged: (value) => _update(
-                            _value.copyWith(volumeKeyTurn: value),
-                          ),
-                        ),
-                        _toggle(
-                          '连续阅读',
-                          subtitle: '滚动到底继续下拉进入下一章；分页始终直接跨章',
-                          value: _value.continuousReading,
-                          onChanged: (value) => _update(
-                            _value.copyWith(continuousReading: value),
-                          ),
-                        ),
-                        _toggle(
-                          '阅读时保持屏幕常亮',
-                          value: _value.keepScreenOn,
-                          onChanged: (value) =>
-                              _update(_value.copyWith(keepScreenOn: value)),
-                        ),
-                        Padding(
-                          padding: const EdgeInsets.fromLTRB(16, 8, 16, 12),
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              Text(
-                                '阅读信息',
-                                style: TextStyle(
-                                  color: _displayPreset.textColor,
-                                  fontSize: 13,
-                                ),
-                              ),
-                              const SizedBox(height: 8),
-                              Wrap(
-                                spacing: 8,
-                                runSpacing: 4,
-                                children: [
-                                  for (final mode in ReaderInfoMode.values)
-                                    ChoiceChip(
-                                      key: ValueKey('reader-info-${mode.name}'),
-                                      label: Text(switch (mode) {
-                                        ReaderInfoMode.hidden => '关闭',
-                                        ReaderInfoMode.compact => '简洁',
-                                        ReaderInfoMode.detailed => '详细',
-                                      }),
-                                      selected: _value.readingInfoMode == mode,
-                                      onSelected: (_) => _update(
-                                        _value.copyWith(readingInfoMode: mode),
-                                      ),
-                                    ),
-                                ],
-                              ),
-                              const SizedBox(height: 4),
-                              Text(
-                                switch (_value.readingInfoMode) {
-                                  ReaderInfoMode.hidden => '隐藏顶部与底部阅读信息',
-                                  ReaderInfoMode.compact => '仅在底部显示时间与全书进度',
-                                  ReaderInfoMode.detailed =>
-                                    '显示书名、章节、页码、进度、时间与电量',
-                                },
-                                style: TextStyle(
-                                  color: _displayPreset.mutedTextColor,
-                                  fontSize: 12,
-                                ),
-                              ),
-                            ],
-                          ),
-                        ),
-                        // 更多排版: fine-grained sliders without an official
-                        // counterpart (字距/标题字号/标题对齐), tucked away so the
-                        // first screen stays official.
-                        Theme(
-                          data: Theme.of(context).copyWith(
-                            dividerColor: Colors.transparent,
-                          ),
-                          child: ExpansionTile(
-                            key: const ValueKey('reader-more-appearance'),
-                            tilePadding: const EdgeInsets.symmetric(
-                              horizontal: 16,
-                            ),
-                            title: Text(
-                              '更多排版',
-                              style: TextStyle(
-                                color: _displayPreset.textColor,
-                                fontSize: 13,
-                              ),
-                            ),
-                            subtitle: Text(
-                              '字距、标题字号与对齐',
-                              style: TextStyle(
-                                color: _displayPreset.mutedTextColor,
-                                fontSize: 12,
-                              ),
-                            ),
-                            shape: const Border(),
-                            collapsedShape: const Border(),
-                            childrenPadding: const EdgeInsets.fromLTRB(
-                              16,
-                              0,
-                              16,
-                              8,
-                            ),
-                            children: [
-                              _metric(
-                                '字距',
-                                'reader-letter-spacing',
-                                _value.letterSpacing,
-                                -0.5,
-                                3,
-                                0.1,
-                                (value) =>
-                                    _value.copyWith(letterSpacing: value),
-                                decimals: 1,
-                              ),
-                              const SizedBox(height: 6),
-                              _metric(
-                                '标题字号',
-                                'reader-title-size',
-                                _value.titleSize,
-                                16,
-                                40,
-                                1,
-                                (value) => _value.copyWith(titleSize: value),
-                              ),
-                              const SizedBox(height: 6),
-                              Wrap(
-                                spacing: 8,
-                                children: [
-                                  for (final alignment
-                                      in ReaderTitleAlignment.values)
-                                    ChoiceChip(
-                                      label: Text(
-                                        alignment == ReaderTitleAlignment.start
-                                            ? '标题居左'
-                                            : '标题居中',
-                                      ),
-                                      selected:
-                                          _value.titleAlignment == alignment,
-                                      onSelected: (_) => _update(
-                                        _value.copyWith(
-                                          titleAlignment: alignment,
-                                        ),
-                                      ),
-                                    ),
-                                ],
-                              ),
-                            ],
-                          ),
-                        ),
-                        // 墨水屏模式下才显示整屏刷新间隔：每翻 N 页全刷压残影。
-                        if (widget.einkOverride) _einkRefreshIntervalRow(),
-                        // 恢复默认: official akh row — centred 28dp pill.
-                        Padding(
-                          padding: const EdgeInsets.fromLTRB(16, 4, 16, 12),
-                          child: Center(
-                            child: TextButton(
-                              style: TextButton.styleFrom(
-                                backgroundColor: _displayPreset.fieldColor,
-                                padding: const EdgeInsets.symmetric(
-                                  horizontal: 16,
-                                ),
-                                minimumSize: const Size(0, 28),
-                                shape: RoundedRectangleBorder(
-                                  borderRadius: BorderRadius.circular(30),
-                                ),
-                              ),
-                              onPressed: () => _update(
-                                ReaderPreferences(
-                                  followSystemBrightness:
-                                      _value.followSystemBrightness,
-                                  brightness: _value.brightness,
-                                ),
-                              ),
-                              child: Text(
-                                '恢复默认排版',
-                                style: TextStyle(
-                                  color: _displayPreset.textColor,
-                                  fontSize: 12,
-                                  height: 1.0,
-                                ),
-                              ),
-                            ),
-                          ),
-                        ),
-                      ],
                     ),
                   ),
                 ),
-              ],
-            ),
+              );
+            },
           ),
         ),
       ),
     );
-  }
-
-  /// One official row: 16dp side margins, ~40dp tall, 12dp below, 13sp label
-  /// leading with a 16dp gap, controls filling the rest.
-  Widget _row({
-    required String label,
-    required Widget child,
-    double minHeight = 40,
-  }) {
-    final preset = _displayPreset;
-    return Container(
-      margin: const EdgeInsets.fromLTRB(16, 0, 16, 12),
-      constraints: BoxConstraints(minHeight: minHeight),
-      child: Row(
-        children: [
-          SizedBox(
-            width: 64,
-            child: Text(
-              label,
-              style: TextStyle(color: preset.textColor, fontSize: 13),
-            ),
-          ),
-          const SizedBox(width: 12),
-          child,
-        ],
-      ),
+    // Keep scope ancestry stable when the user changes paper or runtime
+    // motion settings; an active slider must never be remounted mid-pointer.
+    panel = PerformanceScope(
+      preferences: preset.isEink
+          ? const PerformancePreferences(enabled: true)
+          : PerformanceScope.of(context),
+      explicitReduceMotion: noMotion,
+      child: panel,
+    );
+    return PopScope<void>(
+      canPop: !_nested,
+      onPopInvokedWithResult: (didPop, _) {
+        if (didPop) {
+          _flushAll();
+          _endPreview();
+          _closing = true;
+        } else if (_nested) {
+          _returnCategories();
+        }
+      },
+      child: panel,
     );
   }
 
-  Widget _optionsRow(String label, Widget chips) =>
-      _row(label: label, child: Expanded(child: chips));
-
-  /// 官方 aki 背景 swatch: a 32dp circle in the theme's own background colour,
-  /// the selected one wrapped in a 1.3dp accent ring (aqx selector).
-  Widget _swatch(
-    ReaderThemePreset preset,
-    ReaderThemePreset choice,
-    double diameter,
-  ) {
-    final selected = choice == preset;
-    return Semantics(
-      selected: selected,
-      button: true,
-      label: '${choice.label}阅读背景',
-      child: InkWell(
-        key: ValueKey('reader-theme-${choice.name}'),
-        onTap: widget.einkOverride
-            ? null
-            : () => _update(_value.copyWith(themePreset: choice)),
-        borderRadius: BorderRadius.circular(diameter / 2),
-        child: Container(
-          width: diameter,
-          height: diameter,
-          padding: const EdgeInsets.all(2),
-          decoration: BoxDecoration(
-            shape: BoxShape.circle,
-            border: Border.all(
-              color: selected
-                  ? preset.accentColor
-                  : Colors.transparent,
-              width: 1.3,
-            ),
-          ),
-          child: Container(
-            decoration: BoxDecoration(
-              shape: BoxShape.circle,
-              color: choice.backgroundColor,
-              border: Border.all(color: preset.borderColor, width: 0.5),
-            ),
-            alignment: Alignment.center,
-            child: Text(
-              '阅',
-              style: TextStyle(
-                color: choice.textColor,
-                fontSize: diameter * 13 / 38,
-              ),
-            ),
-          ),
+  Widget _brightnessSlider() {
+    const key = ValueKey('reader-brightness');
+    void change(double level) {
+      if (!_alive || _category != 'page') return;
+      setState(
+        () => value = value.copyWith(
+          brightness: level,
+          followSystemBrightness: false,
         ),
+      );
+      _brightnessPending = true;
+      widget.onBrightness(level);
+    }
+
+    return _adjustment(
+      ReaderValueSlider(
+        sliderKey: key,
+        label: '亮度',
+        value: value.followSystemBrightness
+            ? widget.systemBrightness ?? value.brightness
+            : value.brightness,
+        min: .02,
+        max: 1,
+        format: (n) => '${(n * 100).round()}%',
+        preset: _displayPreset,
+        onPreview: change,
+        onCommitted: (level) {
+          if (!_alive || _category != 'page') return;
+          change(level);
+          _brightnessPending = false;
+          widget.onBrightnessEnd();
+        },
+        onInteractionChanged: (active) => _preview(key, active),
       ),
+      key,
     );
   }
 
-  /// 字号 stepper (official akd): two pill areas with the live size between.
-  Widget _stepper({
-    required Key key,
-    required double value,
-    required double min,
-    required double max,
-    required String Function(double) format,
-    required ValueChanged<double> onStep,
-  }) {
-    final preset = _displayPreset;
-    Widget end(String glyph, double size, double delta, String tooltip) =>
-        Expanded(
-          child: Tooltip(
-            message: tooltip,
-            child: InkWell(
-              borderRadius: BorderRadius.circular(90),
-              onTap: delta < 0
-                  ? value > min
-                        ? () => onStep((value + delta).clamp(min, max).toDouble())
-                        : null
-                  : value < max
-                  ? () => onStep((value + delta).clamp(min, max).toDouble())
-                  : null,
-              child: Container(
-                height: 40,
-                alignment: Alignment.center,
-                decoration: BoxDecoration(
-                  color: preset.fieldColor,
-                  borderRadius: BorderRadius.circular(90),
-                ),
-                child: Text(
-                  glyph,
-                  style: TextStyle(
-                    color: preset.textColor,
-                    fontSize: size,
-                    fontWeight: FontWeight.w600,
-                  ),
-                ),
-              ),
-            ),
+  Widget _followSystem() => Align(
+    alignment: Alignment.centerRight,
+    child: GlassTextButton(
+      key: const ValueKey('reader-follow-system'),
+      compact: true,
+      selected: value.followSystemBrightness,
+      onPressed: () {
+        if (!_alive) return;
+        _flushAll();
+        setState(
+          () => value = value.copyWith(
+            followSystemBrightness: !value.followSystemBrightness,
           ),
         );
-    return SizedBox(
-      key: key,
-      height: 40,
-      child: Row(
-        children: [
-          end('A', 14, -1, '减小字号'),
-          Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 12),
-            child: Text(
-              format(value),
-              style: TextStyle(color: preset.accentColor, fontSize: 13),
-            ),
-          ),
-          end('A', 20, 1, '增大字号'),
-        ],
-      ),
-    );
-  }
-
-  /// Evenly divided option chips (official MultipleOptionsView): each ≥55dp,
-  /// 32dp tall, the selected one accented.
-  Widget _chips<T>({
-    required String key,
-    required Map<T, String> options,
-    required T selected,
-    required String Function(T) format,
-    required ValueChanged<T> onSelected,
-  }) => Row(
-    children: [
-      for (final entry in options.entries)
-        Expanded(
-          child: _chip(
-            key: ValueKey('$key-${entry.key}'),
-            label: entry.value,
-            selected: selected == entry.key,
-            onTap: () => onSelected(entry.key),
-          ),
-        ),
-    ],
+        widget.onFollowSystem();
+      },
+      child: const Text('跟随系统', style: TextStyle(fontSize: 12)),
+    ),
   );
 
-  Widget _chip({
-    required String label,
-    required bool selected,
-    required VoidCallback? onTap,
-    Key? key,
-  }) {
-    final preset = _displayPreset;
-    return Padding(
-      key: key,
-      padding: const EdgeInsets.symmetric(horizontal: 2),
-      child: Material(
-        color: selected
-            ? preset.accentColor.withValues(alpha: 0.14)
-            : preset.fieldColor,
-        borderRadius: BorderRadius.circular(90),
-        clipBehavior: Clip.antiAlias,
-        child: InkWell(
-          onTap: onTap,
-          child: Container(
-            height: 32,
-            alignment: Alignment.center,
-            child: Text(
-              label,
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
-              style: TextStyle(
-                color: selected ? preset.accentColor : preset.mutedTextColor,
-                fontSize: 12,
-                fontWeight: selected ? FontWeight.w600 : FontWeight.w400,
+  Widget _autoTurn() => _adjustment(
+    ReaderSettingsNavRow(
+      key: const ValueKey('reader-auto-turn'),
+      label: widget.autoTurnActive ? '停止自动翻页' : '自动翻页',
+      icon: widget.autoTurnActive
+          ? LucideIcons.circle_pause
+          : LucideIcons.circle_play,
+      onTap: widget.onAutoTurn == null ? null : () => _close(widget.onAutoTurn),
+    ),
+  );
+
+  Widget _spacingRow() => ReaderSettingsRow(
+    label: '间距',
+    child: ReaderSettingsChipRow(
+      children: [
+        for (final option in const [
+          ('compact', '紧凑', 1.5, 6.0, 12.0, 8.0),
+          ('standard', '标准', 1.8, 12.0, 20.0, 16.0),
+          ('loose', '宽松', 2.1, 20.0, 32.0, 28.0),
+        ])
+          ReaderSettingsChip(
+            key: ValueKey('reader-spacing-${option.$1}'),
+            label: option.$2,
+            selected:
+                (value.lineHeight - option.$3).abs() < .001 &&
+                (value.paragraphSpacing - option.$4).abs() < .001 &&
+                (value.horizontalPadding - option.$5).abs() < .001 &&
+                (value.verticalPadding - option.$6).abs() < .001,
+            onTap: () => _apply(
+              value.copyWith(
+                lineHeight: option.$3,
+                paragraphSpacing: option.$4,
+                horizontalPadding: option.$5,
+                verticalPadding: option.$6,
               ),
             ),
           ),
-        ),
-      ),
-    );
-  }
+      ],
+    ),
+  );
 
-  /// Official toggle row: label (with optional subtitle) left, switch right.
-  Widget _toggle(
-    String label, {
-    String? subtitle,
-    required bool value,
-    required ValueChanged<bool> onChanged,
-  }) {
-    final preset = _displayPreset;
-    return Container(
-      margin: const EdgeInsets.fromLTRB(16, 0, 16, 12),
-      child: Row(
-        children: [
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Text(
-                  label,
-                  style: TextStyle(color: preset.textColor, fontSize: 13),
-                ),
-                if (subtitle != null)
-                  Padding(
-                    padding: const EdgeInsets.only(top: 2),
-                    child: Text(
-                      subtitle,
-                      style: TextStyle(
-                        color: preset.mutedTextColor,
-                        fontSize: 11,
-                      ),
+  Widget _backgroundChoices() => Padding(
+    padding: const EdgeInsets.symmetric(vertical: 8),
+    child: Wrap(
+      spacing: 10,
+      runSpacing: 10,
+      children: [
+        for (final choice in ReaderThemePreset.values)
+          Semantics(
+            selected: choice == _displayPreset,
+            button: true,
+            label: '${choice.label}阅读背景',
+            child: GlassTextButton(
+              key: ValueKey('reader-theme-${choice.name}'),
+              selected: choice == _displayPreset,
+              onPressed: _backgroundLocked
+                  ? null
+                  : () => _apply(value.copyWith(themePreset: choice)),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Container(
+                    width: 18,
+                    height: 18,
+                    decoration: BoxDecoration(
+                      color: choice.backgroundColor,
+                      shape: BoxShape.circle,
+                      border: Border.all(color: _displayPreset.borderColor),
                     ),
                   ),
-              ],
+                  const SizedBox(width: 6),
+                  Text(choice.label),
+                ],
+              ),
             ),
           ),
-          Switch(value: value, onChanged: onChanged),
-        ],
-      ),
-    );
-  }
-
-  /// Fine-grained slider (no official counterpart — kept under 更多排版).
-  Widget _metric(
-    String label,
-    String key,
-    double value,
-    double min,
-    double max,
-    double step,
-    ReaderPreferences Function(double) update, {
-    int decimals = 0,
-  }) {
-    final preset = _displayPreset;
-    return Column(
-      children: [
-        Row(
-          children: [
-            Expanded(
-              child: Text(
-                label,
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-                style: TextStyle(color: preset.textColor, fontSize: 13),
-              ),
-            ),
-            Text(
-              value.toStringAsFixed(decimals),
-              style: TextStyle(
-                color: preset.accentColor,
-                fontSize: 13,
-                fontWeight: FontWeight.w600,
-              ),
-            ),
-          ],
-        ),
-        Row(
-          children: [
-            IconButton(
-              tooltip: '减小$label',
-              visualDensity: VisualDensity.compact,
-              constraints: const BoxConstraints(minWidth: 32, minHeight: 44),
-              padding: EdgeInsets.zero,
-              onPressed: value > min
-                  ? () => _update(update((value - step).clamp(min, max)))
-                  : null,
-              icon: const Icon(LucideIcons.minus, size: 16),
-            ),
-            Expanded(
-              child: Slider(
-                key: ValueKey(key),
-                value: value.clamp(min, max),
-                min: min,
-                max: max,
-                divisions: ((max - min) / step).round(),
-                padding: const EdgeInsets.symmetric(horizontal: 4),
-                activeColor: preset.accentColor,
-                onChanged: (value) => _update(update(value)),
-                onChangeEnd: (value) => _flushNotify(),
-                semanticFormatterCallback: (value) =>
-                    '$label ${value.toStringAsFixed(decimals)}',
-              ),
-            ),
-            IconButton(
-              tooltip: '增大$label',
-              visualDensity: VisualDensity.compact,
-              constraints: const BoxConstraints(minWidth: 32, minHeight: 44),
-              padding: EdgeInsets.zero,
-              onPressed: value < max
-                  ? () => _update(update((value + step).clamp(min, max)))
-                  : null,
-              icon: const Icon(LucideIcons.plus, size: 16),
-            ),
-          ],
-        ),
       ],
-    );
-  }
-
-  /// 墨水屏整屏刷新间隔行：0 关闭，1-100 表示每翻这么多页全刷一次压残影。
-  /// 仅在全局墨水屏模式开启（[widget.einkOverride]）时由 build 渲染。
-  Widget _einkRefreshIntervalRow() {
-    final preset = _displayPreset;
-    final interval = _value.einkRefreshInterval.clamp(0, 100);
-    final label = interval == 0 ? '关闭' : '$interval 页';
-    return Container(
-      margin: const EdgeInsets.fromLTRB(16, 0, 16, 12),
-      constraints: const BoxConstraints(minHeight: 40),
-      child: Column(
-        children: [
-          Row(
-            children: [
-              SizedBox(
-                width: 64,
-                child: Text(
-                  '整屏刷新',
-                  style: TextStyle(color: preset.textColor, fontSize: 13),
-                ),
-              ),
-              const SizedBox(width: 12),
-              Expanded(
-                child: Text(
-                  '每翻 $label 全刷一次',
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: TextStyle(color: preset.textColor, fontSize: 13),
-                ),
-              ),
-              Text(
-                label,
-                style: TextStyle(
-                  color: preset.accentColor,
-                  fontSize: 13,
-                  fontWeight: FontWeight.w600,
-                ),
-              ),
-            ],
-          ),
-          Row(
-            children: [
-              IconButton(
-                tooltip: '减小刷新间隔',
-                visualDensity: VisualDensity.compact,
-                constraints: const BoxConstraints(minWidth: 32, minHeight: 44),
-                padding: EdgeInsets.zero,
-                onPressed: interval > 0
-                    ? () => _update(
-                        _value.copyWith(einkRefreshInterval: interval - 1),
-                      )
-                    : null,
-                icon: const Icon(LucideIcons.minus, size: 16),
-              ),
-              Expanded(
-                child: Slider(
-                  key: const ValueKey('einkRefreshInterval'),
-                  value: interval.toDouble(),
-                  min: 0,
-                  max: 100,
-                  divisions: 100,
-                  padding: const EdgeInsets.symmetric(horizontal: 4),
-                  activeColor: preset.accentColor,
-                  onChanged: (value) => _update(
-                    _value.copyWith(einkRefreshInterval: value.round()),
-                  ),
-                  onChangeEnd: (_) => _flushNotify(),
-                  semanticFormatterCallback: (value) =>
-                      '每翻 ${value.round()} 页全刷',
-                ),
-              ),
-              IconButton(
-                tooltip: '增大刷新间隔',
-                visualDensity: VisualDensity.compact,
-                constraints: const BoxConstraints(minWidth: 32, minHeight: 44),
-                padding: EdgeInsets.zero,
-                onPressed: interval < 100
-                    ? () => _update(
-                        _value.copyWith(einkRefreshInterval: interval + 1),
-                      )
-                    : null,
-                icon: const Icon(LucideIcons.plus, size: 16),
-              ),
-            ],
-          ),
-        ],
-      ),
-    );
-  }
+    ),
+  );
 }

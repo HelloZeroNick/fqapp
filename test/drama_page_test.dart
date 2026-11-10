@@ -1,6 +1,8 @@
 import 'dart:async';
 import 'dart:io';
 
+import 'package:flutter/foundation.dart';
+import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -16,15 +18,22 @@ import 'package:fqapp/models/series_detail.dart';
 import 'package:fqapp/pages/drama_page.dart';
 import 'package:fqapp/pages/player_page.dart';
 import 'package:fqapp/pages/series_detail_page.dart';
+import 'package:fqapp/pages/search_page.dart';
 import 'package:fqapp/pages/home_provider.dart';
 import 'package:fqapp/services/api_client.dart';
+import 'package:fqapp/services/app_theme.dart';
+import 'package:fqapp/services/desktop_platform.dart';
+import 'package:fqapp/services/drama_channel_preferences.dart';
 import 'package:fqapp/services/library_store.dart';
 import 'package:fqapp/services/player_style_config.dart';
 import 'package:fqapp/services/shelf_store.dart';
 import 'package:fqapp/services/swipe_guide_store.dart';
 
 import 'package:fqapp/services/digg_store.dart';
+import 'package:fqapp/widgets/tab_swipe_area.dart';
 import 'package:fqapp/widgets/video_player_chrome.dart';
+import 'package:fqapp/widgets/shell_dock.dart';
+import 'package:fqapp/widgets/wenku/wenku_ui.dart';
 import 'support/controlled_player.dart';
 
 MediaItem _item(
@@ -129,11 +138,15 @@ Future<void> _swipeUp(WidgetTester tester) async {
 /// player and an address loader: a case that is not about inline playback must
 /// neither reach the real backend nor allocate a real native player.
 class _Seams {
-  _Seams({this.failContent = true});
+  _Seams({this.failContent = true, this.createGate});
 
   /// Whether the injected address loader refuses, which is the cheapest way to
   /// keep a card from creating a player.
   final bool failContent;
+
+  /// When set, the injected player's `create` waits for it, which keeps an
+  /// activation pending across a lifecycle change.
+  final Completer<void>? createGate;
   final players = <ControlledNativePlayer>[];
   final contentCalls = <String>[];
   final store = ControlledReaderStore();
@@ -141,7 +154,7 @@ class _Seams {
   DramaPage page({
     Future<List<List<Chapter>>> Function(String id, String tab)?
     directoryLoader,
-    Widget Function()? searchPageBuilder,
+    Widget Function(SearchCategory category)? searchPageBuilder,
     Future<ChannelTable> Function()? channelLoader,
     Future<SeriesDetail> Function(String seriesId)? seriesDetailLoader,
     Future<PlayletCommentPage> Function(String seriesId)? seriesCommentLoader,
@@ -157,7 +170,7 @@ class _Seams {
     },
     historyStore: store,
     playerFactory: () {
-      final player = ControlledNativePlayer();
+      final player = ControlledNativePlayer(createGate: createGate);
       players.add(player);
       return player;
     },
@@ -173,11 +186,26 @@ Future<void> _flush(WidgetTester tester) async {
   await tester.pump(const Duration(milliseconds: 16));
 }
 
+/// 横滑切标签的三段动画：送出 110ms → onSelect → 迎入 190ms。
+///
+/// `_flush` 只推进 16ms，动画跑完之前 `onSelect` 还没发出、频道不会换，所以
+/// 凡断言切换结果的地方都要先推过这一整段。逐帧推而不是 `pump` 一次大步长：
+/// 大步长会错过 `endOfFrame` 那一轮的重建。
+Future<void> _settleSwipe(WidgetTester tester) async {
+  for (var i = 0; i < 24; i++) {
+    await tester.pump(const Duration(milliseconds: 16));
+  }
+  await _flush(tester);
+}
+
 late Directory _hiveDir;
 
 void main() {
   // 本地列表和播放回归共用存储；开箱 I/O 保持在 fake-async 区外。
   setUp(() async {
+    // 频道选择是进程级静态态：上一个用例点过「收藏」就会带进下一个用例的
+    // 冷启动恢复，必须先清掉。
+    DramaChannelPreferences.reset();
     _hiveDir = await Directory.systemTemp.createTemp('fqapp-drama-test-');
     Hive.init(_hiveDir.path);
     // 生产 config.json 发新底栏（use_new_player_bottom_style=true）；测试
@@ -397,6 +425,119 @@ void main() {
     await _flush(tester);
   });
 
+  // 与上面同一条生命周期链，但起点是**用户手动暂停**：退到后台再回来
+  // 不许把这次暂停当成可见性暂停撤销。桌面端已有同款用例；Android 的回
+  // 前台续播此前无条件执行，同样会推翻手动暂停。
+  testWidgets('feed：手动暂停后切后台再回来不许自动续播', (tester) async {
+    SharedPreferences.setMockInitialValues({});
+    debugDefaultTargetPlatformOverride = TargetPlatform.android;
+    await tester.binding.setSurfaceSize(const Size(360, 800));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
+    addTearDown(
+      () => tester.binding.handleAppLifecycleStateChanged(
+        AppLifecycleState.resumed,
+      ),
+    );
+
+    final seams = _Seams(failContent: false);
+    await tester.pumpWidget(
+      _scope(
+        child: MaterialApp(
+          home: seams.page(
+            directoryLoader: (id, tab) async => [
+              [Chapter(itemId: '$id-1', title: '第1集', volumeName: '剧集')],
+            ],
+          ),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+    final player = seams.players.single;
+    expect(player.isPlaying, true);
+
+    // 用户手动暂停（单击暂停 / 桌面 chrome 暂停钮都落到播放器上）。
+    await player.pause();
+    await _flush(tester);
+    expect(player.isPlaying, false);
+    final playsAfterManualPause = player.calls
+        .where((call) => call == 'play')
+        .length;
+
+    // 退到后台（hidden）再回前台（resumed）：手动暂停必须保持。
+    tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.hidden);
+    await _flush(tester);
+    tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
+    await _flush(tester);
+    expect(player.isPlaying, false);
+    expect(
+      player.calls.where((call) => call == 'play').length,
+      playsAfterManualPause,
+    );
+
+    await tester.pumpWidget(const SizedBox.shrink());
+    await _flush(tester);
+    debugDefaultTargetPlatformOverride = null;
+  });
+
+  // 激活还没完成（播放器已建、create 还没返回）时切到后台：hidden 分支的
+  // pause() 会把会话意图置假，但当时没有在播的播放器可记账。此前 Android
+  // 回前台无条件续播掩盖了这个空洞；只认「可见性暂停」后，若不把激活中的
+  // 意图也记账，回前台就没人把意图置真，激活收尾时跳过 play，卡片冻住。
+  testWidgets('feed：激活未完成时切后台，回来仍自动续播', (tester) async {
+    SharedPreferences.setMockInitialValues({});
+    debugDefaultTargetPlatformOverride = TargetPlatform.android;
+    await tester.binding.setSurfaceSize(const Size(360, 800));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
+    addTearDown(
+      () => tester.binding.handleAppLifecycleStateChanged(
+        AppLifecycleState.resumed,
+      ),
+    );
+
+    final gate = Completer<void>();
+    final seams = _Seams(failContent: false, createGate: gate);
+    await tester.pumpWidget(
+      _scope(
+        child: MaterialApp(
+          home: seams.page(
+            directoryLoader: (id, tab) async => [
+              [Chapter(itemId: '$id-1', title: '第1集', volumeName: '剧集')],
+            ],
+          ),
+        ),
+      ),
+    );
+    // 停在 create 门前：播放器对象已交给会话，但解码器还没建好。
+    for (var i = 0; i < 20 && seams.players.isEmpty; i++) {
+      await _flush(tester);
+    }
+    final player = seams.players.single;
+    expect(player.calls, contains(startsWith('create:')));
+    expect(player.isCreated, false);
+    expect(player.isPlaying, false);
+
+    // 退到后台（hidden）再回前台，此时激活仍未完成。
+    tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.hidden);
+    await _flush(tester);
+    tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
+    await _flush(tester);
+    expect(player.isPlaying, false);
+
+    // 激活收尾：回前台时恢复的意图必须让它起播。
+    gate.complete();
+    for (var i = 0; i < 20 && !player.isPlaying; i++) {
+      await _flush(tester);
+    }
+    expect(player.isPlaying, true);
+    expect(player.calls, contains('play'));
+
+    await tester.pumpWidget(const SizedBox.shrink());
+    await _flush(tester);
+    debugDefaultTargetPlatformOverride = null;
+  });
+
   testWidgets('the feed shows the official chrome and one full-screen card', (
     tester,
   ) async {
@@ -416,10 +557,16 @@ void main() {
     expect(find.text('请输入短剧名或主演名'), findsOneWidget);
     expect(find.text('推荐'), findsOneWidget);
     expect(find.text('漫剧'), findsOneWidget);
+    // 频道 tag 的按压反馈也走圆角，不再是一块方角高亮。
+    final channelInk = tester.widget<InkWell>(
+      find.ancestor(of: find.text('推荐'), matching: find.byType(InkWell)).first,
+    );
+    expect(channelInk.borderRadius, BorderRadius.circular(12));
     expect(find.byKey(const Key('drama_search_button')), findsOneWidget);
-    // 官方 `ap3.xml` 的 `@id/h4f` 是 20dp **搜索**按钮（`Xh()` → `mh()`
-    // 「点击新按钮 从书城进如搜索页」），不是刷新按钮。刷新在官方是下拉手势。
-    expect(find.byKey(const Key('drama_strip_search_button')), findsOneWidget);
+    // 官方 `ap3.xml` 的 `@id/h4f` 是 20dp 搜索钮，但手机端顶部已有整条
+    // 搜索框，两处入口重复（2026-10-25 用户要求移除）。桌面端没有搜索行，
+    // 才保留频道条右端这一处入口。
+    expect(find.byKey(const Key('drama_strip_search_button')), findsNothing);
 
     // 全屏卡片保留底部观看与信息入口，用户移除了右侧追剧、点赞栏。
     expect(find.byKey(const Key('drama_feed')), findsOneWidget);
@@ -441,6 +588,19 @@ void main() {
     // 距底 94dp）。官方 `pp3.f` 是 300ms 淡入后 **8 次 1s 计数**才淡出
     // （第二轮笔记的「1s 后消失」是误读），且每台设备只弹一次。
     expect(find.text('上滑查看更多视频'), findsOneWidget);
+    // 提示条也是圆角（与 in-feed 的倍速提示一致），不是方角黑块。
+    final hintBox = tester.widget<DecoratedBox>(
+      find
+          .ancestor(
+            of: find.text('上滑查看更多视频'),
+            matching: find.byType(DecoratedBox),
+          )
+          .first,
+    );
+    expect(
+      (hintBox.decoration as BoxDecoration).borderRadius,
+      BorderRadius.circular(24),
+    );
     expect(find.text('16-1 作品'), findsNothing);
     // 8 秒内一直在。
     await tester.pump(const Duration(seconds: 5));
@@ -449,6 +609,221 @@ void main() {
     // 挂载在 8.3s 结束，这里泵到 8.7s。
     await tester.pump(const Duration(seconds: 3, milliseconds: 700));
     expect(find.text('上滑查看更多视频'), findsNothing);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('频道条按首页留白，标签切换沿用首页放大动画', (tester) async {
+    await tester.binding.setSurfaceSize(const Size(360, 800));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    addTearDown(() => tester.pumpWidget(const SizedBox.shrink()));
+
+    await tester.pumpWidget(
+      _scope(perTab: 1, child: MaterialApp(home: _Seams().page())),
+    );
+    await _flush(tester);
+
+    // 搜索行 51dp（6 + 36 + 9），选中 24sp 标签的顶部与搜索框底边之间
+    // 至少留出 9dp；旧的 38dp 搜索行只有约 7dp，标签贴着搜索框。
+    final search = tester.getRect(find.byKey(const Key('drama_search_button')));
+    final selectedTab = tester.getRect(find.text('推荐'));
+    expect(selectedTab.top - search.bottom, greaterThanOrEqualTo(9));
+
+    double fontSizeOf(String label) {
+      final rich = tester.widget<RichText>(
+        find.descendant(of: find.text(label), matching: find.byType(RichText)),
+      );
+      return rich.text.style!.fontSize!;
+    }
+
+    // 首页的字号档位：选中 24sp、未选中 16sp。
+    expect(fontSizeOf('推荐'), 24);
+    expect(fontSizeOf('看剧'), 16);
+
+    await tester.tap(find.text('看剧'));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 90));
+    // 切换不是瞬间跳字号：180ms 动画走到一半时两档都还在中间值。
+    expect(fontSizeOf('推荐'), greaterThan(16));
+    expect(fontSizeOf('推荐'), lessThan(24));
+    expect(fontSizeOf('看剧'), greaterThan(16));
+    expect(fontSizeOf('看剧'), lessThan(24));
+
+    await tester.pump(const Duration(milliseconds: 150));
+    expect(fontSizeOf('推荐'), 16);
+    expect(fontSizeOf('看剧'), 24);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('大字号下频道条随选中字号长高，不撞破搜索框', (tester) async {
+    await tester.binding.setSurfaceSize(const Size(360, 800));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    addTearDown(() => tester.pumpWidget(const SizedBox.shrink()));
+
+    await tester.pumpWidget(
+      _scope(
+        perTab: 1,
+        child: MaterialApp(
+          builder: (context, child) => MediaQuery(
+            data: MediaQuery.of(
+              context,
+            ).copyWith(textScaler: const TextScaler.linear(2)),
+            child: child!,
+          ),
+          home: _Seams().page(),
+        ),
+      ),
+    );
+    await _flush(tester);
+
+    final tab = tester.getRect(
+      find.ancestor(of: find.text('推荐'), matching: find.byType(InkWell)).first,
+    );
+    final search = tester.getRect(find.byKey(const Key('drama_search_button')));
+    // 24sp 在 2 倍字号下已有 52.8dp 高，锁死 38dp 会溢出；条带要跟着长高。
+    expect(tab.height, greaterThan(38));
+    expect(tab.top, greaterThan(search.bottom));
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('冷启动回到上次看的频道，搜索占位跟着频道语境', (tester) async {
+    await tester.binding.setSurfaceSize(const Size(360, 800));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    addTearDown(() => tester.pumpWidget(const SizedBox.shrink()));
+
+    // 官方把上次频道写进 SP（`last_tab_type` 语义）：这里上次停在漫剧（24）。
+    SharedPreferences.setMockInitialValues({
+      DramaChannelPreferences.key: kChannelDynamicComic,
+      DramaChannelPreferences.lastKey: kChannelVideoFeed,
+    });
+    DramaChannelPreferences.reset();
+    DramaChannelPreferences.load(await SharedPreferences.getInstance());
+
+    await tester.pumpWidget(
+      _scope(perTab: 1, child: MaterialApp(home: _Seams().page())),
+    );
+    await _flush(tester);
+    await tester.pumpAndSettle();
+
+    // 首帧就落在漫剧：网格直接是 24 的流，不再先闪一下「推荐」。
+    expect(find.text('24-0 作品'), findsOneWidget);
+    expect(find.text('16-0 作品'), findsNothing);
+    // 搜索占位跟着频道语境走（漫剧频道搜漫剧）。
+    expect(find.text('请输入漫剧名或主演名'), findsOneWidget);
+    expect(find.text('请输入短剧名或主演名'), findsNothing);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('上次频道不在本地表里就回落到推荐', (tester) async {
+    await tester.binding.setSurfaceSize(const Size(360, 800));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    addTearDown(() => tester.pumpWidget(const SizedBox.shrink()));
+
+    // 28＝预约：服务端会下发，本地没有数据源、刻意不渲染。恢复时找不到
+    // 对应频道必须稳稳落在「推荐」，不能空表越界。
+    DramaChannelPreferences.selectedType = 28;
+
+    await tester.pumpWidget(
+      _scope(perTab: 1, child: MaterialApp(home: _Seams().page())),
+    );
+    await _flush(tester);
+
+    expect(find.text('16-0 作品'), findsOneWidget);
+    expect(find.text('请输入短剧名或主演名'), findsOneWidget);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('频道条把选中项滚进视口，切换后写回 SP', (tester) async {
+    await tester.binding.setSurfaceSize(const Size(360, 800));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    addTearDown(() => tester.pumpWidget(const SizedBox.shrink()));
+
+    SharedPreferences.setMockInitialValues({
+      DramaChannelPreferences.key: kChannelDynamicComic,
+      DramaChannelPreferences.lastKey: kChannelVideoFeed,
+    });
+    DramaChannelPreferences.reset();
+    DramaChannelPreferences.load(await SharedPreferences.getInstance());
+
+    await tester.pumpWidget(
+      _scope(
+        perTab: 1,
+        child: MaterialApp(
+          // 2 倍字号（Android 上限）下五个标签总宽超出 360dp：不滚的话
+          // 恢复到的「漫剧」会卡在视口外。
+          builder: (context, child) => MediaQuery(
+            data: MediaQuery.of(
+              context,
+            ).copyWith(textScaler: const TextScaler.linear(2)),
+            child: child!,
+          ),
+          home: _Seams().page(),
+        ),
+      ),
+    );
+    await _flush(tester);
+    await tester.pumpAndSettle();
+
+    final strip = tester.widget<SingleChildScrollView>(
+      find.byKey(const Key('drama_channel_strip')),
+    );
+    // 恢复到的「漫剧」在视口右端之外：首帧就该把条带滚过去。
+    expect(strip.controller!.offset, greaterThan(0));
+    final manju = tester.getRect(find.text('漫剧'));
+    expect(manju.left, greaterThanOrEqualTo(0));
+    expect(manju.right, lessThanOrEqualTo(360));
+
+    // 点「看剧」：条带跟着滚回去，选中项始终完整可见。
+    final before = strip.controller!.offset;
+    await tester.tap(find.text('看剧'));
+    await tester.pumpAndSettle();
+    expect(strip.controller!.offset, lessThan(before));
+    final episode = tester.getRect(find.text('看剧'));
+    expect(episode.left, greaterThanOrEqualTo(0));
+    expect(episode.right, lessThanOrEqualTo(360));
+    expect(find.text('8-0 作品'), findsOneWidget);
+
+    // 选择写回 SP：下次冷启动落在看剧（8），上一次是漫剧（24）。
+    expect(DramaChannelPreferences.selectedType, kChannelVideoEpisode);
+    expect(DramaChannelPreferences.lastType, kChannelDynamicComic);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('分区搜索带上频道语境：漫剧频道落漫剧分类', (tester) async {
+    await tester.binding.setSurfaceSize(const Size(360, 800));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    addTearDown(() => tester.pumpWidget(const SizedBox.shrink()));
+
+    final opened = <SearchCategory>[];
+    await tester.pumpWidget(
+      _scope(
+        perTab: 1,
+        child: MaterialApp(
+          home: _Seams().page(
+            searchPageBuilder: (category) {
+              opened.add(category);
+              return const Scaffold(body: Text('搜索页'));
+            },
+          ),
+        ),
+      ),
+    );
+    await _flush(tester);
+
+    // 推荐频道的内容是短剧，搜索落「短剧」分类。
+    await tester.tap(find.byKey(const Key('drama_search_button')));
+    await tester.pumpAndSettle();
+    expect(opened, [SearchCategory.video]);
+    expect(find.text('搜索页'), findsOneWidget);
+
+    tester.state<NavigatorState>(find.byType(Navigator)).pop();
+    await tester.pumpAndSettle();
+
+    // 切到漫剧再进搜索：落在「漫剧」分类，而不是「综合」。
+    await tester.tap(find.text('漫剧'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const Key('drama_search_button')));
+    await tester.pumpAndSettle();
+    expect(opened, [SearchCategory.video, SearchCategory.manju]);
     expect(tester.takeException(), isNull);
   });
 
@@ -713,6 +1088,7 @@ void main() {
   testWidgets('the bottom bar lists 短剧 right after 首页', (tester) async {
     await tester.binding.setSurfaceSize(const Size(400, 800));
     addTearDown(() => tester.binding.setSurfaceSize(null));
+    addTearDown(() => dramaLightPageNotifier.value = false);
     addTearDown(() => tester.pumpWidget(const SizedBox.shrink()));
 
     await tester.pumpWidget(
@@ -723,10 +1099,8 @@ void main() {
     await tester.pumpAndSettle();
 
     // Scoped to the bar: the home page's own category strip also has a 短剧 entry.
-    Finder navLabel(String label) => find.descendant(
-      of: find.byType(NavigationBar),
-      matching: find.text(label),
-    );
+    Finder navLabel(String label) =>
+        find.descendant(of: find.byType(GlassDock), matching: find.text(label));
 
     final home = tester.getCenter(navLabel('首页')).dx;
     final drama = tester.getCenter(navLabel('短剧')).dx;
@@ -744,6 +1118,23 @@ void main() {
     expect(find.byKey(const Key('drama_feed')), findsOneWidget);
     // 用户已移除右侧追剧入口。
     expect(find.text('追剧'), findsNothing);
+
+    // 浅色外观下：推荐是视频流，dock 仍是深色玻璃；切到看剧（浅色页）后
+    // dock 跟着回浅色，不能页面是奶白、dock 还是一条黑的。
+    Brightness dockBrightness() =>
+        Theme.of(tester.element(find.byType(GlassDock))).brightness;
+    ShellDock shellDock() => tester.widget<ShellDock>(find.byType(ShellDock));
+
+    expect(dockBrightness(), Brightness.dark);
+    expect(shellDock().staticMaterial, isTrue, reason: '视频流上不做实时折射');
+    await tester.tap(find.text('看剧'));
+    await tester.pumpAndSettle();
+    expect(dockBrightness(), Brightness.light);
+    expect(shellDock().staticMaterial, isFalse);
+    await tester.tap(find.text('推荐'));
+    await tester.pumpAndSettle();
+    expect(dockBrightness(), Brightness.dark);
+    expect(shellDock().staticMaterial, isTrue);
     // The shell mounts its own DramaPage without seams, so its inline session
     // starts a real directory request here. Advance past the client timeout to
     // drain that timer, which would otherwise outlive the test.
@@ -799,6 +1190,19 @@ void main() {
       expect(find.text('漫剧'), findsNWidgets(3));
       expect(find.text('全球杀机 作品'), findsOneWidget);
 
+      // 悬浮顶栏（搜索 51 + 频道条 38）是 Stack 里的悬浮层，筛选行必须整体
+      // 让到它下面。实现里曾写死 top+84（＝旧 38+38+8），搜索行加高后
+      // chips 上沿会钻到频道条里 5dp。
+      final strip = tester.getRect(
+        find
+            .ancestor(of: find.text('推荐'), matching: find.byType(InkWell))
+            .first,
+      );
+      final chips = tester.getRect(
+        find.byKey(const Key('drama_recent_filter')),
+      );
+      expect(chips.top, greaterThanOrEqualTo(strip.bottom + 8));
+
       // 漫剧 chip（作用域限定在筛选行，避免命中频道条）→ 只剩漫剧卡。
       await tester.tap(
         find.descendant(
@@ -830,6 +1234,32 @@ void main() {
       await _flush(tester);
       expect(find.text('全球杀机 作品'), findsOneWidget);
       expect(find.text('仙渊道尘 作品'), findsOneWidget);
+
+      // 「其他视频」没有数据源，恒为空：空结果时筛选行必须留着，
+      // 否则用户被锁在这一类里，回不到「全部」。
+      await tester.tap(
+        find.descendant(
+          of: find.byKey(const Key('drama_recent_filter')),
+          matching: find.text('其他视频'),
+        ),
+      );
+      await _flush(tester);
+      expect(find.byKey(const Key('drama_最近_grid')), findsNothing);
+      expect(find.text('暂无浏览历史'), findsOneWidget);
+      expect(find.byKey(const Key('drama_recent_filter')), findsOneWidget);
+      // 没有可编辑的记录就不给「编辑」：编辑头只在有记录时出现，
+      // 点进去就没有「完成」可按了。
+      expect(find.byKey(const Key('drama_recent_edit')), findsNothing);
+
+      await tester.tap(
+        find.descendant(
+          of: find.byKey(const Key('drama_recent_filter')),
+          matching: find.text('全部'),
+        ),
+      );
+      await _flush(tester);
+      expect(find.text('全球杀机 作品'), findsOneWidget);
+      expect(find.text('仙渊道尘 作品'), findsOneWidget);
       expect(tester.takeException(), isNull);
     },
   );
@@ -840,7 +1270,8 @@ void main() {
     (tester) async {
       // 反编译：收藏同样有编辑头/长按进编辑/删除专用底条（`bb3.p0`）与
       // GenreScrollTabLayout 筛选行；编辑头标题 `ye()` 在筛选「全部」时就是
-      // 「全部」；删除确认框是「确认删除吗？」+ 按钮文案「删除」。
+      // 「全部」；官方删除确认框是「确认删除吗？」+ 按钮文案「删除」，
+      // 本项目按 issue #126 不弹、直接执行（见 `_confirmDelete`）。
       await tester.binding.setSurfaceSize(const Size(360, 800));
       addTearDown(() => tester.binding.setSurfaceSize(null));
       addTearDown(() => tester.pumpWidget(const SizedBox.shrink()));
@@ -894,15 +1325,13 @@ void main() {
       // 已选择后缀 = 官方 `xe()`：漫剧/短剧之外一律「视频」。
       expect(find.text('已选择 1 个视频'), findsOneWidget);
 
-      // 全选 → 删除 → 官方确认框「确认删除吗？」。
+      // 全选 → 删除：收藏删除可逆，按 #126 直接执行、不弹确认框。
       await tester.tap(find.byKey(const Key('drama_recent_select_all')));
       await _flush(tester);
       expect(find.text('已选择 2 个视频'), findsOneWidget);
       await tester.tap(find.byKey(const Key('drama_shelf_delete')));
       await tester.pumpAndSettle();
-      expect(find.text('确认删除吗？'), findsOneWidget);
-      await tester.tap(find.byKey(const Key('drama_shelf_delete_confirm')));
-      await tester.pumpAndSettle();
+      expect(find.text('确认删除吗？'), findsNothing);
       // Hive 的写 Future 在真实异步里完成（删除即时生效于内存，revision
       // 通知却等持久化 resolve），测试的 fake-async 需要放行真实时钟。
       await tester.runAsync(() async {
@@ -948,6 +1377,120 @@ void main() {
     // 本地表里没被服务端下发的频道不该再出现。
     expect(find.text('收藏'), findsNothing);
     expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('服务端把同一频道下发两次时，频道条只留一个标签', (tester) async {
+    await tester.binding.setSurfaceSize(const Size(360, 800));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    addTearDown(() => tester.pumpWidget(const SizedBox.shrink()));
+    await tester.pumpWidget(
+      _scope(
+        perTab: 1,
+        child: MaterialApp(
+          home: _Seams().page(
+            channelLoader: () async => const ChannelTable(
+              tabs: [
+                ChannelTab(type: kChannelVideoFeed, title: '推荐'),
+                // 上游真会把同一条 tab_type 下发两次（`tab_item` 原序透传、
+                // 不去重），频道条上就会并排出现两个「漫剧」。
+                ChannelTab(type: kChannelDynamicComic, title: '漫剧'),
+                ChannelTab(type: kChannelVideoEpisode, title: '看剧'),
+                ChannelTab(type: kChannelDynamicComic, title: '漫剧'),
+                // 8 与 4 在 serverChannelOf 里是同一个 case，也该塌成一条。
+                ChannelTab(type: kChannelVideo, title: '看剧'),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+    await _flush(tester);
+    expect(find.text('漫剧'), findsOneWidget, reason: '同一频道被下发了两次');
+    expect(find.text('看剧'), findsOneWidget, reason: '8 与 4 不该各占一条');
+    expect(find.text('推荐'), findsOneWidget);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('被名字兼顶拦下的那条不能白占频道身份', (tester) async {
+    await tester.binding.setSurfaceSize(const Size(360, 800));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    addTearDown(() => tester.pumpWidget(const SizedBox.shrink()));
+    await tester.pumpWidget(
+      _scope(
+        perTab: 1,
+        child: MaterialApp(
+          home: _Seams().page(
+            channelLoader: () async => const ChannelTable(
+              tabs: [
+                ChannelTab(type: kChannelVideoFeed, title: '推荐'),
+                // 漫剧被服务端改名成「独家」。
+                ChannelTab(type: kChannelDynamicComic, title: '独家'),
+                // 看剧也被叫「独家」：名字兼顶拦下它，但它占的频道身份
+                // 必须跟着退回，不能影响下一条。
+                ChannelTab(type: kChannelVideoEpisode, title: '独家'),
+                // 4 与 8 是同一个频道，这条名字不冲突，应该被保留。
+                ChannelTab(type: kChannelVideo, title: '看剧'),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+    await _flush(tester);
+    expect(find.text('推荐'), findsOneWidget);
+    expect(find.text('独家'), findsOneWidget);
+    expect(find.text('看剧'), findsOneWidget, reason: '前一条同身份的被名字拦下后，这一条不该被连带吞掉');
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('服务端频道表替换后，预览不能拿旧快照的新形态画', (tester) async {
+    await tester.binding.setSurfaceSize(const Size(360, 800));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    addTearDown(() => tester.pumpWidget(const SizedBox.shrink()));
+    SharedPreferences.setMockInitialValues({});
+    DramaChannelPreferences.reset();
+    DramaChannelPreferences.load(await SharedPreferences.getInstance());
+
+    // 把时序钉死：先让本地表的「推荐」（视频流）把内容渲染出来（旧快照
+    // 里 items 非空、columns=0），再放行频道表替换，把漫剧排到 0。
+    final gate = Completer<void>();
+    await tester.pumpWidget(
+      _scope(
+        perTab: 1,
+        child: MaterialApp(
+          home: _Seams().page(
+            channelLoader: () async {
+              await gate.future;
+              return const ChannelTable(
+                tabs: [
+                  ChannelTab(type: kChannelDynamicComic, title: '漫剧'),
+                  ChannelTab(type: kChannelVideoFeed, title: '推荐'),
+                  ChannelTab(type: kChannelVideoEpisode, title: '看剧'),
+                ],
+              );
+            },
+          ),
+        ),
+      ),
+    );
+    await _flush(tester);
+    gate.complete();
+    await _flush(tester);
+    // 续接按 tab_type 对等：旧表停在推荐，新表里推荐在 1。
+    expect(find.text('漫剧'), findsOneWidget);
+
+    // 从推荐往右拖（去上一个频道 = 新表里的漫剧），中途按住：
+    // 预览拿到的必须是新表的频道形态，不能是旧快照的。
+    final gesture = await tester.startGesture(
+      tester.getCenter(find.byType(TabSwipeArea)),
+    );
+    for (var step = 0; step < 5; step++) {
+      await gesture.moveBy(const Offset(50, 0));
+      await tester.pump();
+    }
+    await gesture.up();
+    await _settleSwipe(tester);
+    expect(tester.takeException(), isNull, reason: '旧快照的列数被新频道拿去画了');
   });
 
   testWidgets('服务端频道表取不到时保留本地表', (tester) async {
@@ -1130,6 +1673,42 @@ void main() {
     expect(tester.takeException(), isNull);
   });
 
+  testWidgets('深色外观下看剧/漫剧的浅色页改成深色画布与浅色字', (tester) async {
+    await tester.binding.setSurfaceSize(const Size(360, 800));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    addTearDown(() => tester.pumpWidget(const SizedBox.shrink()));
+    await tester.pumpWidget(
+      _scope(
+        perTab: 1,
+        child: MaterialApp(
+          theme: AppTheme.createTheme(Brightness.dark),
+          home: _Seams().page(
+            channelLoader: () async => const ChannelTable(
+              tabs: [
+                ChannelTab(type: kChannelVideoFeed, title: '推荐'),
+                ChannelTab(type: kChannelVideoEpisode, title: '看剧'),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+    await _flush(tester);
+    await tester.tap(find.text('看剧'));
+    await _flush(tester);
+
+    // 海报格页以前恒为白底黑字，深色主题下整页会刺眼——现在跟随色板。
+    expect(
+      tester.widget<Scaffold>(find.byType(Scaffold)).backgroundColor,
+      const Color(0xFF191919),
+    );
+    expect(
+      tester.widget<Text>(find.text('8-0 作品')).style?.color,
+      const Color(0xFFF2F2F2),
+    );
+    expect(tester.takeException(), isNull);
+  });
+
   testWidgets('频道表替换后按 tab_type 续接当前频道（条与 feed 不能对不上）', (tester) async {
     await tester.binding.setSurfaceSize(const Size(360, 800));
     addTearDown(() => tester.binding.setSurfaceSize(null));
@@ -1274,5 +1853,394 @@ void main() {
     final playerPage = tester.widget<PlayerPage>(find.byType(PlayerPage));
     expect(playerPage.startIndex, 1);
     expect(playerPage.initialSeriesDetail?.title, '2-0 作品');
+  });
+
+  testWidgets('桌面宽屏 feed：停靠面板带选集与简介，标题栏剧名让位', (tester) async {
+    SharedPreferences.setMockInitialValues({});
+    debugDefaultTargetPlatformOverride = TargetPlatform.windows;
+    await tester.binding.setSurfaceSize(const Size(1280, 800));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+
+    await tester.pumpWidget(
+      _scope(
+        perTab: 3,
+        intro: '桌面简介甲',
+        child: MaterialApp(home: _Seams().page()),
+      ),
+    );
+    await _flush(tester);
+
+    // 停靠面板：选集段头 + 简介（来自卡片 intro）；计数条是桌面 feed 底栏。
+    expect(find.text('选集'), findsOneWidget);
+    expect(find.text('桌面简介甲'), findsOneWidget);
+    expect(find.text('1 / 3'), findsOneWidget);
+    // 剧名只在面板头部出现一份（标题栏在停靠时不再重复）。
+    expect(find.text('16-0 作品'), findsOneWidget);
+    expect(find.byTooltip('收起面板'), findsOneWidget);
+    await tester.pumpWidget(const SizedBox.shrink());
+    debugDefaultTargetPlatformOverride = null;
+  });
+
+  testWidgets('桌面 feed 滚轮切剧：一次一集，600ms 冷却内不重复触发', (tester) async {
+    SharedPreferences.setMockInitialValues({});
+    debugDefaultTargetPlatformOverride = TargetPlatform.windows;
+    await tester.binding.setSurfaceSize(const Size(1280, 800));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+
+    await tester.pumpWidget(
+      _scope(perTab: 3, child: MaterialApp(home: _Seams().page())),
+    );
+    await _flush(tester);
+    expect(find.text('1 / 3'), findsOneWidget);
+
+    final pointer = TestPointer(1, PointerDeviceKind.mouse);
+    final center = tester.getCenter(
+      find.byKey(const ValueKey('desktop-feed-player')),
+    );
+    await tester.sendEventToBinding(pointer.hover(center));
+    await tester.sendEventToBinding(pointer.scroll(const Offset(0, 240)));
+    await _flush(tester);
+    expect(find.text('2 / 3'), findsOneWidget);
+    expect(find.text('16-1 作品'), findsOneWidget);
+
+    // 紧接着的第二格滚轮落在冷却内：不切。
+    await tester.sendEventToBinding(pointer.scroll(const Offset(0, 240)));
+    await _flush(tester);
+    expect(find.text('2 / 3'), findsOneWidget);
+
+    // 冷却按真实时钟计（DateTime.now），用真实等待越过 600ms。
+    await tester.runAsync(
+      () => Future<void>.delayed(const Duration(milliseconds: 700)),
+    );
+    await tester.sendEventToBinding(pointer.scroll(const Offset(0, 240)));
+    await _flush(tester);
+    expect(find.text('3 / 3'), findsOneWidget);
+
+    // PageUp 仍可回一条（原有键盘通路保留）。
+    await tester.sendKeyEvent(LogicalKeyboardKey.pageUp);
+    await _flush(tester);
+    expect(find.text('2 / 3'), findsOneWidget);
+    await tester.pumpWidget(const SizedBox.shrink());
+    debugDefaultTargetPlatformOverride = null;
+  });
+
+  testWidgets('桌面 feed：手动暂停后切窗口/最小化再回来都不许自动恢复', (tester) async {
+    SharedPreferences.setMockInitialValues({});
+    debugDefaultTargetPlatformOverride = TargetPlatform.windows;
+    await tester.binding.setSurfaceSize(const Size(1280, 800));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
+    addTearDown(
+      () => tester.binding.handleAppLifecycleStateChanged(
+        AppLifecycleState.resumed,
+      ),
+    );
+
+    final seams = _Seams(failContent: false);
+    await tester.pumpWidget(
+      _scope(
+        child: MaterialApp(
+          home: seams.page(
+            directoryLoader: (id, tab) async => [
+              [Chapter(itemId: '$id-1', title: '第1集', volumeName: '剧集')],
+            ],
+          ),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+    final player = seams.players.single;
+    expect(player.isPlaying, true);
+
+    // 用户手动暂停：桌面 chrome 的暂停钮就是直接对播放器下 pause，
+    // 会话的 playing 随播放器事件跟随到 false。
+    await player.pause();
+    await _flush(tester);
+    expect(player.isPlaying, false);
+    final playsAfterManualPause = player.calls
+        .where((call) => call == 'play')
+        .length;
+
+    // 切到别的窗口：桌面端只发 inactive（失焦，窗口仍可见）。不许恢复。
+    tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.inactive);
+    await _flush(tester);
+    expect(player.isPlaying, false);
+    expect(
+      player.calls.where((call) => call == 'play').length,
+      playsAfterManualPause,
+    );
+
+    // 最小化（hidden）再切回来（resumed）：手动暂停同样不许被恢复。
+    tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.hidden);
+    await _flush(tester);
+    tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
+    await _flush(tester);
+    expect(player.isPlaying, false);
+    expect(
+      player.calls.where((call) => call == 'play').length,
+      playsAfterManualPause,
+    );
+
+    await tester.pumpWidget(const SizedBox.shrink());
+    await _flush(tester);
+    debugDefaultTargetPlatformOverride = null;
+  });
+
+  testWidgets('桌面 feed：播放中被最小化是可见性暂停，切回自动恢复', (tester) async {
+    SharedPreferences.setMockInitialValues({});
+    debugDefaultTargetPlatformOverride = TargetPlatform.windows;
+    await tester.binding.setSurfaceSize(const Size(1280, 800));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
+    addTearDown(
+      () => tester.binding.handleAppLifecycleStateChanged(
+        AppLifecycleState.resumed,
+      ),
+    );
+
+    final seams = _Seams(failContent: false);
+    await tester.pumpWidget(
+      _scope(
+        child: MaterialApp(
+          home: seams.page(
+            directoryLoader: (id, tab) async => [
+              [Chapter(itemId: '$id-1', title: '第1集', volumeName: '剧集')],
+            ],
+          ),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+    final player = seams.players.single;
+    expect(player.isPlaying, true);
+
+    // 播放中最小化：可见性逻辑暂停；切回来（hidden → inactive → resumed）
+    // 应恢复播放——自动恢复只对可见性暂停生效，这里不能被误伤。
+    tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.hidden);
+    await _flush(tester);
+    expect(player.isPlaying, false);
+    tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.inactive);
+    await _flush(tester);
+    tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
+    await _flush(tester);
+    expect(player.isPlaying, true);
+
+    await tester.pumpWidget(const SizedBox.shrink());
+    await _flush(tester);
+    debugDefaultTargetPlatformOverride = null;
+  });
+
+  testWidgets('桌面窄窗 feed：不停靠面板，剧名回标题栏', (tester) async {
+    SharedPreferences.setMockInitialValues({});
+    debugDefaultTargetPlatformOverride = TargetPlatform.windows;
+    await tester.binding.setSurfaceSize(const Size(900, 700));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+
+    await tester.pumpWidget(
+      _scope(perTab: 2, child: MaterialApp(home: _Seams().page())),
+    );
+    await _flush(tester);
+
+    expect(find.text('选集'), findsNothing);
+    expect(find.byTooltip('收起面板'), findsNothing);
+    expect(find.text('1 / 2'), findsOneWidget);
+    expect(find.text('16-0 作品'), findsOneWidget);
+    await tester.pumpWidget(const SizedBox.shrink());
+    debugDefaultTargetPlatformOverride = null;
+  });
+
+  testWidgets('桌面全屏 feed：面板、顶栏与计数条都不出现', (tester) async {
+    SharedPreferences.setMockInitialValues({});
+    debugDefaultTargetPlatformOverride = TargetPlatform.windows;
+    DesktopPlatform.fullscreen.value = true;
+    await tester.binding.setSurfaceSize(const Size(1280, 800));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+
+    await tester.pumpWidget(
+      _scope(perTab: 2, child: MaterialApp(home: _Seams().page())),
+    );
+    await _flush(tester);
+
+    expect(find.text('选集'), findsNothing);
+    expect(find.byKey(const Key('drama_search_button')), findsNothing);
+    expect(find.text('1 / 2'), findsNothing);
+    // 先退全屏再拆树，避免 dispose 走 window_manager 通道。
+    DesktopPlatform.fullscreen.value = false;
+    await tester.pumpWidget(const SizedBox.shrink());
+    debugDefaultTargetPlatformOverride = null;
+  });
+
+  testWidgets('非桌面 feed 仍是竖向 PageView，无桌面计数条', (tester) async {
+    await tester.binding.setSurfaceSize(const Size(360, 800));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+
+    await tester.pumpWidget(
+      _scope(perTab: 2, child: MaterialApp(home: _Seams().page())),
+    );
+    await _flush(tester);
+
+    expect(find.byKey(const Key('drama_feed')), findsOneWidget);
+    expect(find.byKey(const ValueKey('desktop-feed-player')), findsNothing);
+    expect(find.text('1 / 2'), findsNothing);
+  });
+
+  testWidgets('桌面 feed 顶栏只剩频道条一行，搜索入口收敛到频道条图标', (tester) async {
+    SharedPreferences.setMockInitialValues({});
+    debugDefaultTargetPlatformOverride = TargetPlatform.windows;
+    await tester.binding.setSurfaceSize(const Size(1280, 800));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+
+    await tester.pumpWidget(
+      _scope(perTab: 2, child: MaterialApp(home: _Seams().page())),
+    );
+    await _flush(tester);
+
+    // 搜索行不渲染；分区搜索只剩频道条右端的图标一处。
+    expect(find.byKey(const Key('drama_search_button')), findsNothing);
+    expect(find.byKey(const Key('drama_strip_search_button')), findsOneWidget);
+    // 播放器顶端只让出频道条一行（38），不再是搜索行 + 频道条的 76。
+    expect(
+      tester.getTopLeft(find.byKey(const ValueKey('desktop-feed-player'))).dy,
+      closeTo(38, 0.5),
+    );
+
+    await tester.pumpWidget(const SizedBox.shrink());
+    await _flush(tester);
+    debugDefaultTargetPlatformOverride = null;
+  });
+
+  testWidgets('横向手势在短剧频道之间切换', (tester) async {
+    await tester.binding.setSurfaceSize(const Size(400, 800));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    addTearDown(() => tester.pumpWidget(const SizedBox.shrink()));
+
+    // 频道选择的单例跨用例存活：先清掉上一个用例写回的频道，否则起手就
+    // 不是「推荐」。
+    SharedPreferences.setMockInitialValues({});
+    DramaChannelPreferences.reset();
+    DramaChannelPreferences.load(await SharedPreferences.getInstance());
+
+    await tester.pumpWidget(
+      _scope(perTab: 1, child: MaterialApp(home: _Seams().page())),
+    );
+    await _flush(tester);
+    // 推荐频道是竖滑播放流。
+    expect(find.byKey(const Key('drama_feed')), findsOneWidget);
+
+    // 海报格频道之间横滑；播放流的横滑单独有一条用例（进度条是唯一例外）。
+    await tester.ensureVisible(find.text('看剧'));
+    await tester.tap(find.text('看剧'));
+    await _settleSwipe(tester);
+    expect(find.byKey(const Key('drama_episode_grid')), findsOneWidget);
+
+    // 往左：看剧 → 漫剧。
+    await tester.drag(
+      find.byKey(const Key('drama_episode_grid')),
+      const Offset(-260, 0),
+    );
+    await _settleSwipe(tester);
+    expect(find.byKey(const Key('drama_manju_grid')), findsOneWidget);
+    expect(find.byKey(const Key('drama_episode_grid')), findsNothing);
+
+    // 往右：漫剧 → 看剧。
+    await tester.drag(
+      find.byKey(const Key('drama_manju_grid')),
+      const Offset(260, 0),
+    );
+    await _settleSwipe(tester);
+    expect(find.byKey(const Key('drama_episode_grid')), findsOneWidget);
+
+    await tester.pumpWidget(const SizedBox.shrink());
+    await _flush(tester);
+  });
+
+  testWidgets('横滑中途邻页要真的画出来，不是一块底色', (tester) async {
+    await tester.binding.setSurfaceSize(const Size(400, 800));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    addTearDown(() => tester.pumpWidget(const SizedBox.shrink()));
+    SharedPreferences.setMockInitialValues({});
+    DramaChannelPreferences.reset();
+    DramaChannelPreferences.load(await SharedPreferences.getInstance());
+
+    await tester.pumpWidget(
+      _scope(perTab: 1, child: MaterialApp(home: _Seams().page())),
+    );
+    await _flush(tester);
+
+    // 先把两个频道都走一遍，让快照把它们的形状与内容记下来：预览只画
+    // 进过的频道，没进过的只能给提示。
+    await tester.ensureVisible(find.text('漫剧'));
+    await tester.tap(find.text('漫剧'));
+    await _settleSwipe(tester);
+    await tester.ensureVisible(find.text('看剧'));
+    await tester.tap(find.text('看剧'));
+    await _settleSwipe(tester);
+    expect(find.byKey(const Key('drama_episode_grid')), findsOneWidget);
+
+    // 按住不放，停在跟手位移中间：当前页还是看剧，但漫剧的卡片应该
+    // 已经在让出来的缺口里画出来了。
+    final gesture = await tester.startGesture(
+      tester.getCenter(find.byKey(const Key('drama_episode_grid'))),
+    );
+    for (var step = 0; step < 5; step++) {
+      await gesture.moveBy(const Offset(-50, 0));
+      await tester.pump();
+    }
+    expect(
+      find.byKey(const Key('drama_manju_grid')),
+      findsNothing,
+      reason: '还没松手，不该已经切到漫剧',
+    );
+    expect(
+      find.byWidgetPredicate(
+        (widget) =>
+            widget.key is ValueKey<String> &&
+            (widget.key as ValueKey<String>).value.startsWith('preview.'),
+      ),
+      findsWidgets,
+      reason: '横滑中途没把邻页画出来，那一侧只剩底色（黑面板）',
+    );
+
+    await gesture.up();
+    await _settleSwipe(tester);
+    expect(find.byKey(const Key('drama_manju_grid')), findsOneWidget);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('竖滑播放流里整片横滑都切频道，只剩进度条那一行调进度', (tester) async {
+    await tester.binding.setSurfaceSize(const Size(400, 800));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    addTearDown(() => tester.pumpWidget(const SizedBox.shrink()));
+
+    SharedPreferences.setMockInitialValues({});
+    DramaChannelPreferences.reset();
+    DramaChannelPreferences.load(await SharedPreferences.getInstance());
+
+    await tester.pumpWidget(
+      _scope(perTab: 1, child: MaterialApp(home: _Seams().page())),
+    );
+    await _flush(tester);
+    expect(find.byKey(const Key('drama_feed')), findsOneWidget);
+
+    // 卡片中间横滑现在归切频道（以前这里是官方 `K6` 的整屏调进度，
+    // 与切频道抢同一个操作 ⇒ 同一手势在不同区域语义相反）。
+    await tester.drag(
+      find.byKey(const Key('drama_feed')),
+      const Offset(-260, 0),
+    );
+    await _settleSwipe(tester);
+    expect(find.byKey(const Key('drama_episode_grid')), findsOneWidget);
+    expect(find.byKey(const Key('drama_feed')), findsNothing);
+
+    // 往右滑回去：看剧 → 推荐，双向一致。
+    await tester.drag(
+      find.byKey(const Key('drama_episode_grid')),
+      const Offset(260, 0),
+    );
+    await _settleSwipe(tester);
+    expect(find.byKey(const Key('drama_feed')), findsOneWidget);
+
+    await tester.pumpWidget(const SizedBox.shrink());
+    await _flush(tester);
   });
 }

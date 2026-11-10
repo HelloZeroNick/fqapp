@@ -1,11 +1,181 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 
 import '../models/media_item.dart';
+import '../services/book_updates.dart';
 import '../services/chapter_cache_store.dart';
 import '../services/connectivity_status.dart';
 import '../services/library_store.dart';
+import '../services/media_history_store.dart';
+import '../services/player_history.dart';
 import '../services/reader_history.dart';
+import 'comic_reader_page.dart';
 import 'reader_page.dart';
+
+/// 最近读过且本地还留着目录时直接续读，不等待详情页或网络探测。
+///
+/// 小说额外要求「上次读到的章节正文仍在缓存」，否则会把用户送进一个读不出
+/// 内容的阅读器；漫画没有正文缓存（图片始终联网取，且带 per-launch 能力值，
+/// 不能落盘），只要求目录缓存存在。
+Future<bool> openRecentBook(
+  BuildContext context,
+  MediaItem item, {
+  ChapterCache? cache,
+  ReaderStore? readerStore,
+  BookDirectoryLoader? directoryLoader,
+}) async {
+  final kind = item.kind;
+  if ((kind != 'book' && kind != 'manga') || item.id.isEmpty) return false;
+  final isManga = kind == 'manga';
+  final store = cache ?? ChapterCacheStore.instance;
+  final baseStore = readerStore ?? LibraryStore.instance;
+  // 漫画进度写在独立作用域里（见 ComicReaderPage 的 scopedHistoryStore），
+  // 用未分作用域的 store 读不到，会误判成「没读过」。
+  final historyStore = isManga
+      ? scopedHistoryStore(baseStore, 'manga')
+      : baseStore;
+  CachedBook? book;
+  int? index;
+  try {
+    final saved = await ReaderHistory(historyStore).load(item.id);
+    if (saved == null || (saved['kind'] != null && saved['kind'] != kind)) {
+      return false;
+    }
+    // 漫画没有正文缓存，只能看目录是否存过；小说要求正文还在（下面再判）。
+    book = isManga
+        ? await store.savedCatalogue(item.id)
+        : await store.cachedBook(item.id);
+    if (book == null) return false;
+    index = resumeEpisodeIndex({
+      ...saved,
+      if (saved['chapterId'] != null)
+        'chapterId': saved['chapterId'].toString(),
+    }, book.chapters);
+    if (index == null) return false;
+    if (!isManga &&
+        !(await store.cachedChapterIds(
+          item.id,
+        )).contains(book.chapters[index].itemId)) {
+      return false;
+    }
+  } catch (_) {
+    // 缓存或历史不可用时，交给原有加载和重试入口。
+    return false;
+  }
+  if (!context.mounted) return false;
+  final cachedBook = book;
+  final startIndex = index;
+  final title = item.title.isNotEmpty ? item.title : cachedBook.title;
+  final cover = item.cover.isNotEmpty ? item.cover : cachedBook.cover;
+  await Navigator.push<void>(
+    context,
+    MaterialPageRoute(
+      builder: (_) => isManga
+          ? ComicReaderPage(
+              bookId: item.id,
+              title: title,
+              cover: cover,
+              chapters: cachedBook.chapters,
+              startIndex: startIndex,
+              // 阅读器自己会写默认缓存，注入的缓存供测试与调用方覆盖。
+              readerStore: baseStore,
+              cache: cache,
+              shelfItem: item,
+            )
+          : _RecentBookReader(
+              book: CachedBook(
+                id: item.id,
+                title: title,
+                cover: cover,
+                chapters: cachedBook.chapters,
+              ),
+              startIndex: startIndex,
+              cache: cache,
+              readerStore: baseStore,
+              item: item,
+              // 注入缓存的调用方自带数据，仅显式提供 loader 时联网。
+              directoryLoader:
+                  directoryLoader ?? (cache == null ? loadBookDirectory : null),
+            ),
+    ),
+  );
+  return true;
+}
+
+/// 先显示缓存正文，目录更新不阻塞开书，也不重建阅读器的 State。
+class _RecentBookReader extends StatefulWidget {
+  final CachedBook book;
+  final int startIndex;
+  final ChapterCache? cache;
+  final ReaderStore readerStore;
+  final MediaItem item;
+  final BookDirectoryLoader? directoryLoader;
+
+  const _RecentBookReader({
+    required this.book,
+    required this.startIndex,
+    required this.cache,
+    required this.readerStore,
+    required this.item,
+    required this.directoryLoader,
+  });
+
+  @override
+  State<_RecentBookReader> createState() => _RecentBookReaderState();
+}
+
+class _RecentBookReaderState extends State<_RecentBookReader>
+    with WidgetsBindingObserver {
+  late List<Chapter> _chapters = widget.book.chapters;
+  bool _refreshing = false;
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    unawaited(_refresh());
+  }
+
+  Future<void> _refresh() async {
+    final loader = widget.directoryLoader;
+    if (loader == null || _refreshing) return;
+    _refreshing = true;
+    try {
+      final chapters = await loader(widget.book.id);
+      if (mounted && chapters.isNotEmpty) {
+        setState(() => _chapters = chapters);
+      }
+    } catch (_) {
+      // 更新检测失败不影响缓存阅读，下次回到前台重试。
+    } finally {
+      _refreshing = false;
+    }
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) unawaited(_refresh());
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) => ReaderPage(
+    bookId: widget.book.id,
+    title: widget.book.title,
+    cover: widget.book.cover,
+    chapters: _chapters,
+    startIndex: widget.startIndex,
+    chapterCache: widget.cache,
+    readerStore: widget.readerStore,
+    shelfItem: widget.item,
+  );
+}
 
 /// 用本地缓存直接起阅读器，全程不碰网络。
 ///
@@ -98,6 +268,12 @@ int cachedStartIndex(
   var index = book.chapters.indexWhere(
     (chapter) => chapter.itemId == saved?['chapterId']?.toString(),
   );
+  if (saved?['fanqieImported'] == true &&
+      saved?['chapterId'] != null &&
+      (index < 0 || !cached.contains(book.chapters[index].itemId))) {
+    // A different cached chapter must not silently replace an imported anchor.
+    return -1;
+  }
   if (index < 0) {
     final episode = num.tryParse(saved?['episode']?.toString() ?? '');
     index = (episode != null && episode.isFinite ? episode.toInt() : 0).clamp(
